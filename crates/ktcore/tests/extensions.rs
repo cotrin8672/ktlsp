@@ -2161,6 +2161,123 @@ fn nominal_reference_identities_are_canonical_and_cannot_cross_hosts_or_revision
 }
 
 #[test]
+fn java_parameterized_source_signatures_erase_only_proven_nominal_references() {
+    use ktcore::types::{Projection, TypeParameterBounds, TypeRef};
+    const LIBRARY: &str = "/oracle/GenericTypes.java";
+    const CLIENT: &str = "/oracle/Erasure.java";
+    let library = "package oracle; class GenericBox<T> {} class GenericOuter<T> { static class Nested<U> {} } class Result {}";
+    for prepared in [false, true] {
+        let (mut index, mut store) = fixture();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_java::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(library, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let symbols = [
+            ("GenericBox", None, Some("T")),
+            ("GenericOuter", None, Some("T")),
+            ("Nested", Some("GenericOuter"), Some("U")),
+            ("Result", None, None),
+        ].into_iter().map(|(name, container, parameter)| {
+            let range = occurrence(library, name, 0);
+            let mut symbol = IndexedSymbol::new(name, SymbolKind::Class, "oracle",
+                container.map(str::to_string), range.start, range.end);
+            if let Some(parameter) = parameter {
+                symbol.type_params = vec![parameter.into()];
+                symbol.type_parameter_bounds = Some(Box::new(vec![TypeParameterBounds {
+                    name: parameter.into(), start_byte: range.end + 1, end_byte: range.end + 2,
+                    scope_start: 0, scope_end: library.len(), upper_bounds: Vec::new(), complete: true,
+                    variance: Some(Projection::Invariant), erasure: None,
+                }]));
+            }
+            symbol
+        }).collect();
+        index.replace_file(LIBRARY, symbols, Tier::Volatile);
+        if prepared {
+            store.replace_prepared_source_declarations(&index,
+                source::prepare_source_references(&index, LIBRARY, Arc::from(library), &tree),
+                Knowledge::Unknown(vec![IncompleteReason::MissingFacts]), Vec::new()).unwrap();
+        } else {
+            store.replace_source(&index, LIBRARY, Arc::from(library),
+                Knowledge::Unknown(vec![IncompleteReason::MissingFacts]), Vec::new()).unwrap();
+        }
+        let parameterized = |name: &str, argument: &str| {
+            let mut ty = TypeRef::simple(name);
+            ty.args = vec![TypeRef::simple(argument)];
+            ty
+        };
+        let mut raw = TypeRef::simple("GenericBox");
+        raw.java_raw_eligible = true;
+        let mut nested = parameterized("Nested", "Result");
+        nested.qualification = Some("oracle.GenericOuter".into());
+        let mut nullable = parameterized("GenericBox", "Result");
+        nullable.nullable = true;
+        let cases = [
+            ("applied", "", "GenericBox<Result>", parameterized("GenericBox", "Result"), Some("Loracle/GenericBox;")),
+            ("raw", "", "GenericBox", raw, Some("Loracle/GenericBox;")),
+            ("nested", "", "GenericOuter.Nested<Result>", nested, Some("Loracle/GenericOuter$Nested;")),
+            ("argument", "<T> ", "GenericBox<T>", parameterized("GenericBox", "T"), Some("Loracle/GenericBox;")),
+            ("variable", "<T> ", "T", TypeRef::simple("T"), None),
+            ("bound", "<T extends Missing> ", "T", TypeRef::simple("T"), None),
+            ("missing", "", "Missing<Result>", parameterized("Missing", "Result"), None),
+            ("ambiguous", "", "Clash<Result>", parameterized("Clash", "Result"), None),
+            ("nullable", "", "GenericBox<Result>", nullable, None),
+        ];
+        let text = format!("package oracle; class Erasure {{ {} }}", cases.iter()
+            .map(|(name, parameters, spelling, _, _)|format!("public {parameters}{spelling} {name}({spelling} value) {{ return null; }}"))
+            .collect::<Vec<_>>().join(" "));
+        let tree = parser.parse(&text, None).unwrap();
+        assert!(!tree.root_node().has_error(), "{text}");
+        let range = occurrence(&text, "Erasure", 0);
+        let mut symbols = vec![IndexedSymbol::new("Erasure", SymbolKind::Class, "oracle", None, range.start, range.end)];
+        for (name, parameters, _, ty, _) in &cases {
+            let start = text.find(&format!(" {name}(")).unwrap() + 1;
+            let mut symbol = IndexedSymbol::new(*name, SymbolKind::Function, "oracle", Some("Erasure".into()), start, start + name.len());
+            symbol.arity = Some(1);
+            symbol.params = vec![ty.clone()];
+            symbol.return_type = Some(ty.clone());
+            if !parameters.is_empty() {symbol.type_params = vec!["T".into()];}
+            let node = tree.root_node().descendant_for_byte_range(start, start + name.len()).unwrap().parent().unwrap();
+            symbol.source_member = ktcore::indexer::source_member_flags(node, &text, true);
+            symbols.push(symbol);
+        }
+        index.replace_file(CLIENT, symbols, Tier::Volatile);
+        for file in ["/oracle/FirstClash.kt", "/oracle/SecondClash.kt"] {
+            install_nominal_kotlin(&mut index, &mut store, file, "package oracle\nclass Clash\n", "oracle");
+        }
+        let scope = ktcore::indexer::TypeScope::with_default_imports("oracle", Vec::new(), &["java.lang"]);
+        let declarations = source::extract(&index, CLIENT, &tree, &text, &scope);
+        store.replace_source_declarations(&index, CLIENT, Arc::from(text), Knowledge::Found(()), declarations).unwrap();
+        install_nominal_kotlin(&mut index, &mut store, "/oracle/KotlinErasure.kt",
+            "package oracle\nclass KotlinErasure { fun applied(value: GenericBox<Result>): GenericBox<Result> = value }", "oracle");
+        let mut read = store.begin(&index, "mixin-consumer", CLIENT).unwrap();
+        let Knowledge::Found(owner) = read.resolve_type("oracle.Erasure") else {panic!("owner");};
+        let (members, _) = read.declared_members(&owner).unwrap();
+        for (name, _, _, _, descriptor) in &cases {
+            let member = members.iter().find(|member|member.name == *name).unwrap();
+            if let Some(descriptor) = descriptor {
+                assert!(matches!(&member.signature, Knowledge::Found(signature)
+                    if signature.descriptor() == format!("({descriptor}){descriptor}")), "{name}: {:?}", member.signature);
+                let declaration = read.declaration(member.id.definition().start_byte..member.id.definition().end_byte).unwrap();
+                let Knowledge::Found(exact) = read.declaration_member(&declaration).unwrap() else {panic!("exact {name}");};
+                assert_eq!(exact.signature, member.signature);
+            } else {
+                assert!(matches!(&member.signature, Knowledge::Unknown(_)), "{name}: {:?}", member.signature);
+            }
+        }
+        let Knowledge::Found(kotlin) = read.resolve_type("oracle.KotlinErasure") else {panic!("Kotlin owner");};
+        assert!(matches!(read.declared_members(&kotlin).unwrap().0[0].signature, Knowledge::Unknown(_)));
+        let pending = read.finish();
+        store.remove_source(LIBRARY);
+        assert_eq!(store.validate_pending(&pending), Err(ContractError::Stale));
+        let mut read = store.begin(&index, "mixin-consumer", CLIENT).unwrap();
+        let (members, _) = read.declared_members(&owner).unwrap();
+        assert!(members.iter().all(|member|matches!(member.signature, Knowledge::Unknown(_))),
+            "an indexed generic name without its source identity cannot establish a descriptor");
+        assert!(read.finish().requested_source_files().contains(LIBRARY));
+    }
+}
+
+#[test]
 fn nominal_source_signatures_resolve_references_and_keep_boxing_generics_and_missing_types_unknown()
 {
     let (mut index, mut store) = fixture();

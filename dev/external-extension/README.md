@@ -148,6 +148,9 @@ must omit the parameter field. The generic parameter imports `refs.LocalRef<Stri
 the visible `decoy.LocalRef` fixture prevents a unique-short-name fallback from
 passing that resolution. Include both small source directories when preparing
 the disposable IPC project (the full project-copy recipe already includes them).
+The probe also reads `declarationMember`: the parameterized Java reference must
+produce the exact `refs.LocalRef` erased descriptor; direct method and owner type
+variables must retain nonempty Unknown reasons in the first accepted source view.
 Generic TypeRefs, Kotlin equivalents/aliases, unsupported
 headers/lowerings, forged metadata, edits/stale reads and foreign snapshot
 contexts have focused Rust cases; these additions require a newly sealed native

@@ -1077,6 +1077,14 @@ fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Writ
         .find(|declaration|declaration["name"]=="parameterFactsProbe").ok_or("parameter probe declaration")?;
     let parameters=parameter_declaration["parameters"]["value"].as_array().ok_or("known parameter facts")?;
     if parameters.len()!=3 {return Err("parameter fact order/count".into());}
+    let mut member_queries=Vec::new();
+    for name in ["parameterFactsProbe","methodTypeVariableProbe","ownerTypeVariableProbe"] {
+        let declaration=result["facts"][0]["declarations"].as_array().ok_or("source facts declarations")?.iter()
+            .find(|declaration|declaration["name"]==name).ok_or("parameter erasure probe declaration")?;
+        member_queries.push(json!({"op":"declarationMember","declaration":declaration["id"]}));
+    }
+    let parameter_members=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
+        "queries":member_queries}))?;
     let parameter_types=request(input,output,next,"analysis/readFacts",json!({"evaluation":params["evaluation"],"queries":[
         {"op":"resolveTypeRef","reference":parameters[1]["typeRef"]},
         {"op":"resolveTypeRef","reference":parameters[2]["typeRef"]},
@@ -1130,7 +1138,8 @@ fn record_source_facts_v2(input:&mut impl std::io::BufRead,output:&mut impl Writ
     std::fs::create_dir_all(directory).map_err(|error|error.to_string())?;
     std::fs::write(directory.join(format!("source-facts-{}.json",params["evaluation"].as_str().ok_or("evaluation")?)),
         serde_json::to_vec(&json!({"evaluation":params["evaluation"],"ownerEvaluation":owner_evaluation,"legacy":legacy,"rich":rich,"types":types["facts"],
-            "parameterDeclaration":parameter_declaration,"parameterTypes":parameter_types["facts"],"foreignJvm":foreign_jvm})).map_err(|error|error.to_string())?)
+            "parameterDeclaration":parameter_declaration,"parameterTypes":parameter_types["facts"],
+            "parameterMembers":parameter_members["facts"],"foreignJvm":foreign_jvm})).map_err(|error|error.to_string())?)
         .map_err(|error|error.to_string())?;
     Ok(())
 }

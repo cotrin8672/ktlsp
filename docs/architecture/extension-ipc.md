@@ -78,6 +78,11 @@ goto, references and applied rename outputs.
 An authored Kotlin property with accessor projections, or an unsupported `@JvmOverloads`
 lowering, does not prove a single JVM member; unresolved signature/modifier facts keep the
 whole correspondence Unknown. This query does not enumerate generated JVM projections.
+For Java parameterized references, a proven outer nominal JVM identity supplies
+the erased descriptor under [JLS21 section4.6](https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.6).
+Raw and nested Java references use the same host identity checks. Direct type
+variables, unavailable/ambiguous outer identities and unsupported Kotlin lowering
+remain Unknown; no inferred `Object` descriptor fills a missing bound.
 
 ### Optional project/type facts (next source slice)
 

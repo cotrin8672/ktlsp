@@ -1086,7 +1086,7 @@ pub(super) fn ordinary_reference_types(
                     | SymbolKind::Interface
                     | SymbolKind::EnumClass
                     | SymbolKind::Object
-            ) && entry.sym.type_params.is_empty()
+            ) && (entry.sym.type_params.is_empty() || file.ends_with(".java"))
         })
         .collect();
     if entries.is_empty() {
@@ -1122,7 +1122,6 @@ fn ordinary_reference_type(entry: &crate::index::Entry, text: &str, tree: &Tree)
         .name
         .trim_matches('`')
         .contains(['.', '/', ';', '[', ']', '<', '>'])
-        || !entry.sym.type_params.is_empty()
     {
         return false;
     }
@@ -1130,6 +1129,12 @@ fn ordinary_reference_type(entry: &crate::index::Entry, text: &str, tree: &Tree)
     let Some(node) = declaration_node(tree, &entry.sym, java) else {
         return false;
     };
+    // Java class/interface parameters do not change their nominal JVM binary name.
+    if !entry.sym.type_params.is_empty()
+        && !(java && matches!(node.kind(), "class_declaration" | "interface_declaration"))
+    {
+        return false;
+    }
     if !matches!(
         node.kind(),
         "class_declaration"
@@ -1149,7 +1154,9 @@ fn ordinary_reference_type(entry: &crate::index::Entry, text: &str, tree: &Tree)
     }
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
-        if child_of_kind(parent, "type_parameters").is_some() {
+        if child_of_kind(parent, "type_parameters").is_some()
+            && !(java && matches!(parent.kind(), "class_declaration" | "interface_declaration"))
+        {
             return false;
         }
         if matches!(

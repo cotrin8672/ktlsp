@@ -617,6 +617,8 @@ or editor framework is needed.
 
 `KTLSP_IPC_MODE=source-facts-v2` also checks authored callable parameter order,
 ranges, annotations and imported type references, with legacy field omission.
+It checks exact erased Java member descriptors through `declarationMember`,
+including a same-name type decoy, while direct method/owner type variables remain Unknown.
 
 `KTLSP_IPC_MODE=annotation-sites` checks an annotation written before its method:
 exact source identity/ranges, imported type resolution, then an unsaved edit to

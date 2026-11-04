@@ -1,6 +1,8 @@
 # Current fork state
 
 Updated 2026-11-05 (Asia/Tokyo). **Selected Wire editing and Java/Kotlin diagnostic cases pass. Discovered Rust regressions are fixed and remaining workspace targets checked. Original CEM first completion and the85-member comparison also pass.**
+Java reference erasure through the existing extension API is verified on103;
+its related native/editor evidence is separate from the earlier broad workspace run.
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -76,16 +78,45 @@ an unavailable authored-member result. Its raw Unknown reasons were not saved.
 Static inspection confirms two independent limitations: the disposable Gradle
 fixture includes only Create/Ponder/Mixin/MixinExtras and two Mixin source files;
 none of its five archives supplies the handler's Minecraft parameter classes.
-Also, `ReadSession::source_jvm_type` currently rejects parameterized reference
-types with nonempty arguments, so its generic callback needs source-ABI
-normalization support even after the real dependencies are supplied. Existing
+At102, `ReadSession::source_jvm_type` also rejected parameterized reference
+types with nonempty arguments. That independent Java source-ABI limitation is
+fixed in103: ordinary generic class/interface identities pass the existing
+source proof, Java parameterized/raw references use the proven outer identity,
+and nested types retain their actual JVM binary names. Direct type variables,
+unresolved bounds/outer identities and unsupported Kotlin lowering stay Unknown.
+No `Object` fallback or new operation was added. The implementation follows
+[JLS21 section4.6](https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.6).
+Existing
 `declarationMember` is the appropriate operation; names or consumer-built
 descriptors cannot replace its exact correspondence. This is not evidence of a
 `sourceLocation` failure, which the run never reached. No runner was repeated for
-this contract inspection, and the32 Kotlin assertions remain unrun. Evidence:
+the contract inspection; that Drill attempt never reached the Kotlin phase.
+The consumer's later NeoForge/explicit-Kotlin-root profile reaches eight of the
+original32 assertions, then stops at a current completion's child-response
+`CommandFailed`. Its raw normalized facts/error detail were not saved, so this is
+an unclassified separate consumer failure. Evidence for the original Drill attempt:
 MC `build/rust-test-logs/kotlin-drill-native-20261105/recovery-and-run-receipt.json`;
 implementation boundaries are `crates/ktcore/src/extensions.rs` functions
 `declaration_member`, `source_member_signature` and `source_jvm_type`.
+
+Host103 passes67 relevant native tests: the65-test core extension target, the
+prepared-reference guard and exact declaration-member wire guard. The new core
+regression covers parameterized/raw/nested references, erased inner type
+arguments, direct type variables, missing/ambiguous/nullable types, ordinary and
+prepared source admission, and stale reads after dependency-source removal.
+One real child/Neovim `source-facts-v2` run confirms the first accepted Java source
+view returns `(Ljava/lang/String;Lrefs/LocalRef;Lfixture/CallbackInfo;)V` despite
+the same-name decoy, while method/owner type-variable members remain Unknown.
+The new editor assertions do not claim a second source-state replay. Evidence:
+`integrated-input103/main-ready.json` and `integrated-input103/editor/receipt.json`.
+The locked release host SHA-256 is
+`2e52f2d0e5edf57766569d7011c5230a4e879e8514445e87770e9e6af719b9fb`;
+the verification child SHA-256 is
+`629ee0376b6ff97fbca9af36f4d12c01ae7e27fe6607f71840f4427b32ab66cf`.
+Both were independently checked; code/fixture guards are stable. The previously
+completed workspace1977 and original CEM85 were not replayed. The original
+incomplete Drill profile and later Kotlin child-response `CommandFailed` remain
+separate failed/unfinished consumer cases, not host103 acceptance conditions.
 
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable

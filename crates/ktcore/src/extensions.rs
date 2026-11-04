@@ -2506,7 +2506,7 @@ impl ReadSession<'_> {
             )
             .then(|| JvmType::Array(Box::new(element)));
         }
-        if !ty.args.is_empty() {
+        if !java && !ty.args.is_empty() {
             return None;
         }
         if let Some(scalar) =
@@ -2514,12 +2514,17 @@ impl ReadSession<'_> {
         {
             return Some(scalar);
         }
+        let resolved = crate::infer::declared_type(&self.index, ty, context);
+        let resolved = match resolved {
+            crate::types::Type::Raw(outer) if java => *outer,
+            resolved => resolved,
+        };
         let crate::types::Type::Class {
             name,
             package,
             container,
             ..
-        } = crate::infer::declared_type(&self.index, ty, context)
+        } = resolved
         else {
             return None;
         };

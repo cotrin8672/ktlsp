@@ -365,6 +365,15 @@ return function(env)
       check(label..' parameter type resolves through host facts '..name,observed.parameterTypes[i].state=='found'
         and observed.parameterTypes[i].value.qualifiedName==name)
     end
+    local members=observed.parameterMembers
+    check(label..' authored parameterized reference has exact erased member descriptor',#members==3
+      and members[1].state=='found' and members[1].value.name=='parameterFactsProbe'
+      and members[1].value.signature.state=='found'
+      and members[1].value.signature.value.descriptor=='(Ljava/lang/String;Lrefs/LocalRef;Lfixture/CallbackInfo;)V')
+    for i,name in ipairs({'method','owner'}) do
+      check(label..' '..name..' type-variable member remains Unknown',members[i+1].state=='unknown'
+        and type(members[i+1].reasons)=='table' and #members[i+1].reasons>0)
+    end
     local foreign = observed.foreignJvm
     local foreign_path = vim.fs.abspath(env.project .. '/modules/editing/src/main/java/fixture/ForeignJvmNames.java')
     local foreign_buf = vim.fn.bufnr(foreign_path)
@@ -576,6 +585,10 @@ return function(env)
       [=[  @SourceFactsExample(method="ti\u0063k" + "()V", at=@SourceFactsAt(value="INVOKE", target="Lpkg/C;m()V", ordinal=1), index=2L)]=],
       '  public static final void sourceFactsProbe() {}',
       [=[  public void parameterFactsProbe(@Local(argsOnly=true,ordinal=0,name={"text"},at=@SourceFactsAt(value="INVOKE",target="Lpkg/C;m()V",ordinal=1)) String text,@Share("slot") LocalRef<String> slot,@Cancellable CallbackInfo ci) {}]=],
+      '  public <MethodT> void methodTypeVariableProbe(MethodT value) {}',
+      '}',
+      'class SourceFactsGenericOwner<OwnerT> {',
+      '  public void ownerTypeVariableProbe(OwnerT value) {}',
       '}',
     })
   end
