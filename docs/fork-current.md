@@ -4,9 +4,14 @@ Updated 2026-11-05 (Asia/Tokyo). **Selected Wire editing and Java/Kotlin diagnos
 Java reference erasure through the existing extension API is verified on103;
 its related native/editor evidence is separate from the earlier broad workspace run.
 Library-source preparation105 passes its focused guards and real-archive proof
-comparison; the corrected consumer Java editor run is being checked separately.
-Indexed library-body retention106 now passes its92 related native checks; the
-original consumer handler has not yet been verified with that release.
+comparison; its consumer failure and subsequent106 repair are recorded separately.
+Indexed library-body retention106, public code7327a04, passes its92 related native
+checks; the actual MC106 consumer run remains unverified.
+The agreed [MC responsibility boundary](architecture/extension-ipc.md#current-mc-dev-responsibility-boundary)
+keeps MC source-syntax projection and host-authoritative semantic facts in the mixed
+pipeline. This Kotlin connection needs no new host API; separately demonstrated
+unresolved requests remain open. MC's agreement is docs-only at2919962, with runtime
+unchanged atb0d102c. It adds no acceptance credit or raw-DTO prerequisite.
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -90,9 +95,10 @@ and nested types retain their actual JVM binary names. Direct type variables,
 unresolved bounds/outer identities and unsupported Kotlin lowering stay Unknown.
 No `Object` fallback or new operation was added. The implementation follows
 [JLS21 section4.6](https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.6).
-Existing
+For features requiring exact authored JVM-member correspondence, existing
 `declarationMember` is the appropriate operation; names or consumer-built
-descriptors cannot replace its exact correspondence. This is not evidence of a
+descriptors cannot replace that proof. This is not a universal selector prerequisite
+or evidence of a
 `sourceLocation` failure, which the run never reached. No runner was repeated for
 the contract inspection; that Drill attempt never reached the Kotlin phase.
 The consumer's later NeoForge/explicit-Kotlin-root profile reaches eight of the
@@ -205,6 +211,16 @@ Subsequent model imports performed no application compilation or generation.
 | `project.configur` before `.create(...)` completes to `configurations` and preserves the remaining expression | Passes on98 after merged-JAR entry bounds and annotated Java API rendering fixes | `new-project95/editor98-remaining/artifacts/corpus.out` |
 | Kotlin valid / unresolved-method typo / restored diagnostics | Compiler-certified error counts0/1/0 on98 | `new-project95/editor98-remaining/artifacts/trace-events.jsonl` |
 | Java valid / unresolved-method typo / restored diagnostics | Compiler-certified error counts0/1/0 on101; `noSuchGetType` range18..31 is exact | `new-project95/editor101-java/artifacts/wire-java-diagnostics.json` |
+
+A final sealed106 real-Neovim `corpus --no-build` run checks the shared editing cases together.
+`wire106-final/receipt.json` reports success/passed, exit0 and `guards_stable=true`; source edits were restored.
+Its `editor/artifacts/corpus-results.json` records29 measured/ok checks, including infrastructure and restoration assertions, not29 semantic cases.
+The same run covers Java/Kotlin completion and exact goto, Kotlin partial completion,
+and unsaved Java member addition followed by Kotlin completion, applied call and goto.
+Both diagnostics are0→1→0: `wire-diagnostics.json` and `wire-java-diagnostics.json` in those artifacts each have3 states with `canonical_certified=true`, `wire_matches_snapshot=true` and no RPC error.
+Indexing records project433/library58974/index_failed0;155 unavailable source JARs are not binary misses.
+The182s duration covers the whole run, not a performance baseline. Existing sealed artifacts were reused; no Cargo, new build, full suite or speed benchmark ran.
+Historical94/98/101 evidence remains above; MC106's original handler is still unverified.
 
 Gradle9.7.1/KGP2.3.21 task inventories, fragment roles and the captured JDK21
 target1.8 Java recipe are now supported with existing custom-action and input guards.

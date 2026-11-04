@@ -22,6 +22,28 @@ references and rename consume the same accepted contribution sets as linked prov
 The child does not create an independent project model or return feature-specific LSP
 answers through this semantic protocol.
 
+### Current mc-dev responsibility boundary
+
+Keep the mixed pipeline: MC's existing `MixinSemanticModelParser` projects the original
+source-level Kotlin/Lapis/KMixin syntax, selectors and annotation-array rules. ktlsp remains
+the authority for facts about the same view/source/project/scope, types, candidates, members
+and JVM identities. Prefer host TypeRefs; MC source names are only inputs to queries such
+as `resolveType`. Only host evidence establishes Found. An MC syntax model must not be
+presented as `HostNormalized` or a proven JVM member.
+
+Preserve host Unknown. Return typed unavailable only for the feature needing the missing
+ABI or binding; exact JVM handler correspondence is not a universal selector prerequisite.
+MC changes stay in `HostSemanticProvider::build`, `collect_class_refs` and the relevant
+`declarationMember` requirements. Preserve outer parse-owner/foreign-snapshot, text/version,
+active-view and Java-path guards, quotas and deadlines. Neither replacing all routing with
+`CoreCommandHost` nor full Kotlin/JVM normalization is required for this connection.
+
+This Kotlin connection requests zero new host APIs; that does not withdraw independently
+demonstrated unresolved requests. Consider a small generic fact only when a concrete old
+test proves a missing source occurrence. Raw DTO capture is optional, not a prerequisite.
+The matching [MC responsibility decision](https://github.com/cotrin8672/mc-dev-lsp/blob/291996211207345fd6a711e1c810c612c1fe2691/docs/rust-migration.md#responsibility-decision-2026-11-05)
+records the consumer agreement, not new runtime validation.
+
 Executable path and argv are explicit user registration, separate from provider
 `enabled`/`configuration`. Spawn without a shell; opening a repository must not execute
 repository-selected programs automatically. Initialization options and
