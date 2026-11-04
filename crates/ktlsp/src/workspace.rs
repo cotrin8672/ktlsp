@@ -1120,11 +1120,13 @@ impl Workspace {
             generation: self.analysis_generation, expected: BTreeMap::new(), libraries: Vec::new(), waiting: Vec::new(),
         });
         capture.expected.retain(|key,_|requested.contains(key));
-        crate::trace::span("extension.ipc.project_source_demand", "extension", std::time::Instant::now(),
-            serde_json::json!({"evaluation":evaluation,"owner":owner,"requested_files":requested,
-                "eligible_files":capture.expected.keys().collect::<Vec<_>>()}));
+        let owner=owner.to_owned();
         capture.waiting=self.analysis_extensions.source_waits_for(&self.index,&requested);
         capture.libraries=self.analysis_extensions.take_source_requests_for(&self.index,&requested);
+        crate::trace::span("extension.ipc.project_source_demand", "extension", std::time::Instant::now(),
+            serde_json::json!({"evaluation":evaluation,"owner":owner,"requested_files":requested,
+                "eligible_files":capture.expected.keys().collect::<Vec<_>>(),
+                "library_requests":capture.libraries.len(),"library_waiters":capture.waiting.len()}));
         (!capture.expected.is_empty() || !capture.libraries.is_empty() || !capture.waiting.is_empty()).then_some(capture)
     }
 
@@ -1239,6 +1241,11 @@ impl Workspace {
             }
         }
         result
+    }
+
+    pub(crate) fn reread_ipc_facts(&mut self,evaluation:u64,params:serde_json::Value)->Result<serde_json::Value,String> {
+        // Retain the batch's captured metadata and prepared resources while refreshing facts.
+        self.analysis_extensions.reread_ipc_facts(&self.index,evaluation,params)
     }
 
     pub(crate) fn finish_ipc_work(
@@ -6771,11 +6778,11 @@ mod tests {
     }
 
     #[test]
-    fn ipc_requested_binary_capture_completes_command_demand_before_retiring_its_view() {
+    fn ipc_requested_binary_capture_preserves_nominal_reads_but_rejects_semantic_changes() {
         use std::io::Write;
         use serde_json::json;
 
-        for scenario in ["current", "inflight", "edited", "disabled"] {
+        for scenario in ["current", "inflight", "edited", "disabled", "index"] {
             let root=unique_tmp(&format!("ipc-binary-source-{scenario}"));
             std::fs::create_dir_all(&root).unwrap();
             let binary=root.join("fixture.jar");
@@ -6790,7 +6797,6 @@ mod tests {
             }
             zip.finish().unwrap();
             let mut ws=Workspace::new();
-            ws.register_ipc_provider_commands("test.binary",vec!["fixture-child".into()],vec!["fixture.types".into()]).unwrap();
             for batch in crate::deps::resolve_local_jar_stubs(&binary,&root.join("extract"),
                 &mut crate::parser::KotlinParser::new(),&mut crate::java::JavaParser::new()).unwrap() {
                 assert!(ws.index_dependency_batch(batch));
@@ -6798,6 +6804,8 @@ mod tests {
             ws.bump_index_revision();
             let owner=crate::paths::file_key(&root.join("Owner.java"));
             ws.open(&owner,"import org.spongepowered.asm.mixin.Mixin; @Mixin(arrayfixture.Item.class) class Owner {}".into());
+            assert!(!ws.analysis_extensions.has_framework_providers());
+            ws.register_ipc_provider_commands("test.binary",vec!["fixture-child".into()],vec!["fixture.types".into()]).unwrap();
             let begin=|ws:&mut Workspace|ws.begin_provider_command("test.binary",&owner,"fixture.types".into(),Vec::new(),json!({})).unwrap();
             let work=begin(&mut ws);
             let other=begin(&mut ws);
@@ -6807,6 +6815,11 @@ mod tests {
             let missing=demand(&mut ws,work.evaluation,&["org.spongepowered.asm.mixin.Mixin","arrayfixture.Item"]);
             assert!(missing["facts"].as_array().unwrap().iter().all(|fact|*fact==json!({"state":"unknown","reasons":[{"code":"MissingSource"}]})),"{missing}");
             demand(&mut ws,other.evaluation,&["org.spongepowered.asm.mixin.injection.Inject"]);
+            let semantic=ws.take_ipc_work().into_iter().find(|work|work.params["owner"]==owner).unwrap();
+            demand(&mut ws,semantic.evaluation,&["org.spongepowered.asm.mixin.Mixin"]);
+            ws.ipc_batch(semantic.evaluation,"analysis/finish",json!({"evaluation":semantic.evaluation.to_string(),
+                "contributions":{"sites":[],"diagnostics":[]}})).unwrap();
+            ws.finish_ipc_work(semantic.evaluation,Ok(()));
             let selected:BTreeSet<_>=["Mixin","Item"].into_iter().map(|name|ws.index.lookup_type(name)[0].path.to_string()).collect();
             let unrelated=ws.index.lookup_type("Inject")[0].path.to_string();
             assert!(selected.iter().all(|file|!Path::new(file).exists()));
@@ -6844,27 +6857,30 @@ mod tests {
             assert!(!Path::new(&unrelated).exists(),"another active command's demand is not eagerly loaded");
             if scenario=="edited" {ws.open(&owner,"class Edited {}".into());}
             if scenario=="disabled" {ws.configure_analysis_provider("test.binary",false,"{}".into());}
+            if scenario=="index" {ws.analysis_extensions.mark_index_changed();}
             let changed=ws.finish_ipc_source_capture(prepared);
-            assert!(!ws.ipc_evaluation_current(work.evaluation));
-            assert!(ws.ipc_batch(work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[]})).is_err());
-            assert_eq!(ws.analysis_extensions.finish_ipc_command(work.evaluation,Ok(json!({"obsolete":true}))).unwrap_err(),"Stale");
             for file in &selected {
                 assert!(ws.extension_source_input_identity(file).is_none(),"a binary preview never becomes authored input");
                 assert_eq!(ws.index.file_origin(file).unwrap().representation,ktcore::project_model::SourceRepresentation::Stub);
             }
             if matches!(scenario,"current" | "inflight") {
                 if scenario=="current" {assert!(changed>0);} else {assert_eq!(changed,0);}
-                let fresh=begin(&mut ws);
-                let found=demand(&mut ws,fresh.evaluation,&["org.spongepowered.asm.mixin.Mixin","arrayfixture.Item"]);
+                assert!(ws.ipc_evaluation_current(work.evaluation),"proof delivery does not change indexed names");
+                let found=demand(&mut ws,work.evaluation,&["org.spongepowered.asm.mixin.Mixin","arrayfixture.Item"]);
                 assert!(found["facts"].as_array().unwrap().iter().all(|fact|fact["state"]=="found"),"{found}");
-                let members=ws.ipc_batch(fresh.evaluation,"analysis/readFacts",json!({"evaluation":fresh.evaluation.to_string(),"queries":[
+                let members=ws.ipc_batch(work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[
                     {"op":"declaredMembers","target":found["facts"][0]["value"]["id"]}
                 ]})).unwrap();
                 assert_eq!(members["facts"][0]["coverage"]["state"],"unknown","{members}");
                 assert!(members["facts"][0]["members"].as_array().unwrap().is_empty());
-                assert_eq!(ws.analysis_extensions.finish_ipc_command(fresh.evaluation,Ok(found.clone())).unwrap(),found);
+                assert_eq!(ws.analysis_extensions.finish_ipc_command(work.evaluation,Ok(found.clone())).unwrap(),found);
+                assert!(ws.take_ipc_work().iter().any(|work|work.params["owner"]==owner),
+                    "committed MissingSource consumers must be reevaluated after proof delivery");
             } else {
                 assert_eq!(changed,0,"stale or disabled demand cannot accept the late source batch");
+                assert!(!ws.ipc_evaluation_current(work.evaluation));
+                assert!(ws.ipc_batch(work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[]})).is_err());
+                assert_eq!(ws.analysis_extensions.finish_ipc_command(work.evaluation,Ok(json!({"obsolete":true}))).unwrap_err(),"Stale");
                 if scenario=="edited" {
                     let fresh=begin(&mut ws);
                     demand(&mut ws,fresh.evaluation,&["org.spongepowered.asm.mixin.Mixin"]);
@@ -11076,6 +11092,19 @@ mod kotlin_diagnostic_lifecycle_tests {
             diagnostics: Vec::new(), clean: true, java_clean: Some(proof),
         }, Arc::new(AtomicBool::new(false)));
         assert!(ws.kotlin_diagnostic_result_id(&java).is_none(), "different compiler inputs cannot reuse a body receipt");
+        for invalid_external in [false, true] {
+            let (mut ws, _, _, java) = fixture();
+            ws.change(&java, "class Main { boolean call(Schema schema, ProtoType type) { return schema.noSuchGetType(type) != null; } }".into());
+            let request = ticket(&mut ws);
+            let error = reported(&request, &java, "noSuchGetType");
+            if !invalid_external {
+                ws.change(&java, "class Main { String newer; }".into());
+            }
+            assert!(ws.finish_kotlin_diagnostics(&request, error,
+                Arc::new(AtomicBool::new(invalid_external))).is_empty(),
+                "current compiler errors cannot bypass a stale source or invalidated external-input epoch");
+            assert!(ws.kotlin_diagnostic_result_id(&java).is_none());
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Current fork state
 
-Updated 2026-11-05 (Asia/Tokyo). **Binary annotation resolution94 passes focused checks; original CEM integration and one additional repository are being checked.**
+Updated 2026-11-05 (Asia/Tokyo). **Selected Wire editing and Java/Kotlin diagnostic cases pass. Discovered Rust regressions are fixed and remaining workspace targets checked. Original CEM first completion and the85-member comparison also pass.**
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -16,18 +16,132 @@ The focused repair run passes hydration10, IPC12 and the workspace IPC lifecycle
 case1 (23 total); the locked release binary is sealed with stable input hashes.
 Evidence: `annotation-resolve94/native94-repair/{receipt,main-ready}.json`.
 The failed first compile is retained under `annotation-resolve94/native94`.
-This is not yet a claim that the original CEM completion/85-member comparison passes.
+The later original CEM acceptance result is recorded below; this focused run alone
+did not prove it.
+
+The original D10 first-completion request then failed with `Stale`: evaluation13
+delivered selected binary proof and changed namespace1 to2, although source SHA,
+document version3/revision2, analysis generation1 and provider instance2 were unchanged.
+Evidence: the `extension.ipc.source_capture`, `pending_validation_failed` and
+`command_validation` evaluation13 rows in
+`C:/Users/gummy/.codex/worktrees/ktlsp-rust/mc-dev-lsp/build/cem-host94-source-9e30558-20261105/build/rust-test-logs/cem-project-20261105-011644904-ad911c67/host.trace.jsonl`.
+The follow-up implementation treats empty `UnsupportedSource` Stub admission as
+proof of an already indexed nominal identity, preserves every existing read-set
+guard, retires committed MissingSource consumers, and clears fulfilled demand.
+The host re-reads the still-unsent facts once using the original wire quota charge
+and prepared inputs. It does not restart the child command or add an editor retry.
+Candidate96 passes32 focused checks, including the external-child outer-command
+regression explicitly run with `--ignored`. The original CEM then still returned
+MissingSource: its90,185-byte signed manifest exceeded a whole-manifest64KiB limit,
+although the main section needed for class selection was only436 bytes. The reader
+now consumes only the bounded main section and preserves MR-JAR selection checks.
+Archive provenance is also retained before framework registration, without loading
+all dependency source text. The outer-command regression now covers late registration
+and a large manifest together. Candidate98 passes18 affected checks with stable input
+hashes. These counts are separate runs, not a sum of distinct cases. Candidate98's
+real CEM run stopped before completion when the full Info readiness query was cancelled
+after5 seconds;24 resource-inventory pages had succeeded. That preparation failure is
+retained. A temporary test overlay aligned only that preparation observation with the
+existing60-second startup deadline; source bytes,85-member oracle, completion
+expectations, product binary and client retry behavior remained unchanged.
+Candidate101 then returned the first completion with7 items, target1 and
+`isIncomplete=false`, from the original254 CRLF bytes/version3. Both protocol and
+envelope errors were absent. The original85-member oracle matched the complete
+owner/name/descriptor sets: Item62 and BlockItem23, without missing, unexpected or
+duplicate rows. Raw native responses independently reproduce the same comparison.
+Info took3089.1656ms; the first completion took4899.6849ms. These are single
+observations, not a latency distribution or a new performance acceptance threshold.
+The overall run still exited1: Blink v2 requires Neovim0.12+, while the pinned
+Neovim0.11.5 lacks the `vim.pos` API used by its real context constructor. The
+provider-cache context lacked `pos`; later aggregate/snippet assertions were not
+reached and no synthetic position was added to make them pass. This UI environment
+mismatch is separate from the successful host results. Normal host shutdown returned0.
+Evidence: `original85-member-comparison.json` under the external run
+`cem-project-20261105-034633094-d1b9e197`, rooted at
+`C:/Users/gummy/.codex/worktrees/ktlsp-rust/mc-dev-lsp/build/cem-readiness60-source-9e30558-20261105/build/rust-test-logs`.
+
+The additional repository is Square Wire revision
+`9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable
+checkout supplied configuration-build prerequisites; the LSP did not regenerate them.
+Subsequent model imports performed no application compilation or generation.
+
+| Actual Wire workflow | Observed result | Evidence relative to RUN |
+| --- | --- | --- |
+| Project/dependency completion, Java/Kotlin goto, unsaved Java member completion and applied snippet | Nine selected editor checks pass on94 | `new-project95/editor94-extra3/artifacts/corpus.out` |
+| `project.configur` before `.create(...)` completes to `configurations` and preserves the remaining expression | Passes on98 after merged-JAR entry bounds and annotated Java API rendering fixes | `new-project95/editor98-remaining/artifacts/corpus.out` |
+| Kotlin valid / unresolved-method typo / restored diagnostics | Compiler-certified error counts0/1/0 on98 | `new-project95/editor98-remaining/artifacts/trace-events.jsonl` |
+| Java valid / unresolved-method typo / restored diagnostics | Compiler-certified error counts0/1/0 on101; `noSuchGetType` range18..31 is exact | `new-project95/editor101-java/artifacts/wire-java-diagnostics.json` |
+
+Gradle9.7.1/KGP2.3.21 task inventories, fragment roles and the captured JDK21
+target1.8 Java recipe are now supported with existing custom-action and input guards.
+The selected main classpath has12 indexed external modules, no unresolved dependencies
+and no binary-index failure. The155 source-JAR misses are not missing binary dependencies.
+The merged Gradle API has52,102 archive entries; binary metadata now has a separate
+100,000-entry bound while source extraction retains its50,000 bound. Its ordinary
+Java declaration annotations no longer discard the `Project` API or its getter.
+No general whole-repository or all-language IDEA parity is claimed by these cases.
+
+The unchanged candidate96 CEM replay at
+`cem-project-20261105-021422946-9bad26d3` under that same external run root
+now retains a current evaluation11 and transport success, but its first command
+still returns MissingSource for both Mixin aliases and no items; the85-member
+comparison remains unreached. Three dependencies were requested, only one prepared.
+Direct inspection confirms the actual selected `mixin-0.8.7.jar` manifest is90,185
+bytes, with a436-byte main section. Its Mixin/Inject class SHA-256 values equal
+the checked-in mixin087 fixtures. `LibrarySource::has_binary_type` calls the shared
+effective-class selector, which rejected the entire manifest above64 KiB before
+selecting either class. The new fix reads only the main section within the same
+64 KiB bound. Existing MR-JAR profile selection and input guards remain enforced.
+A separately confirmed index-before-provider gap discarded LibrarySource metadata;
+selection now retains its existing Arc archive handle before the retention gate,
+without constructing stamps or reading source text before a provider needs them.
+The outer-command regression now uses that event order plus an oversized per-entry
+manifest. The existing MR-selector case also retains the main-section size limit.
+Status: **implemented and checked**. Candidate98 passes18 affected native checks,
+including the explicitly enabled first-command regression, effective-MR selection
+and workspace lifecycle. Candidate101 passes the original first completion and85
+comparison described above. No
+runtime assertion about actual provider registration timing is established by
+the old trace; manifest rejection is independently confirmed from its jar bytes.
+
 The previously unseen mixed-language Okio repository now has eight accepted editor
 interop checks and three current canonical diagnostic states (valid, invalid,
 restored). Its reproduced Gradle/Kotlin and mixed-source producer gaps are fixed.
 MockK's reproduced diagnostic/producer-lifetime failure is also fixed and verified.
-The latest broad workspace93 run covers42 test binaries:1968 passed,16 existing
+The historical broad workspace93 run covers42 test binaries:1968 passed,16 existing
 ignored, and one old initialize-stream capability-mask expectation failed. Adding
 the independently negotiated annotation-sites bit to its two explicit masks makes
 that same test pass in the targeted repair. Production is unchanged by this
 test-only correction; no unrelated suite or editor replay was added. Preserve both
 `final-workspace93/receipt.json` and `final-workspace93-repair/receipt.json`; this is
 combined evidence, not a claim that the original broad command exited0.
+The current broad workspace101 command passed1027 tests, failed2 and ignored16
+across5 completed binaries before Cargo stopped. Both failures now pass targeted
+repair: the JVM-default profile guard and a test's obsolete binary-cache fingerprint.
+Resuming only previously unrun targets passed884 tests, failed2 and ignored1 across
+26 further completed binaries. The two `binary_known_leaf_override` cases lost
+useful results through `NestedBoundMid`: an unavailable ancestor method poisoned a
+known receiver-declared override. The shared candidate collector now excludes that
+ancestor blocker only for one proven public instance zero-argument method; unknown
+arity, static/private/generic/extension and receiver-own blockers remain intact.
+The new focused guard and both failed cases pass. The71 other member-selection
+tests also pass on the repaired shared collector. All nine previously unrun
+integration targets pass61 tests; both documentation targets complete with zero
+doctests. Combined evidence covers1977 unique successful tests, with17 ignored in
+the original broad/continuation runs. One of those ignored cases, the external-child
+outer-command regression, passed explicitly on98 with its required child.
+Preserve `final-workspace101/receipt.json` and `integrated-input102-unrun/receipt.json`;
+neither failed command is a passing suite. The completed coverage ledger and final
+receipts are `integrated-input102-unrun/coverage-ledger.md`,
+`integrated-input102-retry/receipt.json` and
+`integrated-input102-member-rest/targeted-passed.json`. Earlier passing targets
+were not replayed wholesale; only the directly affected member-selection target
+was broadened after its shared algorithm changed.
+The locked release host is sealed at `integrated-input102-retry/ktlsp.exe`,
+SHA-256 `d31c9e623a6b51256257300514556ebe5fa07aaa08d23841af2834f545cba833`.
+Its embedded Gradle init input remains
+`6528a6d85110ada780c378d9eb8e6780dadb3af4dcdb63bddcc959b2f496e93d`;
+the verified external child remains unchanged from96. Source guards are stable.
 Release85 additionally passes the focused source-parameter native checks and30 real-editor checks.
 Release86 adds17 focused host checks, one child check and one real-editor root-file scenario.
 The readonly JVM-name follow-up passes36 real-editor checks on88. Host89 fixes the
@@ -35,7 +149,8 @@ newly reproduced Resilience4j diagnostic gap and verifies error counts0/1/0 agai
 the pinned compiler. CEM92 preflight now succeeds without a retry or stale command.
 The next original CEM completion exposed a genuine missing dangling-annotation
 fact. Generic annotationSites93 passes95 native and22 real-editor checks while
-the actual CEM consumer integration remains unverified. Earlier broad84/89 results
+that run alone did not verify the actual CEM consumer. Its later101 first-completion
+and85-member results are recorded above. Earlier broad84/89 results
 are retained separately as historical evidence.
 Broader grammar, SDK/compiler-profile coverage and whole-project IDEA parity remain unmeasured;
 there is no invented completeness percentage or requirement for100% grammar.
@@ -58,10 +173,12 @@ The complete previous record is preserved in
 are historical observations, not a list of current regressions. Performance targets
 and comparison rules remain in [performance budgets](fork-performance-budgets.md).
 
-## Latest qualified acceptance through89
+## Earlier qualified acceptance through93
 
 Release artifacts are immutable and identified by their receipts; rows below span
 different releases and must not be presented as one same-binary corpus replay.
+Pending/unverified statements below describe their named historical release; the
+current Wire, CEM and Rust outcomes are recorded above.
 
 | Workflow | Result and evidence under RUN | Scope / limit |
 |---|---|---|

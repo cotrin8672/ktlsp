@@ -1179,7 +1179,11 @@ impl ExtensionStore {
             .collect();
         let prepared = prepared.or_else(||tree.as_ref().map(|tree|
             source::prepare_source_references(index, file, text.clone(), tree)));
-        self.replace_source_impl(index, file, text, coverage, members, prepared, refresh)?;
+        let nominal_proof = declarations.is_empty() && prepared.is_some()
+            && coverage == unknown(IncompleteReason::UnsupportedSource)
+            && index.origin_facts().and_then(|facts| facts.file_origin(file))
+                .is_some_and(|origin| origin.representation == SourceRepresentation::Stub);
+        self.replace_source_impl(index, file, text, coverage, members, prepared, refresh, nominal_proof)?;
         self.sources.get_mut(file).unwrap().declarations = declarations;
         Ok(())
     }
@@ -1194,7 +1198,7 @@ impl ExtensionStore {
         coverage: Fact<()>,
         members: Vec<DeclaredMemberFacts>,
     ) -> Result<(), ContractError> {
-        self.replace_source_impl(index, file, text, coverage, members, None, false)
+        self.replace_source_impl(index, file, text, coverage, members, None, false, false)
     }
 
     fn replace_source_impl(
@@ -1206,6 +1210,7 @@ impl ExtensionStore {
         members: Vec<DeclaredMemberFacts>,
         prepared: Option<source::PreparedSourceReferences>,
         refresh: bool,
+        nominal_proof: bool,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let mut types: Vec<_> = entries
@@ -1218,7 +1223,8 @@ impl ExtensionStore {
         let namespace_changed = self
             .sources
             .get(file)
-            .is_none_or(|source| source.types != types);
+            // A verified Stub proof admits an already indexed identity, not a new name.
+            .map_or(!nominal_proof, |source| source.types != types);
         let mut normalized = BTreeMap::new();
         for member in members {
             if member.definition.file != file {
@@ -1590,7 +1596,10 @@ impl ExtensionStore {
         let stale: Vec<_> = self
             .sets
             .iter()
-            .filter(|(_, pending)| !self.is_current(pending))
+            // Published MissingSource results must be reevaluated when their proof arrives;
+            // an active read can instead consume it before sending its first result.
+            .filter(|(_, pending)| !self.is_current(pending)
+                || pending.reads.missing_sources.iter().any(|file| self.sources.contains_key(file)))
             .map(|(key, _)| key.clone())
             .collect();
         if !stale.is_empty() {
@@ -2963,6 +2972,7 @@ impl ReadSession<'_> {
             .get(entry.path.as_ref())
             .ok_or(ContractError::MissingSource)?;
         validate_entry(&source.text, entry)?;
+        self.reads.missing_sources.remove(entry.path.as_ref());
         self.reads
             .files
             .insert(entry.path.to_string(), source.generation);

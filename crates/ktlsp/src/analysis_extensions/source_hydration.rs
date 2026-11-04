@@ -820,13 +820,14 @@ impl AnalysisExtensions {
         origin: Option<FileOrigin>,
         source: Option<Arc<LibrarySource>>,
     ) {
-        if !self.retain_all_sources {
-            return;
-        }
         if let (Some(origin), Some(source)) = (origin, source) {
             self.library_sources.insert(file.into(), (origin, source));
         } else {
             self.library_sources.remove(file);
+        }
+        // Providers may register after indexing; retain archive handles without loading text.
+        if !self.retain_all_sources {
+            return;
         }
         let stamp = self.source_stamp(index, file);
         if self.source_producers.get(file).is_some_and(|producer| {

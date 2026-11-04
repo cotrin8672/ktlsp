@@ -4420,14 +4420,15 @@ fn kotlin_fragment_source_roles(
 ) -> anyhow::Result<Option<KotlinFragmentSourceRoles>> {
     if !task.arguments.iter().any(|argument|argument.starts_with("-Xfragment")) {return Ok(None);}
     let recipe = task.kotlin_compiler.as_ref().ok_or_else(||anyhow::anyhow!("kotlin-fragment-runtime-unknown"))?;
-    anyhow::ensure!(recipe.compiler_version=="2.2.21" && recipe.gradle_plugin_version=="2.2.21"
+    anyhow::ensure!(matches!(recipe.compiler_version.as_str(), "2.2.21" | "2.3.21")
+        && recipe.gradle_plugin_version==recipe.compiler_version
         && task.complete && task.problem.is_none()
         && task.arguments.iter().any(|argument|argument=="-Xmulti-platform")
         && !task.arguments.iter().any(|argument|argument.starts_with("-Xcommon-sources")),
         "kotlin-fragment-profile-unhandled");
     let roles: KotlinFragmentSourceRoles = serde_json::from_value(task.options.get("kotlinFragmentSourceRoles")
         .cloned().ok_or_else(||anyhow::anyhow!("kotlin-fragment-source-roles-unknown"))?)?;
-    anyhow::ensure!(roles.adapter=="kgp-2.2.21-jvm-fragment-sources-v1" && roles.task==task.task
+    anyhow::ensure!(roles.adapter==format!("kgp-{}-jvm-fragment-sources-v1", recipe.compiler_version) && roles.task==task.task
         && !roles.fragments.is_empty() && roles.fragments.len()<=256 && roles.refines.len()<=1024
         && roles.sources.len()<=65_536, "kotlin-fragment-source-roles-unhandled");
     let mut names = std::collections::BTreeSet::new();
@@ -4611,7 +4612,8 @@ fn kotlin_editor_arguments(
                     }
                     if argument == "-opt-in" {
                         anyhow::ensure!(request.task.kotlin_compiler.as_ref().is_some_and(|runtime|
-                            runtime.compiler_version == "2.2.21" && runtime.gradle_plugin_version == "2.2.21")
+                            matches!(runtime.compiler_version.as_str(), "2.2.21" | "2.3.21")
+                                && runtime.gradle_plugin_version == runtime.compiler_version)
                             && value.split(',').all(|name| name.split('.').all(|part| {
                                 let mut chars=part.chars();
                                 chars.next().is_some_and(|ch|ch.is_alphabetic() || ch=='_' || ch=='$')
@@ -4655,6 +4657,9 @@ fn kotlin_editor_arguments(
             | "-Xjsr305=strict"
             | "-opt-in=kotlin.RequiresOptIn"
             | "-Xexplicit-api=strict" => result.push(argument.clone()),
+            "-Xjvm-default=all" if request.task.kotlin_compiler.as_ref().is_some_and(|runtime|
+                runtime.compiler_version == "2.3.21" && runtime.gradle_plugin_version == "2.3.21") =>
+                result.push(argument.clone()),
             _ if argument.starts_with("-Xcommon-sources=") => {
                 anyhow::ensure!(!common_sources && request.task.arguments.iter().any(|a| a == "-Xmulti-platform"),
                     "kotlin-common-source-role-unhandled");
@@ -5982,23 +5987,27 @@ mod kotlin_editor_compile_tests {
 
     #[test]
     fn argument_adapter_replays_attested_fragment_roles_with_private_source_copies() {
+        for (version, language) in [("2.2.21", "2.1"), ("2.3.21", "2.0")] {
         let root=std::env::temp_dir().join("ktlsp-fragment-role-args");
         let mut request=kotlin_test_request(&root);
         let recipe=request.task.kotlin_compiler.as_mut().unwrap();
-        recipe.compiler_version="2.2.21".into();recipe.gradle_plugin_version="2.2.21".into();
-        recipe.run_via_build_tools_api=false;
+        recipe.compiler_version=version.into();recipe.gradle_plugin_version=version.into();
+        recipe.run_via_build_tools_api=version=="2.3.21";
         recipe.execution_strategy=crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
         let common=root.join("common/Expected.kt");let jvm=root.join("jvm/Actual.kt");
         request.sources=vec![jvm.clone(),common.clone()];request.task.source_files=vec![common.clone(),jvm.clone()];
         let private=[root.join("private/Actual.kt"),root.join("private/Expected.kt")];let output=root.join("private/classes");
         let target=request.task.arguments.iter().position(|argument|argument=="-jvm-target").unwrap()+1;
         request.task.arguments[target]="1.8".into();
-        request.task.arguments.extend(["-language-version","2.1","-api-version","2.1","-Xmulti-platform","-Xexpect-actual-classes",
+        request.task.arguments.extend(["-language-version",language,"-api-version",language,"-Xmulti-platform","-Xexpect-actual-classes",
             "-Xfragment-refines=jvmMain:commonMain","-Xfragments=jvmMain,commonMain"].map(str::to_owned));
+        if version=="2.3.21" {
+            request.task.arguments.extend(["-Xjvm-default=all", "-opt-in", "kotlin.experimental.ExperimentalObjCName,kotlinx.cinterop.BetaInteropApi,kotlinx.cinterop.ExperimentalForeignApi"].map(str::to_owned));
+        }
         let roles=vec![format!("commonMain:{}",common.display()),format!("jvmMain:{}",jvm.display())];
         request.task.arguments.push(format!("-Xfragment-sources={}",roles.join(",")));
         request.task.options.insert("kotlinFragmentSourceRoles".into(),serde_json::json!({
-            "adapter":"kgp-2.2.21-jvm-fragment-sources-v1","task":request.task.task,
+            "adapter":format!("kgp-{version}-jvm-fragment-sources-v1"),"task":request.task.task,
             "fragments":["jvmMain","commonMain"],"refines":["jvmMain:commonMain"],"sources":roles}));
         let original=request.task.arguments.clone();
         let remapped=kotlin_editor_arguments(&request,&output,&private).unwrap();
@@ -6040,6 +6049,7 @@ mod kotlin_editor_compile_tests {
             assert!(kotlin_editor_arguments(&changed,&output,&private).is_err(),"{case}");
         }
         assert!(kotlin_editor_arguments(&request,&output,&private[..1]).is_err());
+        }
     }
 
     #[test]

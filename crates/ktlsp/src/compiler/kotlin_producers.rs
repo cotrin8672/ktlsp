@@ -44,7 +44,8 @@ fn tasks(source: &SourceSetClasspath) -> Option<(&CompilerTask, &CompilerTask)> 
     let mixed = !java.source_files.is_empty();
     let source_roles = if mixed {
         java.java_compiler_recipe().is_some_and(|recipe|
-            recipe.adapter == "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
+            matches!(recipe.adapter.as_str(), "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
+                | "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1")
                 && java.java_api_option_slots(&recipe).is_ok())
             && selected_java == java_sources && java_sources.len() == java.source_files.len()
             && java.source_files.iter().all(|path| path.extension().and_then(|e| e.to_str()) == Some("java"))

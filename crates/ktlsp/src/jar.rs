@@ -13,6 +13,10 @@ use anyhow::Context;
 /// malicious archive with an absurd number of entries.
 pub(crate) const MAX_SOURCE_FILES: usize = 50_000;
 
+/// Merged binary JARs include resources and directories alongside classes (Gradle's API exceeds
+/// 50,000 total entries). Bound binary metadata separately from extracted source files.
+const MAX_BINARY_ARCHIVE_ENTRIES: usize = 100_000;
+
 /// Cap on the per-entry capacity hint taken from the archive's declared uncompressed size, so a
 /// forged header cannot trigger an absurd upfront allocation.
 const MAX_ENTRY_SIZE_HINT: u64 = 64 << 20;
@@ -53,7 +57,7 @@ pub(crate) fn selected_class_entries<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>, prefix: &str, feature: Option<u16>,
     current: impl Fn() -> bool,
 ) -> Result<Vec<SelectedClassEntry>, String> {
-    if archive.len()>MAX_SOURCE_FILES {return Err("class archive entry limit".into());}
+    if archive.len()>MAX_BINARY_ARCHIVE_ENTRIES {return Err("class archive entry limit".into());}
     if archive.has_duplicate_names() {return Err("ambiguous class archive entries".into());}
     let mut manifests=Vec::new();
     for index in 0..archive.len() {
@@ -66,7 +70,12 @@ pub(crate) fn selected_class_entries<R: Read + io::Seek>(
     if manifests.len()>1 {return Err("ambiguous JAR manifest".into());}
     let multi_release=if let Some(index)=manifests.first() {
         let mut entry=archive.by_index(*index).map_err(|error|error.to_string())?;
-        let mut bytes=Vec::new();entry.by_ref().take(64*1024+1).read_to_end(&mut bytes).map_err(|error|error.to_string())?;
+        // Signed per-entry sections can be large; selection only needs the bounded main section.
+        let mut bytes=Vec::new();
+        for byte in io::BufReader::new(entry.by_ref().take(64*1024+1)).bytes() {
+            bytes.push(byte.map_err(|error|error.to_string())?);
+            if bytes.ends_with(b"\n\n") || bytes.ends_with(b"\n\r") || bytes.ends_with(b"\r\r") {break;}
+        }
         if bytes.len()>64*1024 {return Err("JAR manifest limit".into());}
         let text=std::str::from_utf8(&bytes).map_err(|_|"invalid JAR manifest encoding")?;
         let mut attributes=std::collections::BTreeMap::<String,String>::new();
@@ -777,7 +786,7 @@ fn visit_class_stub_facts_selected(
     let unique_entries = declared_entries == Some(archive.len());
     let no_nested = std::collections::BTreeMap::new();
     anyhow::ensure!(
-        archive.len() <= MAX_SOURCE_FILES,
+        archive.len() <= MAX_BINARY_ARCHIVE_ENTRIES,
         "too many binary jar entries"
     );
     let versioned: BTreeSet<_> = archive
@@ -1040,8 +1049,8 @@ fn java_class_stub_facts(
     java_declaration_stub(class, false)
 }
 
-/// Only a pinned compiler SDK archive establishes that absent SourceFile and API annotations
-/// describe Java declarations rather than an unknown source-language lowering.
+/// Only a pinned compiler SDK archive establishes that absent SourceFile describes Java
+/// declarations rather than an unknown source-language lowering.
 pub(crate) fn selected_sdk_class_stub_facts(
     selection: &crate::classpath::SdkApiSelection,
     class: &ktcore::classfile::ClassFileFacts,
@@ -1226,13 +1235,14 @@ fn java_declaration_stub_scoped(
         || (class.source_file.is_some() || !selected_sdk)
             && class.source_file.as_deref()
                 != Some(expected_source.unwrap_or(format!("{name}.java").as_str()))
+        || class.annotations.iter().any(|annotation| {
+            annotation.annotation.descriptor.starts_with("Lkotlin/")
+        })
         || class.attribute_names.iter().any(|attribute| {
             (!selected_sdk
                 && matches!(
                     attribute.as_ref(),
-                    "RuntimeVisibleAnnotations"
-                        | "RuntimeInvisibleAnnotations"
-                        | "RuntimeVisibleTypeAnnotations"
+                    "RuntimeVisibleTypeAnnotations"
                         | "RuntimeInvisibleTypeAnnotations"
                 ))
                 || matches!(
@@ -1447,8 +1457,12 @@ fn java_declaration_stub_scoped(
                     !matches!(
                         attribute.as_ref(),
                         "Code" | "Signature" | "Exceptions" | "MethodParameters" | "Deprecated"
+                            | "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations"
                     )
                 })
+            || method.annotations.iter().any(|annotation| {
+                annotation.annotation.descriptor.starts_with("Lkotlin/")
+            })
             || method.access_flags & 0x0005 == 0x0005
             || method.access_flags
                 & !(PUBLIC
@@ -2495,6 +2509,100 @@ mod tests {
     }
 
     #[test]
+    fn binary_java_annotated_gradle_project_completes_mid_chain_property() {
+        let class = ktcore::classfile::decode(
+            "fixture:gradle-api:9.7.1",
+            include_bytes!("../tests/fixtures/gradle971/Project.class"),
+        )
+        .unwrap();
+        assert_eq!(class.identity.internal_name, "org/gradle/api/Project");
+        assert!(class.annotations.iter().any(|annotation| annotation.annotation.descriptor.as_ref()
+            == "Lorg/gradle/internal/instrumentation/api/annotations/NotToBeMigratedToLazy;"));
+        let getter = class
+            .methods
+            .iter()
+            .find(|method| method.name.as_ref() == "getConfigurations")
+            .unwrap();
+        assert_eq!(
+            getter.descriptor.as_ref(),
+            "()Lorg/gradle/api/artifacts/ConfigurationContainer;"
+        );
+        assert!(
+            getter
+                .annotations
+                .iter()
+                .any(|annotation| annotation.annotation.descriptor.as_ref()
+                    == "Lorg/gradle/declarative/dsl/model/annotations/HiddenInDefinition;")
+        );
+        let (source, unavailable) = java_class_stub_facts(&class).expect("annotated Java API");
+        assert!(
+            source.contains("org.gradle.api.artifacts.ConfigurationContainer getConfigurations();")
+        );
+        assert!(
+            !unavailable
+                .iter()
+                .any(|(name, _, _)| name == "getConfigurations")
+        );
+        let mut java = crate::java::JavaParser::new();
+        let tree = java.parse(&source);
+        assert!(!tree.root_node().has_error(), "{source}");
+        let mut symbols = crate::java::extract_symbols(&tree, &source);
+        symbols
+            .iter_mut()
+            .find(|symbol| symbol.name == "Project")
+            .unwrap()
+            .unavailable_members = Some(Box::new(unavailable));
+        let mut workspace = crate::workspace::Workspace::new();
+        workspace.index.replace_file(
+            "org/gradle/api/Project.java",
+            symbols,
+            crate::index::Tier::Durable,
+        );
+        let original = "package com.squareup.wire.gradle\nimport org.gradle.api.Plugin\nimport org.gradle.api.Project\nclass WirePlugin : Plugin<Project> {\n  internal lateinit var project: Project\n  override fun apply(project: Project) {\n    this.project = project\n    project.configurations.create(\"protoProjectDependenciesJvm\")\n  }\n}\n";
+        workspace.open("WirePlugin.kt", original.into());
+        let mut partial =
+            original.replace("project.configurations.create", "project.configur.create");
+        workspace.change("WirePlugin.kt", partial.clone());
+        let offset = partial.find("project.configur.create").unwrap() + "project.configur".len();
+        let query = workspace.completion_query("WirePlugin.kt", offset).unwrap();
+        assert_eq!(query.prefix, "configur");
+        assert!(
+            query.candidates.iter().any(|candidate| {
+                candidate.label == "configurations"
+                    && candidate.kind == ktcore::symbol::SymbolKind::Property
+            }),
+            "candidates: {:?}", query.candidates.iter().map(|candidate| candidate.label.as_str()).collect::<Vec<_>>()
+        );
+        let item = workspace
+            .complete("WirePlugin.kt", offset, false)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| {
+                item.label == "configurations" && item.kind == ktcore::symbol::SymbolKind::Property
+            })
+            .unwrap();
+        assert!(!item.is_snippet);
+        assert!(item.auto_import.is_none());
+        let range = item
+            .replace_range
+            .unwrap_or(offset - "configur".len()..offset);
+        partial.replace_range(range, &item.insert_text);
+        assert_eq!(
+            partial, original,
+            "completion preserves the rest of the call chain"
+        );
+        workspace.change("WirePlugin.kt", partial);
+
+        let mut lowered = class.clone();
+        lowered.annotations[0].annotation.descriptor = "Lkotlin/Metadata;".into();
+        assert!(java_class_stub_facts(&lowered).is_none());
+        let mut non_java = class.clone();
+        non_java.source_file = Some("Project.kt".into());
+        assert!(java_class_stub_facts(&non_java).is_none());
+    }
+
+    #[test]
     fn binary_java_default_interface_keeps_hierarchy_and_name_specific_unknowns() {
         use ktcore::extensions::{Dispatch, Visibility};
         let source = "package defaultfixture; interface Implicit { int VALUE = 1; }";
@@ -2612,7 +2720,7 @@ mod tests {
         let mut annotated = original.clone();
         annotated
             .attribute_names
-            .push("RuntimeVisibleAnnotations".into());
+            .push("RuntimeVisibleTypeAnnotations".into());
         assert!(java_class_stub(&annotated).is_none());
         for failure in ["annotation", "flags", "signature"] {
             let mut unsupported = original.clone();
@@ -2624,7 +2732,7 @@ mod tests {
             match failure {
                 "annotation" => method
                     .attribute_names
-                    .push("RuntimeVisibleAnnotations".into()),
+                    .push("RuntimeVisibleTypeAnnotations".into()),
                 "flags" => method.access_flags = 0x0409,
                 _ => method.signature = Some("()TT;".into()),
             }
@@ -3182,8 +3290,10 @@ mod tests {
             ("META-INF/versions/09/mr/Api.class",b"noncanonical version bytes"),
             ("META-INF/versions/8/mr/Api.class",b"ignored pre9 version bytes"),
             ("META-INF/versions/17/META-INF/Fake.class",b"nonversionable resource")];
+        let signed_manifest=format!("Manifest-Version: 1.0\r\nMulti-Release: tr\r\n ue\r\n\r\n{}",
+            "Name: fixture/Entry.class\r\nSHA-256-Digest: padding\r\n\r\n".repeat(1800));
         for manifest in [None,Some("Manifest-Version: 1.0\r\nMulti-Release: false\r\n\r\n"),
-            Some("Manifest-Version: 1.0\r\nMulti-Release: tr\r\n ue\r\n\r\n")] {
+            Some("Manifest-Version: 1.0\r\nMulti-Release: tr\r\n ue\r\n\r\n"),Some(signed_manifest.as_str())] {
             let mut entries=entries.clone();
             if let Some(manifest)=manifest {entries.push(("META-INF/MANIFEST.MF",manifest.as_bytes()));}
             write_binary_jar(&path,&entries);
@@ -3204,6 +3314,9 @@ mod tests {
             }
             assert_eq!(read_effective_class_bytes(&path,"mr/Api","",None,||true).is_err(),enabled);
         }
+        let oversized_main=format!("Manifest-Version: 1.0\nLong-Attribute: {}\n\n","x".repeat(64*1024));
+        write_binary_jar(&path,&[("META-INF/MANIFEST.MF",oversized_main.as_bytes()),("mr/Api.class",base)]);
+        assert_eq!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).unwrap_err(),"JAR manifest limit");
         write_binary_jar(&path,&[("META-INF/MANIFEST.MF",b"Manifest-Version: 1.0\nMulti-Release: true\n\n"),
             ("META-INF/versions/17/mr/../Api.class",base)]);
         assert!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).is_err());
@@ -3216,6 +3329,62 @@ mod tests {
         fs::write(&path,bytes).unwrap();
         assert!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).unwrap_err().contains("ambiguous"));
         assert_eq!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||false).unwrap_err(),"Stale");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_archive_entry_budget_is_independent_of_source_extraction() {
+        let class =
+            include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_binary_entry_budget_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.jar");
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for resource_count in [MAX_SOURCE_FILES, MAX_BINARY_ARCHIVE_ENTRIES] {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            zip.start_file("pluginfixture/Person.class", opts).unwrap();
+            zip.write_all(class).unwrap();
+            for index in 0..resource_count {
+                zip.start_file(format!("res/{index}"), opts).unwrap();
+            }
+            zip.finish().unwrap();
+
+            let mut visits = Vec::new();
+            let stubs = visit_class_stub_facts(&path, &root.join("stubs"), |path, source, owners| {
+                visits.push((path.to_path_buf(), source.to_owned(), owners));
+                Ok(())
+            });
+            let selected =
+                read_effective_class_bytes(&path, "pluginfixture/Person", "", None, || true);
+            if resource_count == MAX_SOURCE_FILES {
+                stubs.unwrap();
+                assert_eq!(visits.len(), 1);
+                assert!(visits[0].0.ends_with("pluginfixture/Person.java"));
+                assert!(visits[0].1.contains("java.lang.String getName("));
+                assert!(visits[0].2.as_ref().unwrap().contains_key("Person"));
+                let bytes = selected.unwrap().unwrap();
+                assert_eq!(bytes, class);
+                let facts = ktcore::classfile::decode("entry-budget", &bytes).unwrap();
+                assert_eq!(facts.identity.internal_name, "pluginfixture/Person");
+                assert!(facts.methods.iter().any(|method| {
+                    method.name.as_ref() == "getName"
+                        && method.descriptor.as_ref() == "()Ljava/lang/String;"
+                }));
+            } else {
+                assert!(stubs
+                    .unwrap_err()
+                    .to_string()
+                    .contains("too many binary jar entries"));
+                assert!(
+                    visits.is_empty(),
+                    "over-budget archives cannot publish partial facts"
+                );
+                assert_eq!(selected.unwrap_err(), "class archive entry limit");
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

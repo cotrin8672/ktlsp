@@ -88,7 +88,7 @@ fn k2_normal(request: &KotlinDiagnosticRequest) -> bool {
 }
 
 fn header_assets(request: &KotlinDiagnosticRequest) -> Vec<(&'static str, &'static str)> {
-    if java_only(request) || kmp_release8_java(request) {
+    if java_only(request) || canonical_output_java(request) {
         // These paths need only the checked Javac helper; no Kotlin header plugin runs.
         vec![("JavacDiagnostics.java", JAVA_SOURCE)]
     } else if k2_normal(request) {
@@ -113,7 +113,7 @@ fn stock_task_action(task: &CompilerTask, declaring_class: &str, method_name: &s
         Some("gradle-7.4.2-stock-actions-v1" | "gradle-7.5-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalInputsTaskAction"
         }
-        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.4.1-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1" | "gradle-9.8.2-stock-actions-v1") => {
+        Some("gradle-8.10.2-stock-actions-v1" | "gradle-9.3.0-stock-actions-v1" | "gradle-9.4.1-stock-actions-v1" | "gradle-9.6.1-stock-actions-v1" | "gradle-9.7.1-stock-actions-v1" | "gradle-9.8.2-stock-actions-v1") => {
             "org.gradle.api.internal.project.taskfactory.IncrementalTaskAction"
         }
         _ => return false,
@@ -136,13 +136,13 @@ fn stock_only_if(task: &CompilerTask, kapt: bool) -> bool {
     };
     match fact.get("adapter").and_then(Value::as_str) {
         Some("gradle-7.4.2-stock-onlyif-v1" | "gradle-7.5-stock-onlyif-v1") => {}
-        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.4.1-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1") if !kapt => {}
+        Some("gradle-8.10.2-stock-onlyif-v1" | "gradle-9.3.0-stock-onlyif-v1" | "gradle-9.4.1-stock-onlyif-v1" | "gradle-9.6.1-stock-onlyif-v1" | "gradle-9.7.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1") if !kapt => {}
         _ => return false,
     }
     let Some(predicates) = fact.get("predicates").and_then(Value::as_array) else {
         return false;
     };
-    if matches!(fact.get("adapter").and_then(Value::as_str),Some("gradle-9.4.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1"))
+    if matches!(fact.get("adapter").and_then(Value::as_str),Some("gradle-9.4.1-stock-onlyif-v1" | "gradle-9.7.1-stock-onlyif-v1" | "gradle-9.8.2-stock-onlyif-v1"))
         && predicates.first().and_then(|predicate| predicate.get("class")).and_then(Value::as_str)
             != Some("org.gradle.api.internal.tasks.execution.SelfDescribingSpec")
     {
@@ -607,6 +607,15 @@ fn kmp_release8_java(request: &KotlinDiagnosticRequest) -> bool {
             recipe.adapter == "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1")
 }
 
+fn canonical_output_java(request: &KotlinDiagnosticRequest) -> bool {
+    kmp_release8_java(request) || request.java_task.as_ref().is_some_and(|java|
+        java.java_compiler_recipe().is_some_and(|recipe|
+            recipe.adapter == "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1")
+            && request.task.kotlin_compiler.as_ref().is_some_and(|runtime|
+                runtime.compiler_version == "2.3.21" && runtime.gradle_plugin_version == "2.3.21")
+            && selected_tasks_supported(&request.task, java, &[]))
+}
+
 fn gradle94_jvm21(primary: &CompilerTask) -> bool {
     primary.kotlin_compiler.as_ref().is_some_and(|runtime|
         runtime.compiler_version == "2.1.21" && runtime.gradle_plugin_version == "2.1.21"
@@ -641,6 +650,11 @@ pub(super) fn selected_tasks_supported_reason(
         && ["-language-version", "-api-version"].iter().all(|flag|
             primary.arguments.windows(2).any(|pair| pair[0] == *flag && pair[1] == "1.8"));
     let kmp_fragments = kmp_fragment_task(primary);
+    let kotlin2321 = runtime.compiler_version == "2.3.21" && runtime.gradle_plugin_version == "2.3.21"
+        && runtime.run_via_build_tools_api
+        && runtime.execution_strategy == crate::classpath::KotlinCompilerExecutionStrategy::Daemon
+        && runtime.normalized_daemon_jvm_arguments.is_empty()
+        && [primary, java].iter().all(|task| task.complete && task.problem.is_none());
     let gradle75 = legacy
         && java
             .options
@@ -648,7 +662,9 @@ pub(super) fn selected_tasks_supported_reason(
             .and_then(|fact| fact.get("adapter"))
             .and_then(Value::as_str)
             == Some("gradle-7.5-stock-actions-v1");
-    let (adapter, only_if_adapter) = if gradle75 {
+    let (adapter, only_if_adapter) = if kotlin2321 {
+        ("gradle-9.7.1-stock-actions-v1", "gradle-9.7.1-stock-onlyif-v1")
+    } else if gradle75 {
         ("gradle-7.5-stock-actions-v1", "gradle-7.5-stock-onlyif-v1")
     } else if legacy {
         (
@@ -667,7 +683,7 @@ pub(super) fn selected_tasks_supported_reason(
             "gradle-9.6.1-stock-onlyif-v1",
         )
     };
-    if (!legacy && !complete_k2 && !jvm21 && !kmp_k2 && !kmp_fragments)
+    if (!kotlin2321 && !legacy && !complete_k2 && !jvm21 && !kmp_k2 && !kmp_fragments)
         || [primary, java].iter().any(|task| {
             task.options
                 .get("taskActionInventory")
@@ -739,7 +755,8 @@ fn source_sdk_encoding_supported(task: &CompilerTask, recipe: &JavaCompilerRecip
     let release8 = matches!(recipe.adapter.as_str(),
         "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
             | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1");
-    let guide8 = recipe.adapter == "gradle-7.5-current-jdk17-utf8-javac-api-v1";
+    let target8 = matches!(recipe.adapter.as_str(), "gradle-7.5-current-jdk17-utf8-javac-api-v1"
+        | "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1");
     let target17_jdk21 =
         recipe.adapter == "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1";
     task.options.get("bootstrapClasspath") == Some(&Value::Null)
@@ -754,7 +771,7 @@ fn source_sdk_encoding_supported(task: &CompilerTask, recipe: &JavaCompilerRecip
         } else {
             task.options.get("encoding") == Some(&Value::Null)
         }
-        && (!(release8 || guide8)
+        && (!(release8 || target8)
             || ["sourceCompatibility", "targetCompatibility"]
                 .iter()
                 .all(|key| task.options.get(*key).and_then(Value::as_str) == Some("1.8")))
@@ -845,6 +862,7 @@ pub(super) fn configured_recipe(
         recipe.adapter.as_str(),
         "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
             | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+            | "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1"
             | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
     );
     anyhow::ensure!(
@@ -873,7 +891,7 @@ pub(super) fn configured_recipe(
                         crate::classpath::KotlinCompilerExecutionStrategy::InProcess
                     )
                 ))
-            || (kmp_release8_java(request)
+            || (canonical_output_java(request)
                 && selected_tasks_supported(&request.task, task, &[])))
             && kotlin.normalized_daemon_jvm_arguments.is_empty(),
         "java-header-compiler-version-unhandled"
@@ -888,7 +906,9 @@ pub(super) fn configured_recipe(
             .java_home
             .as_ref()
             .is_some_and(|home| same_path(home, sdk))
-            && same_path(&kotlin.gradle_java_home, sdk),
+            && same_path(&kotlin.gradle_java_home, sdk)
+            && (recipe.adapter != "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1"
+                || same_path(&kotlin.toolchain_java_home, sdk)),
         "java-kotlin-sdk-selection-differs"
     );
     let version_prefix = if jdk21 { "21." } else { "17." };
@@ -902,7 +922,7 @@ pub(super) fn configured_recipe(
         (task.annotation_processing_disabled()
             || ((k2_normal(request)
                 || recipe.adapter == "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
-                || kmp_release8_java(request))
+                || canonical_output_java(request))
                 && task.arguments.is_empty()))
             && task.annotation_processor_path.is_empty()
             && source_sdk_encoding_supported(task, &recipe),
@@ -960,7 +980,7 @@ pub(super) fn configured_recipe(
     );
     anyhow::ensure!(
         // Producer copies are also checked against closed source membership before execution.
-        kmp_release8_java(request) || request
+        canonical_output_java(request) || request
             .overlays
             .iter()
             .any(|source| source.key.ends_with(".java")
@@ -1312,7 +1332,7 @@ impl Tools {
         let source_root = self.owner.directory.join("assets");
         let recipe = &environment.key.recipe;
         let mut outputs = Vec::new();
-        if !java_only(request) && !k2_normal(request) && !kmp_release8_java(request) {
+        if !java_only(request) && !k2_normal(request) && !canonical_output_java(request) {
             let plugin_classes = self.owner.directory.join("classes/headers");
             std::fs::create_dir(&plugin_classes)?;
             let mut arguments = vec![
@@ -2038,6 +2058,19 @@ fn utf16_byte_offset(text: &str, offset: usize) -> Option<usize> {
     (units == offset).then_some(text.len())
 }
 
+fn javac_member_selector(diagnostic: &Value, text: &str, position: usize) -> Option<usize> {
+    if diagnostic["code"] != "compiler.err.cant.resolve.location.args" { return None; }
+    let bound = |key: &str| diagnostic[key].as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .and_then(|value| utf16_byte_offset(text, value));
+    let (start, end) = (bound("start")?, bound("end")?);
+    if start > position || position >= end { return None; }
+    // Javac points at the qualification dot; the editor expands the selected identifier.
+    let name = text.get(position..end)?.strip_prefix('.')?;
+    crate::language::is_valid_identifier(crate::language::SourceLanguage::Java, name)
+        .then_some(position + 1)
+}
+
 /// A nested class import can have any preceding name prefix as its actual JVM package.
 fn disjoint_import(name: &str, packages: &BTreeSet<String>) -> bool {
     let mut prefix = String::new();
@@ -2071,6 +2104,7 @@ fn import_diagnostics(
     packages: &BTreeSet<String>,
     exit: i32,
     complete_kotlin_output: bool,
+    canonical_errors: bool,
 ) -> anyhow::Result<Vec<CompileDiagnostic>> {
     require_bool(value, "compileCompleted", true)?;
     let explicit_utf8 = explicit_utf8_recipe(recipe);
@@ -2151,6 +2185,30 @@ fn import_diagnostics(
     );
     tracing::debug!(diagnostics = %value["diagnostics"], compiler_output = %value["compilerOutput"],
         runtime = %value["runtime"], "selected Java complete structured diagnostic stream");
+    // The caller leases complete Kotlin output and closes all compiler inputs before
+    // admitting owner Javac errors. An unsuccessful Java body needs no class-output lease.
+    if canonical_errors {
+        return diagnostics.iter().filter(|diagnostic| diagnostic["kind"] == "ERROR")
+            .filter_map(|diagnostic| {
+                let path = by_uri.get(diagnostic.get("sourceUri")?.as_str()?)?;
+                Some((diagnostic, path))
+            })
+            .map(|(diagnostic, path)| {
+                let text = std::fs::read_to_string(path)?;
+                let position = diagnostic.get("position").and_then(Value::as_u64)
+                    .and_then(|position| usize::try_from(position).ok())
+                    .and_then(|position| utf16_byte_offset(&text, position))
+                    .ok_or_else(|| anyhow::anyhow!("java-diagnostic-position-unhandled"))?;
+                let position = javac_member_selector(diagnostic, &text, position).unwrap_or(position);
+                let original = overlay.paths.get(&kotlin_path_key(&crate::paths::file_key(path)))
+                    .ok_or_else(|| anyhow::anyhow!("java-diagnostic-source-unmapped"))?;
+                let (line, col) = crate::text::LineIndex::new(&text).position(&text, position);
+                Ok(CompileDiagnostic {
+                    path: original.clone(), line: line + 1, col: col + 1,
+                    severity: Severity::Error, message: value_string(diagnostic, "message")?.to_owned(),
+                })
+            }).collect();
+    }
     let mut result = Vec::new();
     let mut seen = BTreeSet::new();
     for diagnostic in diagnostics {
@@ -2619,7 +2677,7 @@ fn run_checked(
     let started = Instant::now();
     let recipe = configured_recipe(request)?;
     let complete_k2 = k2_normal(request);
-    let canonical_only = kmp_release8_java(request);
+    let canonical_only = canonical_output_java(request);
     let kotlin_inventory_known = request.task.complete
         && crate::classpath::sdk_producer_roots(&request.task).is_some_and(|(_, complete)| complete);
     anyhow::ensure!(
@@ -2896,6 +2954,7 @@ fn run_checked(
         &packages,
         exit,
         complete_k2,
+        canonical_only && canonical_outputs.is_some(),
     )?;
     result.extend(plain_kotlin_method_diagnostics(&value, &receipt, &expected, overlay)?);
     if let Some(before) = &canonical_outputs {

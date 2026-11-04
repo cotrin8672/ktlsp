@@ -13511,6 +13511,70 @@ impl Backend {
 mod provider_command_context_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires KTLSP_IPC_CHILD built from dev/external-extension"]
+    async fn first_provider_command_resolves_selected_binary_without_editor_retry() {
+        use std::io::Write;
+        let child=std::env::var("KTLSP_IPC_CHILD").expect("set KTLSP_IPC_CHILD to the existing ipc-child executable");
+        let root=std::env::temp_dir().join(format!("ktlsp-first-binary-command-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary=root.join("fixture.jar");
+        let mut zip=zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+        zip.start_file("META-INF/MANIFEST.MF",zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"Manifest-Version: 1.0\r\n\r\n").unwrap();
+        // Real signed Mixin's 90,185-byte manifest has only a 436-byte main section.
+        zip.write_all("Name: fixture/Entry.class\r\nSHA-256-Digest: padding\r\n\r\n".repeat(1800).as_bytes()).unwrap();
+        for (entry,bytes) in [
+            ("org/spongepowered/asm/mixin/Mixin.class",include_bytes!("../../ktcore/tests/fixtures/classfile/mixin087/Mixin.class").as_slice()),
+            ("org/spongepowered/asm/mixin/injection/Inject.class",include_bytes!("../../ktcore/tests/fixtures/classfile/mixin087/Inject.class").as_slice()),
+        ] {
+            zip.start_file(entry,zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        let key=crate::paths::file_key(&root.join("Owner.java"));
+        let text="import org.spongepowered.asm.mixin.Mixin;\r\n@Mixin(Object.class) class Owner {}\r\n";
+        let (service,socket)=tower_lsp_server::LspService::new(Backend::new);drop(socket);
+        let backend=service.inner();*backend.root.lock()=Some(root.clone());
+        let (selected,unrelated)={
+            let mut ws=backend.ws.lock();
+            for batch in crate::deps::resolve_local_jar_stubs(&binary,&root.join("extract"),
+                &mut crate::parser::KotlinParser::new(),&mut crate::java::JavaParser::new()).unwrap() {
+                assert!(ws.index_dependency_batch(batch));
+            }
+            ws.bump_index_revision();
+            ws.open(&key,text.into());
+            ws.record_owned_document(&key,None,3,Some("java".into()));
+            backend.doc_versions.lock().entry(key.clone()).or_default().document_version=Some(3);
+            // Dependency indexing can finish before the editor negotiates its provider.
+            ws.register_ipc_provider_commands("test.commands",vec![child,"--provider-commands".into()],vec!["fixture.echo".into()]).unwrap();
+            (ws.index.lookup_type("Mixin")[0].path.to_string(),ws.index.lookup_type("Inject")[0].path.to_string())
+        };
+        assert!(!Path::new(&selected).exists());
+        let response=backend.execute_command(ExecuteCommandParams {
+            command:crate::commands::PROVIDER_COMMAND.into(),
+            arguments:vec![json!({"provider":"test.commands","command":"fixture.echo",
+                "arguments":[{"resolveAnnotationType":true}],
+                "context":{"workspaceRoot":crate::paths::file_key(&root),"documentUri":key_to_uri(&key).unwrap(),
+                    "bufferText":text,"documentVersion":3}})],
+            work_done_progress_params:Default::default(),
+        }).await.expect("the first outer command must succeed").unwrap();
+        assert_eq!(response["result"]["commandCount"],1,"late registration and manifest sections must need only one child command");
+        assert_eq!(response["result"]["facts"][0]["state"],"found","{response}");
+        assert_eq!(response["result"]["facts"][0]["value"]["qualifiedName"],"org.spongepowered.asm.mixin.Mixin");
+        assert_eq!(response["result"]["source"],text);
+        assert_eq!(response["result"]["context"]["documentVersion"],3);
+        assert!(Path::new(&selected).is_file());
+        assert!(!Path::new(&unrelated).exists(),"only the requested dependency is hydrated");
+        let ws=backend.ws.lock();
+        assert!(ws.extension_source_input_identity(&selected).is_none(),"a binary proof is not authored source");
+        drop(ws);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn command_context_uses_owned_text_versions_and_selected_workspace() {
         let root=std::env::temp_dir().join(format!("ktlsp-command-context-{}",std::process::id()));

@@ -995,12 +995,6 @@ fn collect_candidates<'a>(
                     .any(|(written, kind, _)| name.matches_member(written, *kind))
                 {
                     blockers.push((current.clone(), names));
-                    unavailable_members.extend(
-                        names
-                            .iter()
-                            .filter(|(written, kind, _)| name.matches_member(written, *kind))
-                            .map(|(written, kind, arity)| (written.as_str(), *kind, *arity)),
-                    );
                     hierarchy_complete = false;
                 }
             }
@@ -1018,7 +1012,41 @@ fn collect_candidates<'a>(
         }
         ControlFlow::Continue(())
     });
+    let receiver_root = infer::receiver_root_key(index, receiver);
+    let mut own_zero_argument_methods = BTreeMap::new();
+    if !blockers.is_empty() {
+        for entry in members.iter().copied() {
+            if receiver.package() == Some(entry.sym.package.as_str())
+                && receiver_root.as_deref() == entry.sym.container.as_deref()
+                && entry.sym.kind == crate::symbol::SymbolKind::Function
+                && entry.sym.arity == Some(0)
+                && entry.sym.params.is_empty()
+                && entry.sym.type_params.is_empty()
+                && !entry.sym.has_vararg
+                && entry.sym.ext_receiver.is_none()
+                && entry.sym.extension_receiver.is_none()
+                && !entry.sym.source_member.jvm_restricted()
+                && entry.sym.source_member.dispatch() == Some(crate::extensions::Dispatch::Instance)
+                && entry.sym.source_member.visibility() == Some(crate::extensions::Visibility::Public)
+            {
+                *own_zero_argument_methods
+                    .entry(entry.sym.name.as_str())
+                    .or_insert(0usize) += 1;
+            }
+        }
+    }
     for (owner, names) in blockers {
+        let inherited = owner.package() != receiver.package()
+            || infer::receiver_root_key(index, &owner) != receiver_root;
+        // shortcut: only receiver-declared zero-argument overrides, extend when parameter identities are known.
+        unavailable_members.extend(names.iter().filter_map(|(written, kind, arity)| {
+            (name.matches_member(written, *kind)
+                && !(inherited
+                    && *kind == crate::symbol::SymbolKind::Function
+                    && *arity == Some(0)
+                    && own_zero_argument_methods.get(written.as_str()) == Some(&1)))
+            .then_some((written.as_str(), *kind, *arity))
+        }));
         let mut shadowed_owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let _ = infer::walk_supertypes(index, &owner, 32, |current| {
             if let (Some(package), Some(root)) =
@@ -2695,6 +2723,99 @@ fn reference_forward(
         DeclarationForward::Unknown
     } else {
         DeclarationForward::Disproven
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn own_zero_argument_override_does_not_inherit_unavailable_ancestor_call() {
+    use crate::extensions::{Dispatch, Visibility};
+    use crate::index::{Index, Tier};
+    use crate::symbol::{IndexedSymbol, MemberImplementation, SourceMemberFlags, SymbolKind};
+    for case in [
+        "valid",
+        "parameter",
+        "static",
+        "private",
+        "generic",
+        "extension",
+        "restricted",
+        "own-blocker",
+        "unknown-arity",
+    ] {
+        let mut parent = IndexedSymbol::new("Parent", SymbolKind::Class, "proof", None, 0, 1);
+        parent.unavailable_members = Some(Box::new(vec![(
+            "f".into(),
+            SymbolKind::Function,
+            if case == "unknown-arity" {
+                None
+            } else {
+                Some(0)
+            },
+        )]));
+        let mut leaf = IndexedSymbol::new("Leaf", SymbolKind::Class, "proof", None, 2, 3);
+        leaf.supertypes = vec!["Parent".into()];
+        if case == "own-blocker" {
+            leaf.unavailable_members = parent.unavailable_members.clone();
+        }
+        let mut method = IndexedSymbol::new(
+            "f",
+            SymbolKind::Function,
+            "proof",
+            Some("Leaf".into()),
+            4,
+            5,
+        );
+        method.arity = Some(if case == "parameter" { 1 } else { 0 });
+        method.min_arity = method.arity;
+        if case == "parameter" {
+            method.params = vec![TypeRef::simple("String")];
+        }
+        if case == "generic" {
+            method.type_params = vec!["T".into()];
+        }
+        if case == "extension" {
+            method.ext_receiver = Some("String".into());
+            method.extension_receiver = Some(Box::new(crate::symbol::ExtensionReceiverFacts {
+                ty: TypeRef::simple("String"),
+                upper_bounds: Vec::new(),
+                has_type_constraints: false,
+            }));
+        }
+        method.source_member = SourceMemberFlags::new(
+            MemberImplementation::Concrete,
+            if case == "static" {
+                Dispatch::Static
+            } else {
+                Dispatch::Instance
+            },
+            if case == "private" {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            },
+            false,
+            false,
+        )
+        .with_jvm_restricted(case == "restricted");
+        let mut index = Index::new();
+        index.replace_file("Parent.java", vec![parent], Tier::Durable);
+        index.replace_file("Leaf.java", vec![leaf, method], Tier::Volatile);
+        let receiver = Type::class("Leaf", Some("proof".into()));
+        let ctx = FileCtx::new("proof".into(), Vec::new());
+        let pool = candidates(&index, &receiver, "f", &ctx);
+        assert_eq!(
+            pool.has_unavailable_call(Some(0)),
+            case != "valid",
+            "{case}"
+        );
+        let parent_pool = candidates(
+            &index,
+            &Type::class("Parent", Some("proof".into())),
+            "f",
+            &ctx,
+        );
+        assert!(parent_pool.has_unavailable_call(Some(0)), "{case}");
     }
 }
 

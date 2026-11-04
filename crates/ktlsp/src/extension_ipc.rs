@@ -1630,6 +1630,15 @@ impl Evaluation {
         value["next"]=json!(next);Ok(json!({"state":"found","value":value}))
     }
 
+    pub(crate) fn reread_facts(&mut self, read: &mut ReadSession<'_>, params: Value) -> Result<Value,String> {
+        if self.prepaid_input.is_some() || self.handles.len()>MAX_HANDLES {
+            return Err("extension evaluation limit".into());
+        }
+        // Only the host repeats its still-unsent batch: retain its original wire charge.
+        self.prepaid_input=Some(params.clone());
+        self.batch(read,"analysis/readFacts",params)
+    }
+
     pub fn batch(
         &mut self,
         read: &mut ReadSession<'_>,
@@ -2942,7 +2951,7 @@ impl Worker {
                         Ok(())
                     })();
                     if let Err(error)=&prepared_inputs {workspace.lock().fail_ipc_input_read(work.evaluation,error);}
-                    let result = prepared_inputs.and_then(|_|{stage="facts";workspace.lock().ipc_batch(
+                    let mut result = prepared_inputs.and_then(|_|{stage="facts";workspace.lock().ipc_batch(
                         work.evaluation,
                         method,
                         message["params"].clone(),
@@ -2956,7 +2965,6 @@ impl Worker {
                             "stage":stage,"ops":ops,"query_count":queries.map_or(0,Vec::len),
                             "ok":result.is_ok(),"error":result.as_ref().err().map(|error|bounded_trace_text(error))}));
                     }
-                    stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
                     if result.is_ok() && method == "analysis/readFacts" {
                         stage="requested-source-capture";
                         let request=workspace.lock().begin_ipc_requested_source_capture(work.evaluation);
@@ -2966,8 +2974,14 @@ impl Worker {
                             workspace.lock().finish_ipc_source_capture(prepared);
                             stage="requested-source-wait";
                             wait_for_requested_sources(waiting,deadline)?;
+                            if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
+                            // The first result has not left the host. Re-read once with all
+                            // original guards; real source/index changes still reject it.
+                            stage="requested-source-facts";
+                            result=workspace.lock().reread_ipc_facts(work.evaluation,message["params"].clone());
                         }
                     }
+                    stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
                     after_batch();
                     let response = match result {
                         Ok(value) => json!({"jsonrpc":"2.0","id":request_id,"result":value}),
@@ -3945,6 +3959,10 @@ mod stream_quota_tests {
             assert!(first_cursor.is_string());
             if length == 300*1024 {
                 for _ in 33..64 { call(&mut evaluation,&mut read,json!([{"op":"projectContext"}])).unwrap(); }
+                let repeated=evaluation.reread_facts(&mut read,json!({"evaluation":evaluation.id.to_string(),
+                    "queries":[{"op":"projectContext"}]})).unwrap();
+                assert_eq!(repeated["facts"].as_array().unwrap().len(),1);
+                assert_eq!(evaluation.batches,64,"an unsent re-read shares its original wire charge");
                 assert!(call(&mut evaluation,&mut read,json!([{"op":"projectContext"}])).is_err());
                 assert_eq!(evaluation.batches,64,"the ordinary limit is unchanged");
                 let mut wire_bytes = 0;

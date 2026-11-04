@@ -877,6 +877,14 @@ impl AnalysisExtensions {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        self.ipc_batch_impl(index,id,method,params,false)
+    }
+
+    pub(crate) fn reread_ipc_facts(&mut self,index:&dyn InferenceIndex,id:u64,params:Value)->Result<Value,String> {
+        self.ipc_batch_impl(index,id,"analysis/readFacts",params,true)
+    }
+
+    fn ipc_batch_impl(&mut self,index:&dyn InferenceIndex,id:u64,method:&str,params:Value,reread:bool)->Result<Value,String> {
         let mut evaluation = self.ipc_evaluations.remove(&id).ok_or("Stale")?;
         if let Some(error) = evaluation.failure.clone() {
             self.ipc_evaluations.insert(id, evaluation);
@@ -897,7 +905,8 @@ impl AnalysisExtensions {
                 .store
                 .resume(index, &owner, pending)
                 .map_err(|error| format!("{error:?}"))?;
-            let result = evaluation.batch(&mut read, method, params);
+            let result = if reread {evaluation.reread_facts(&mut read,params)}
+                else {evaluation.batch(&mut read, method, params)};
             evaluation.pending = Some(read.finish());
             if let Err(error) = &result {
                 if method != "analysis/readFacts"

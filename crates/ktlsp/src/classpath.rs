@@ -205,6 +205,7 @@ impl CompilerTask {
                 | "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1", "21")
                 | (
                     "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+                        | "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1"
                         | "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1",
                     "21"
                 )
@@ -251,6 +252,10 @@ impl CompilerTask {
             "gradle-9.6.1-current-jdk17-javac-api-v1"
             | "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1" => {
                 (&["-source", "17", "-target", "17"], &[], false)
+            }
+            "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1" => {
+                anyhow::ensure!(task.arguments.is_empty(), "java-api-raw-arguments-unhandled");
+                (&["-source", "1.8", "-target", "1.8"], &[], false)
             }
             "gradle-9.6.1-current-jdk21-utf8-javac-api-v1" => (
                 &["-source", "21", "-target", "21"],

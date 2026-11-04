@@ -282,6 +282,7 @@ object KtlspCompilerConfiguration {
         "9.3.0" -> JavaGradleProfile("9.3.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.4.1" -> JavaGradleProfile("9.4.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.6.1" -> JavaGradleProfile("9.6.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
+        "9.7.1" -> JavaGradleProfile("9.7.1", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.8.2" -> JavaGradleProfile("9.8.2", "isConfigurationCacheRequested", "IncrementalTaskAction")
         "9.8.0" -> JavaGradleProfile("9.8.0", "isConfigurationCacheRequested", "IncrementalTaskAction")
         else -> error("Unsupported Java recipe Gradle adapter")
@@ -345,6 +346,13 @@ object KtlspCompilerConfiguration {
             task.sourceCompatibility == "17" && task.targetCompatibility == "17" &&
             o.release.orNull == null && o.encoding == null &&
             java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
+        val defaultUtf8Target8Jdk21 = profile.version == "9.7.1" &&
+            task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" &&
+            o.release.orNull == null && o.encoding == null && o.compilerArgs.isEmpty() &&
+            java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
+        check(profile.version != "9.7.1" || defaultUtf8Target8Jdk21) {
+            "Gradle 9.7.1 Java execution requires the selected JDK21 target8 default-UTF8 profile"
+        }
         val release8Utf8Jdk17 = profile.version == "7.4.2" && o.release.orNull == 8 &&
             task.sourceCompatibility == "1.8" && task.targetCompatibility == "1.8" &&
             o.encoding == null && java.nio.charset.Charset.defaultCharset().name() == "UTF-8"
@@ -383,7 +391,7 @@ object KtlspCompilerConfiguration {
         check(stableSources.toList() == task.source.files.toList()) { "Java stable source order differs from the recorded task" }
         val selected = when (profile.version) {
             "7.4.2", "7.5" -> (invoke("getCompilerTool") as? Provider<*>)?.orNull as? org.gradle.jvm.toolchain.JavaCompiler
-            "8.10.2", "9.4.1", "9.6.1", "9.8.2" -> task.javaCompiler.orNull
+            "8.10.2", "9.4.1", "9.6.1", "9.7.1", "9.8.2" -> task.javaCompiler.orNull
             else -> error("Unsupported Java compiler selector")
         } ?: error("Selected Java compiler is unavailable")
         check(selected.javaClass.name == "org.gradle.jvm.toolchain.internal.DefaultToolchainJavaCompiler") {
@@ -391,7 +399,7 @@ object KtlspCompilerConfiguration {
         }
         val metadata = selected.metadata
         val home = metadata.installationPath.asFile
-        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21 || defaultUtf8Target17Jdk21 || release8DefaultUtf8Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
+        check(metadata.languageVersion.asInt() == (if (explicitUtf8Jdk21 || defaultUtf8Target17Jdk21 || defaultUtf8Target8Jdk21 || release8DefaultUtf8Jdk21) 21 else 17) && home.isAbsolute && selectedHome != null &&
             home.canonicalFile == selectedHome.canonicalFile &&
             home.canonicalFile == java.io.File(System.getProperty("java.home")).canonicalFile) {
             "Java recipe requires the selected current SDK profile"
@@ -451,6 +459,7 @@ object KtlspCompilerConfiguration {
                 parametersJdk21 -> "gradle-9.4.1-current-jdk21-utf8-parameters-javac-api-v1"
                 explicitUtf8Jdk21 -> "gradle-9.6.1-current-jdk21-utf8-javac-api-v1"
                 defaultUtf8Target17Jdk21 -> "gradle-9.6.1-current-jdk21-target17-default-utf8-javac-api-v1"
+                defaultUtf8Target8Jdk21 -> "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1"
                 release8Utf8Jdk17 -> "gradle-7.4.2-current-jdk17-release8-utf8-javac-api-v1"
                 release8DefaultUtf8Jdk21 -> "gradle-9.8.2-current-jdk21-release8-default-utf8-javac-api-v1"
                 explicitUtf8Jdk17 -> "gradle-7.5-current-jdk17-utf8-javac-api-v1"
@@ -825,7 +834,7 @@ object KtlspCompilerConfiguration {
     private fun sdkSourceFacts(task: Task, language: String): Pair<Map<String, Any?>?, Map<String, Any?>?> {
         var claims: Map<String, Any?>? = null
         val policy = runCatching {
-        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.4.1", "9.6.1", "9.8.0", "9.8.2"))
+        check(task.project.gradle.gradleVersion in listOf("7.4.2", "7.5", "8.7", "8.10.2", "8.14.2", "9.3.0", "9.4.1", "9.6.1", "9.7.1", "9.8.0", "9.8.2"))
         val extension = task.project.extensions.findByName("kotlin")
         val targets = extension?.javaClass?.methods?.firstOrNull { it.name == "getTargets" && it.parameterCount == 0 }
             ?.invoke(extension) as? Iterable<*>
@@ -841,8 +850,9 @@ object KtlspCompilerConfiguration {
         if (compilation != null) {
             // JavaCompile belongs to Gradle's loader, which cannot see the project's KGP.
             val helper = Class.forName("org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapperKt", false, checkNotNull(extension).javaClass.classLoader)
-            check(task.project.gradle.gradleVersion in listOf("9.3.0", "9.8.2") &&
-                helper.getMethod("getKotlinPluginVersion", Project::class.java).invoke(null, task.project) == "2.2.21")
+            val version = helper.getMethod("getKotlinPluginVersion", Project::class.java).invoke(null, task.project)
+            check((task.project.gradle.gradleVersion in listOf("9.3.0", "9.8.2") && version == "2.2.21") ||
+                (task.project.gradle.gradleVersion == "9.7.1" && version == "2.3.21"))
         }
         val sets = task.project.extensions.findByType(SourceSetContainer::class.java)
         val sourceSet: SourceSet = compilation?.let {
@@ -885,7 +895,7 @@ object KtlspCompilerConfiguration {
         val treeType = Class.forName("org.gradle.api.internal.file.FileCollectionInternal", false, loader)
         val visitType = Class.forName("org.gradle.api.internal.file.FileCollectionStructureVisitor\$VisitType", false, loader)
         // Verified Gradle 8/9 visitors removed Spec and default to Visit.
-        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.4.1", "9.6.1", "9.8.0", "9.8.2")) "Visit" else "Spec"
+        val visitName = if (task.project.gradle.gradleVersion in listOf("8.7", "8.10.2", "8.14.2", "9.3.0", "9.4.1", "9.6.1", "9.7.1", "9.8.0", "9.8.2")) "Visit" else "Spec"
         val spec = visitType.enumConstants.single { (it as Enum<*>).name == visitName }
         val future = linkedSetOf<java.io.File>()
         val producerRoots = linkedSetOf<java.io.File>()
@@ -1095,7 +1105,8 @@ object KtlspCompilerConfiguration {
                 record["kotlin_compiler"] = recipe
                 var fragmentSourceRoles: Map<String, Any?>? = null
                 if ("-Xmulti-platform" in strings) {
-                    check(recipe["compiler_version"] == "2.2.21" && recipe["gradle_plugin_version"] == "2.2.21") {
+                    check(recipe["compiler_version"] in listOf("2.2.21", "2.3.21") &&
+                        recipe["gradle_plugin_version"] == recipe["compiler_version"]) {
                         "Unsupported Kotlin source-valued argument profile"
                     }
                     check(strings.none { it.startsWith("-Xcommon-sources") || it.startsWith("-Xfragment-sources") || it.startsWith("-Xfragment-dependencies") }) {
@@ -1146,7 +1157,7 @@ object KtlspCompilerConfiguration {
                         } && roles.map { it.substringAfter(':') }.toSet() == selected.filterIsInstance<String>().filter { it.endsWith(".kt") }.toSet()) {
                             "Kotlin fragment sources differ from selected compiler sources"
                         }
-                        fragmentSourceRoles = linkedMapOf("adapter" to "kgp-2.2.21-jvm-fragment-sources-v1",
+                        fragmentSourceRoles = linkedMapOf("adapter" to "kgp-${recipe["compiler_version"]}-jvm-fragment-sources-v1",
                             "task" to task.path, "fragments" to fragments, "refines" to refines, "sources" to roles)
                         if (roles.isNotEmpty()) record["arguments"] = strings + "-Xfragment-sources=${roles.joinToString(",")}"
                     } else {

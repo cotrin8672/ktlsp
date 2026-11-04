@@ -584,6 +584,13 @@ setup with `KTLSP_IPC_MODE=provider-commands`. It checks opaque DTOs, a versione
 cancellation, source staleness, disable/restart and a real host refresh through standard
 `workspace/executeCommand`. See [the explicit provider command contract](docs/architecture/extension-ipc.md#explicit-provider-commands).
 
+The focused native outer-command regression uses the same external child: after building
+`dev/external-extension`, set `KTLSP_IPC_CHILD` to that executable and run
+`rtk cargo test -p ktlsp --lib first_provider_command_resolves_selected_binary_without_editor_retry -- --ignored`.
+It requires the first command's annotation TypeRef to resolve from a cold selected binary,
+indexed before provider registration, with a large signed-style manifest. It requires one
+child dispatch, unchanged CRLF source/version, and no unrelated hydration.
+
 `analysis/readFacts` also supports `declarationMember` for an exact authored declaration
 token. It returns the host-normalized member and signature without guessing among names
 or overloads. Ambiguous JVM projections and incomplete facts remain Unknown. The same

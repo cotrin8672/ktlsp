@@ -555,6 +555,7 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &packages,
         1,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(receipt["diagnostics"].as_array().unwrap().len(), 6);
@@ -578,6 +579,7 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
             &packages,
             1,
             false,
+            false,
         )
         .unwrap()
         .len(),
@@ -594,6 +596,7 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &packages,
         1,
         false,
+        false,
     )
     .is_err());
     wrong = receipt.clone();
@@ -607,6 +610,7 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
             &overlay,
             &packages,
             1,
+            false,
             false,
         )
         .unwrap()
@@ -623,6 +627,7 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &overlapping,
         1,
         false,
+        false,
     )
     .unwrap()
     .is_empty());
@@ -636,8 +641,78 @@ fn japanese_import_messages_use_original_task_ast_and_keep_cascades_in_the_strea
         &packages,
         1,
         false,
+        false,
     )
     .is_err());
+}
+
+#[test]
+fn canonical_javac_argument_error_maps_to_owner_without_a_clean_java_receipt() {
+    let (owner, mut request) = fixture();
+    let text = format!("{JAVA}// \u{1f600}\r\nclass WireCall {{ boolean call(Schema schema, ProtoType type) {{ return schema.noSuchGetType(type) != null; }} }}\r\n");
+    for source in &mut request.overlays {
+        if source.key.ends_with(".java") {
+            *source = KotlinSourceOverlay::new(source.key.clone(), text.clone(), 1);
+        }
+    }
+    let overlay = KotlinEditorOverlay::create_in(&request, &owner.directory.join("wire-error")).unwrap();
+    let path = overlay.sources.iter().find(|path| path.extension().unwrap() == "java").unwrap();
+    let recipe = configured_recipe(&request).unwrap();
+    let mut receipt = java_receipt(path, &text, &recipe);
+    let uri = receipt["sourcesBefore"][0]["uri"].clone();
+    let start_byte = text.find("schema.noSuchGetType").unwrap();
+    let position_byte = start_byte + "schema".len();
+    // Same Javac error/range as Wire JavaGenerator.java:605, with a preceding surrogate pair.
+    receipt["diagnostics"] = json!([{
+        "kind":"ERROR", "code":"compiler.err.cant.resolve.location.args", "sourceUri":uri,
+        "start":text[..start_byte].encode_utf16().count(),
+        "position":text[..position_byte].encode_utf16().count(),
+        "end":text[..start_byte + "schema.noSuchGetType".len()].encode_utf16().count(),
+        "message":"cannot find symbol: method noSuchGetType(ProtoType)"
+    }]);
+    let expected = [(path.clone(), sha(text.as_bytes()))];
+    let decode = |receipt: &Value, exit, canonical| import_diagnostics(receipt, &recipe.api_options,
+        &recipe, &expected, &overlay, &BTreeSet::new(), exit, false, canonical);
+    assert!(decode(&receipt, 1, false).unwrap().is_empty(), "partial headers cannot certify this receiver");
+    let errors = decode(&receipt, 1, true).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].path, crate::paths::file_key(&request.project_dir.join("src/Main.java")));
+    let method_byte = text.find("noSuchGetType").unwrap();
+    let (line, col) = crate::text::LineIndex::new(&text).position(&text, method_byte);
+    assert_eq!((errors[0].line, errors[0].col), (line + 1, col + 1));
+    let mapped = crate::text::LineIndex::new(&text).offset(&text, errors[0].line - 1, errors[0].col - 1);
+    assert_eq!(&text[mapped..mapped + "noSuchGetType".len()], "noSuchGetType");
+    assert!(errors[0].message.contains("noSuchGetType"));
+    for (code, byte) in [("compiler.err.operator.cant.be.applied", position_byte),
+        ("compiler.err.operator.cant.be.applied", text.find("!=").unwrap()),
+        ("compiler.err.cant.resolve.location.args", method_byte)] {
+        let mut unchanged = receipt.clone();
+        unchanged["diagnostics"][0]["code"] = json!(code);
+        unchanged["diagnostics"][0]["position"] = json!(text[..byte].encode_utf16().count());
+        let mapped = decode(&unchanged, 1, true).unwrap();
+        let (line, col) = crate::text::LineIndex::new(&text).position(&text, byte);
+        assert_eq!((mapped[0].line, mapped[0].col), (line + 1, col + 1));
+    }
+    for fault in ["incomplete", "failure", "runtime", "options", "source-hash", "parsed-units", "position"] {
+        let mut changed = receipt.clone();
+        match fault {
+            "incomplete" => changed["compileCompleted"] = json!(false),
+            "failure" => changed["failure"] = json!("compiler failed"),
+            "runtime" => changed["runtime"]["javaVersion"] = json!("foreign"),
+            "options" => changed["options"][0] = json!("-opaque"),
+            "source-hash" => changed["sourcesBefore"][0]["sha256"] = json!("stale"),
+            "parsed-units" => changed["parsedUnits"] = json!([]),
+            "position" => changed["diagnostics"][0]["position"] = json!(text.encode_utf16().count() + 1),
+            _ => unreachable!(),
+        }
+        assert!(decode(&changed, 1, true).is_err(), "{fault}");
+    }
+    let mut foreign = receipt.clone();
+    foreign["diagnostics"][0]["sourceUri"] = json!("file:/foreign/JavaGenerator.java");
+    assert!(decode(&foreign, 1, true).unwrap().is_empty());
+    assert!(decode(&receipt, 0, true).is_err(), "exit status must agree with the error stream");
+    std::fs::write(path, format!("{text}// changed")).unwrap();
+    assert!(decode(&receipt, 1, true).is_err(), "stale private source bytes cannot publish an error");
 }
 
 #[test]
@@ -699,6 +774,7 @@ fn java_import_positions_bind_unicode_current_text_and_utf16_ast_ranges() {
             &overlay,
             &packages,
             1,
+            false,
             false,
         )
     };
@@ -763,6 +839,7 @@ fn java_positions_use_utf16_offsets_instead_of_javac_visual_tab_columns() {
         &overlay,
         &BTreeSet::from(["fixture".into()]),
         1,
+        false,
         false,
     )
     .unwrap();
@@ -2772,6 +2849,7 @@ fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() 
                 &packages,
                 1,
                 false,
+                false,
             )
             .unwrap()
             .len(),
@@ -2803,6 +2881,7 @@ fn javac_structured_encoding_flag_must_match_selected_null_or_explicit_policy() 
                     &overlay,
                     &packages,
                     1,
+                    false,
                     false,
                 )
                 .is_err(),
@@ -2891,7 +2970,8 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
         &overlay,
         &packages,
         1,
-        false
+        false,
+        false,
     )
     .unwrap()
     .is_empty());
@@ -2904,6 +2984,7 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
         &packages,
         1,
         true,
+        false,
     )
     .unwrap();
     assert_eq!(actual.len(), 3);
@@ -2919,7 +3000,8 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
             &overlay,
             &packages,
             1,
-            true
+            true,
+            false,
         )
         .unwrap()
         .len(),
@@ -2936,7 +3018,8 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
             &overlay,
             &packages,
             1,
-            true
+            true,
+            false,
         )
         .unwrap()
         .len(),
@@ -2953,7 +3036,8 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
             &overlay,
             &packages,
             1,
-            true
+            true,
+            false,
         )
         .unwrap()
         .len(),
@@ -2969,7 +3053,8 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
         &overlay,
         &packages,
         1,
-        true
+        true,
+        false,
     )
     .is_err());
     std::fs::write(path, format!("{JAVA}// changed")).unwrap();
@@ -2981,7 +3066,8 @@ fn closed_canonical_output_uses_actual_javac_imports_without_package_absence_pro
         &overlay,
         &packages,
         1,
-        true
+        true,
+        false,
     )
     .is_err());
 }
@@ -3227,6 +3313,7 @@ fn same_javac_platform_body_errors_require_current_receiver_attribution() {
                 &BTreeSet::new(),
                 1,
                 complete,
+                false,
             )
         };
         let actual = decode(&receipt, true).unwrap();
@@ -3389,6 +3476,123 @@ fn selected_captured_gradle982_release8(request: &mut KotlinDiagnosticRequest) {
     std::fs::create_dir_all(sdk.join("lib")).unwrap();
     std::fs::write(sdk.join("release"), "JAVA_VERSION=\"21.0.4\"\n").unwrap();
     std::fs::write(sdk.join("lib/ct.sym"), b"selected release8 fixture input").unwrap();
+}
+
+#[test]
+fn wire_stock_task_shape_admits_kotlin_without_inventing_java_execution() {
+    let root = std::env::temp_dir().join("ktlsp-wire-stock-task-shape");
+    let mut original = request(&root);
+    let runtime = original.task.kotlin_compiler.as_mut().unwrap();
+    // Wire 9a3bce4a: Gradle 9.7.1, KGP/compiler 2.3.21, JDK21, BTA daemon.
+    runtime.compiler_version = "2.3.21".into();
+    runtime.gradle_plugin_version = "2.3.21".into();
+    runtime.run_via_build_tools_api = true;
+    runtime.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+    original.java_task.as_mut().unwrap().options.remove("javaCompilerRecipe");
+    let supported = |request: &KotlinDiagnosticRequest| selected_tasks_supported_reason(
+        &request.task, request.java_task.as_ref().unwrap(), &[]);
+    assert!(supported(&original).is_err(), "the old pinned inventory cannot certify this runtime");
+    for task in [&mut original.task, original.java_task.as_mut().unwrap()] {
+        task.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!("gradle-9.7.1-stock-actions-v1");
+        task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] =
+            json!("org.gradle.api.internal.project.taskfactory.IncrementalTaskAction");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!("gradle-9.7.1-stock-onlyif-v1");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"] =
+            json!("org.gradle.api.internal.tasks.execution.SelfDescribingSpec");
+    }
+    assert_eq!(supported(&original), Ok(()));
+    assert!(configured_recipe(&original).is_err(), "stock source membership is not a Java execution recipe");
+    for java in [false, true] {
+        for fault in ["missing-action", "null-action", "unknown-action-adapter", "action-class", "action-owner",
+            "action-method", "action-parameters", "extra-action", "missing-predicate", "null-predicate",
+            "unknown-predicate-adapter", "predicate-class", "custom-predicate", "kapt-predicate", "extra-predicate", "incomplete"] {
+            let mut changed = original.clone();
+            let task = if java { changed.java_task.as_mut().unwrap() } else { &mut changed.task };
+            match fault {
+                "missing-action" => { task.options.remove("taskActionInventory"); }
+                "null-action" => { task.options.insert("taskActionInventory".into(), Value::Null); }
+                "unknown-action-adapter" => task.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!("unknown"),
+                "action-class" => task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["class"] = json!("custom.Action"),
+                "action-owner" => task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["declaringClass"] = json!("custom.Compiler"),
+                "action-method" => task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["method"] = json!("customCompile"),
+                "action-parameters" => task.options.get_mut("taskActionInventory").unwrap()["actions"][0]["parameterTypes"] = json!([]),
+                "extra-action" => task.options.get_mut("taskActionInventory").unwrap()["actions"].as_array_mut().unwrap().push(json!({"class":"custom.Action"})),
+                "missing-predicate" => { task.options.remove("taskOnlyIfInventory"); }
+                "null-predicate" => { task.options.insert("taskOnlyIfInventory".into(), Value::Null); }
+                "unknown-predicate-adapter" => task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!("unknown"),
+                "predicate-class" => task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"] = json!("custom.Predicate"),
+                "custom-predicate" => task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["stockEnabledPredicate"] = json!(false),
+                "kapt-predicate" => task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["stockKaptPredicate"] = json!(true),
+                "extra-predicate" => task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"].as_array_mut().unwrap().push(json!({"class":"custom.Predicate"})),
+                "incomplete" => task.complete = false,
+                _ => unreachable!(),
+            }
+            assert!(supported(&changed).is_err(), "java={java}, {fault}");
+        }
+    }
+}
+
+#[test]
+fn wire_jdk21_target8_recipe_preserves_exact_options_and_canonical_output_boundary() {
+    let (_owner, mut original) = fixture();
+    selected_captured_k2_jdk21_target17(&mut original);
+    let runtime = original.task.kotlin_compiler.as_mut().unwrap();
+    runtime.compiler_version = "2.3.21".into();
+    runtime.gradle_plugin_version = "2.3.21".into();
+    runtime.execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::Daemon;
+    for task in [&mut original.task, original.java_task.as_mut().unwrap()] {
+        task.options.get_mut("taskActionInventory").unwrap()["adapter"] = json!("gradle-9.7.1-stock-actions-v1");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["adapter"] = json!("gradle-9.7.1-stock-onlyif-v1");
+        task.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["class"] =
+            json!("org.gradle.api.internal.tasks.execution.SelfDescribingSpec");
+    }
+    let mut recipe = original.java_task.as_ref().unwrap().java_compiler_recipe().unwrap();
+    recipe.adapter = "gradle-9.7.1-current-jdk21-target8-default-utf8-javac-api-v1".into();
+    recipe.api_options[1] = "1.8".into();
+    recipe.api_options[3] = "1.8".into();
+    set_recipe(&mut original, recipe.clone());
+    let java = original.java_task.as_mut().unwrap();
+    java.options.insert("sourceCompatibility".into(), json!("1.8"));
+    java.options.insert("targetCompatibility".into(), json!("1.8"));
+    assert_eq!(configured_recipe(&original).unwrap(), recipe);
+    assert!(canonical_output_java(&original));
+    assert_eq!(header_assets(&original).into_iter().map(|(name, _)| name).collect::<Vec<_>>(), ["JavacDiagnostics.java"]);
+    let private = original.project_dir.join("wire-private");
+    let replayed = replay_options(original.java_task.as_ref().unwrap(), &recipe, &original.task.output_roots[0], &private).unwrap();
+    for (index, option) in recipe.api_options.iter().enumerate() {
+        if ![5, 7, 13, 16].contains(&index) { assert_eq!(&replayed[index], option); }
+    }
+    let mut closed = original.clone();
+    closed.overlays.clear();
+    assert!(configured_recipe(&closed).is_ok(), "producer sources may be closed; execution still checks their exact bytes");
+    for fault in ["missing-recipe", "compiler", "plugin", "strategy", "build-api", "daemon-options", "toolchain",
+        "sdk", "runtime", "charset", "source", "target", "release", "encoding", "raw-args", "api-options",
+        "processor", "action", "predicate"] {
+        let mut changed = original.clone();
+        let java = changed.java_task.as_mut().unwrap();
+        match fault {
+            "missing-recipe" => { java.options.remove("javaCompilerRecipe"); }
+            "compiler" => changed.task.kotlin_compiler.as_mut().unwrap().compiler_version = "2.3.20".into(),
+            "plugin" => changed.task.kotlin_compiler.as_mut().unwrap().gradle_plugin_version = "2.3.20".into(),
+            "strategy" => changed.task.kotlin_compiler.as_mut().unwrap().execution_strategy = crate::classpath::KotlinCompilerExecutionStrategy::InProcess,
+            "build-api" => changed.task.kotlin_compiler.as_mut().unwrap().run_via_build_tools_api = false,
+            "daemon-options" => changed.task.kotlin_compiler.as_mut().unwrap().normalized_daemon_jvm_arguments.push("-Dopaque=true".into()),
+            "toolchain" => changed.task.kotlin_compiler.as_mut().unwrap().toolchain_java_home = private.join("other-sdk"),
+            "sdk" => java.java_home = Some(private.join("other-sdk")),
+            "runtime" => java.options.get_mut("javaCompilerRecipe").unwrap()["java_runtime_version"] = json!("17.0.7"),
+            "charset" => java.options.get_mut("javaCompilerRecipe").unwrap()["effective_charset"] = json!("windows-31j"),
+            "source" | "target" => { java.options.insert(format!("{fault}Compatibility"), json!("17")); }
+            "release" => { java.options.insert("release".into(), json!(8)); }
+            "encoding" => { java.options.insert("encoding".into(), json!("UTF-8")); }
+            "raw-args" => java.arguments.push("-Xlint".into()),
+            "api-options" => java.options.get_mut("javaCompilerRecipe").unwrap()["api_options"].as_array_mut().unwrap().push(json!("-Xplugin:opaque")),
+            "processor" => java.annotation_processor_path.push(private.join("processor.jar")),
+            "action" => java.options.get_mut("taskActionInventory").unwrap()["actions"][0]["method"] = json!("customCompile"),
+            "predicate" => java.options.get_mut("taskOnlyIfInventory").unwrap()["predicates"][0]["stockEnabledPredicate"] = json!(false),
+            _ => unreachable!(),
+        }
+        assert!(configured_recipe(&changed).is_err(), "{fault}");
+    }
 }
 
 #[test]

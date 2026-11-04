@@ -1466,7 +1466,7 @@ pub(crate) fn resolve_local_jar_stubs_for_origin_while_current(
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
     // Mutable local archives may preserve both size and modification time.
-    hasher.update(b"|local-jar-java-members-v9|");
+    hasher.update(b"|local-jar-java-members-v10|");
     hasher.update(origin_id.as_bytes());
     hasher.update(content);
     let fingerprint = format!("{:x}", hasher.finalize());
@@ -1562,7 +1562,7 @@ pub(crate) fn resolve_module_binary_stubs_while_current(
     let origin_id = crate::classpath::maven_origin_id(coord);
     let mut hasher = Sha256::new();
     hasher.update(SYMCACHE_VERSION);
-    hasher.update(b"|module-jar-java-members-v8|");
+    hasher.update(b"|module-jar-java-members-v9|");
     hasher.update(origin_id.as_bytes());
     hasher.update(b"|");
     hasher.update(expected_origin.as_bytes());
@@ -4724,12 +4724,12 @@ public class ParameterUse<Iterable> {
             (
                 false,
                 origin.as_str(),
-                b"|local-jar-java-members-v9|".as_slice(),
+                b"|local-jar-java-members-v10|".as_slice(),
             ),
             (
                 true,
                 module_origin.as_str(),
-                b"|module-jar-java-members-v8|".as_slice(),
+                b"|module-jar-java-members-v9|".as_slice(),
             ),
         ] {
             let mut hasher = Sha256::new();
@@ -5184,7 +5184,7 @@ public class ParameterUse<Iterable> {
                 if is_module {
                     hash.update(b"|");
                     hash.update(binary_origin.as_bytes());
-                } else if version == 9 {
+                } else if version >= 9 {
                     hash.update(file_content_digest(&jar).unwrap());
                 }
                 format!("{:x}", hash.finalize())
@@ -5195,7 +5195,7 @@ public class ParameterUse<Iterable> {
                 symcache_load(&old_key, &legacy_dir).is_some(),
                 "legacy placeholder cache must exist"
             );
-            let current_key = fingerprint(if is_module { 8 } else { 9 });
+            let current_key = fingerprint(if is_module { 9 } else { 10 });
             let dest = extract.join("local-jars").join(&current_key);
             let cache = symcache_dir().join(format!("{current_key}.zst"));
             for warm in [false, true] {
@@ -5351,9 +5351,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if module {
-                b"|module-jar-java-members-v8|".as_slice()
+                b"|module-jar-java-members-v9|".as_slice()
             } else {
-                b"|local-jar-java-members-v9|".as_slice()
+                b"|local-jar-java-members-v10|".as_slice()
             });
             if module {
                 hash.update(crate::classpath::maven_origin_id(&coord).as_bytes());
@@ -5862,9 +5862,9 @@ public class ParameterUse<Iterable> {
             let mut hash = Sha256::new();
             hash.update(SYMCACHE_VERSION);
             hash.update(if is_module {
-                b"|module-jar-java-members-v8|".as_slice()
+                b"|module-jar-java-members-v9|".as_slice()
             } else {
-                b"|local-jar-java-members-v9|".as_slice()
+                b"|local-jar-java-members-v10|".as_slice()
             });
             hash.update(owner.as_bytes());
             if is_module {

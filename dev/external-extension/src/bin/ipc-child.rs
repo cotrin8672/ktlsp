@@ -928,8 +928,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let name=params["command"].as_str().ok_or("missing routed command")?;
                 if !matches!(name,"fixture.echo"|"fixture.pause"|"fixture.refresh") { return Err("unapproved command dispatched".into()); }
                 let lookup=params["arguments"][0]["lookup"].as_str().unwrap_or("fixture.Target");
+                let query=if params["arguments"][0]["resolveAnnotationType"]==true {
+                    let reference=params["declarations"].as_array().into_iter().flatten()
+                        .flat_map(|declaration|declaration["annotations"].as_array().into_iter().flatten())
+                        .find_map(|annotation|annotation["typeRef"].as_str()).ok_or("missing annotation type reference")?;
+                    json!({"op":"resolveTypeRef","reference":reference})
+                } else {json!({"op":"resolveType","name":lookup})};
                 let facts=request(&mut input,&mut output,&mut next,"analysis/readFacts",json!({"evaluation":params["evaluation"],
-                    "queries":[{"op":"resolveType","name":lookup}]}))?;
+                    "queries":[query]}))?;
                 if name=="fixture.pause" {
                     let case=params["arguments"][0]["pauseCase"].as_str().ok_or("missing command pause case")?;
                     if !matches!(case,"source"|"cancel"|"disable") { return Err("invalid fixture pause case".into()); }
