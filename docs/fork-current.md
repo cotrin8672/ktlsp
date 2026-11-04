@@ -5,6 +5,8 @@ Java reference erasure through the existing extension API is verified on103;
 its related native/editor evidence is separate from the earlier broad workspace run.
 Library-source preparation105 passes its focused guards and real-archive proof
 comparison; the corrected consumer Java editor run is being checked separately.
+Indexed library-body retention106 now passes its92 related native checks; the
+original consumer handler has not yet been verified with that release.
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -158,6 +160,39 @@ The sealed105 host is25348096 bytes, SHA-256
 `3c26a5208d64ea85209f2c5b9650b43992769cdaa64bdbd986439c0dfa03c4f5`;
 init input6528 and verification child629ee037 are unchanged from103. The relevant
 consumer editor check uses only its failed Java group, not the full/85 replay.
+
+That single105 consumer run completed in56.8 seconds with clean shutdown and
+eight original assertions, then returned `-32801 Stale` after `typeJvm`, before
+`declarationMember`. Its command's source-capture events prepared8/0/8 files in
+12.429345/0.000424/4.611298 seconds. These are actual run observations, separate
+from the representative scalar/batch comparison above. Owner SHA/revision/version,
+analysis generation and provider instance were unchanged; final pending was absent.
+No original failed-guard counters were recorded, so its exact cause is not asserted.
+
+An independent native diagnostic demonstrates that an unchanged indexed library
+can lose its active view when its first Source body is retained: namespace2→3,
+resume fails, and pending is consumed while the evaluation remains. Fix106 adds
+an explicit retention path only for the first dependency Source body whose full
+parsed symbol facts match the captured index stamp. Origin, epoch and symbols are
+rechecked at acceptance, and staged index changes are flushed first. Ordinary
+unanchored admission, edits, new indexed facts and other read guards still retire
+stale views. Unindexed declarations are rejected; counters are not rolled back.
+Failures are now traced before resume consumes their pending evidence.
+
+The106 checks cover core extensions65, hydration12, IPC13, workspace capture1 and
+the explicitly enabled external-child first command1:92 combined passes. The
+initial run passed65+11 and failed one new negative fixture; rematerialization
+restored its edited cache file, so the fixture was corrected to put the extra
+class in the real archive and deliberately omit it from the current index. The
+same rejection expectation then passed, followed by only the previously unrun
+targets. Preserve `integrated-input106/receipt.json` and
+`integrated-input106-retry/main-ready.json`; the original command remains failed.
+The independent diagnostic is `source-body106-diagnostic/diagnostic-result.json`,
+not an MC replay. The sealed host is25458176 bytes, SHA-256
+`a2b883b5896a1eb1707ffa54de777edb25debf85918d21d2f8b182559661e168`;
+init6528 and verification child629ee037 remain unchanged. Existing code/fixture
+guards are stable. The consumer105 receipt is MC
+`build/rust-test-logs/java-host105-native-20261105/recovery-and-run-receipt.json`.
 
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable

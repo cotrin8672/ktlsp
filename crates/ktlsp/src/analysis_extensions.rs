@@ -240,7 +240,7 @@ impl AnalysisExtensions {
         if self.pending_index {
             self.pending_index = false;
             for key in self.inputs.keys().cloned().collect::<Vec<_>>() {
-                let _ = self.normalize_input(index,&key,true);
+                let _ = self.normalize_input(index,&key,true,false);
             }
             self.evaluate(index);
         }
@@ -308,10 +308,10 @@ impl AnalysisExtensions {
     }
 
     fn normalize(&mut self, index: &dyn InferenceIndex, key: &str) -> Result<(), String> {
-        self.normalize_input(index,key,false)
+        self.normalize_input(index,key,false,false)
     }
 
-    fn normalize_input(&mut self,index:&dyn InferenceIndex,key:&str,refresh:bool)->Result<(),String> {
+    fn normalize_input(&mut self,index:&dyn InferenceIndex,key:&str,refresh:bool,retain_namespace:bool)->Result<(),String> {
         let Some(input) = self.inputs.get(key) else {
             return Ok(());
         };
@@ -329,6 +329,8 @@ impl AnalysisExtensions {
         let annotation_scope=crate::language::source_type_scope(key,&input.tree,&input.text);
         let replaced = if refresh {
             self.store.refresh_prepared_source_declarations(index,prepared,coverage,facts)
+        } else if retain_namespace {
+            self.store.retain_prepared_library_source_declarations(index,prepared,coverage,facts)
         } else {
             self.store.replace_prepared_source_declarations(index,prepared,coverage,facts)
         }.and_then(|_|self.store.cache_annotation_sites(index,&annotation_source,&annotation_scope));

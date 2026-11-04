@@ -210,8 +210,12 @@ When a semantic read records an exact indexed source key whose body is missing,
 the host can hydrate that closed project input outside the Workspace lock. It
 requires current compiler-task membership, selected scope/origin, accepted model,
 source stamp and content hash; current open buffers win. Only requested eligible
-files are read. Installing the body invalidates and requeues the old evaluation,
-so an initial Unknown cannot publish an obsolete empty result. Namespace coverage
+files are read. Replacing source inputs or indexed facts invalidates and requeues
+the old evaluation, so an initial Unknown cannot publish an obsolete empty result.
+The first body of an already indexed dependency can retain the current namespace
+only after its complete symbol inventory, accepted origin and source/model epoch
+match the captured stamp. Real staged index changes are still flushed first;
+unanchored admission and edits retain their ordinary invalidation behavior. Namespace coverage
 Unknown alone never grants a guessed file read. No source-inventory capability is
 needed for this shared semantic hydration.
 Requests sharing the same accepted library archive handle reuse class selection

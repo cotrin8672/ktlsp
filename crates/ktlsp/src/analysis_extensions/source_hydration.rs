@@ -314,6 +314,76 @@ mod tests {
     }
 
     #[test]
+    fn requested_library_body_retains_current_command_but_not_staged_index_changes() {
+        use serde_json::json;
+        for staged_index in [false,true] {
+            let fixture = Fixture::new();
+            let mut ws = fixture.workspace();
+            assert!(!bound(&mut ws));
+            ws.register_ipc_provider_commands("body-command",vec!["fixture-child".into()],vec!["fixture.types".into()]).unwrap();
+            let owner = ws.extension_source_input_identity("Owner.java").unwrap();
+            let work = ws.begin_provider_command("body-command","Owner.java","fixture.types".into(),vec![],json!({})).unwrap();
+            let params = json!({"evaluation":work.evaluation.to_string(),"queries":[
+                {"op":"resolveType","name":"arrayfixture.Factory"},{"op":"resolveType","name":"arrayfixture.Item"}]});
+            let missing = ws.ipc_batch(work.evaluation,"analysis/readFacts",params.clone()).unwrap();
+            assert!(missing["facts"].as_array().unwrap().iter().all(|fact|fact["state"]=="unknown"));
+            let namespace = ws.extension_test_inputs().1.store.namespace_revision();
+            let capture = ws.begin_ipc_requested_source_capture(work.evaluation).unwrap();
+            let prepared = crate::workspace::prepare_ipc_source_capture(capture);
+            if staged_index {
+                assert!(ws.index_dependency_file("/other/Added.java",vec![ktcore::symbol::IndexedSymbol::new(
+                    "Added",ktcore::symbol::SymbolKind::Class,"other",None,6,11)]));
+                assert!(ws.extension_test_inputs().1.pending_index);
+            }
+            assert!(ws.finish_ipc_source_capture(prepared)>0);
+            let (_,host) = ws.extension_test_inputs();
+            assert!(!host.pending_index,"real staged index changes must be flushed before retaining bodies");
+            assert_eq!(host.store.namespace_revision(),namespace,"body retention must not invent new names");
+            assert!(Arc::ptr_eq(&owner,&ws.extension_source_input_identity("Owner.java").unwrap()));
+            assert!(bound(&mut ws),"committed MissingSource consumers must be reevaluated with member facts");
+            if staged_index {
+                assert!(!ws.ipc_evaluation_current(work.evaluation));
+                assert_eq!(ws.reread_ipc_facts(work.evaluation,params).unwrap_err(),"Stale");
+                continue;
+            }
+            assert!(ws.ipc_evaluation_current(work.evaluation));
+            let found = ws.reread_ipc_facts(work.evaluation,params).unwrap();
+            assert!(found["facts"].as_array().unwrap().iter().all(|fact|fact["state"]=="found"));
+            let members = ws.ipc_batch(work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),
+                "queries":[{"op":"declaredMembers","target":found["facts"][0]["value"]["id"]}]})).unwrap();
+            assert!(members["facts"][0]["members"].as_array().unwrap().iter()
+                .any(|member|member["name"]=="rows" && member["signature"]["value"]["descriptor"]=="()[[Larrayfixture/Item;"),"{members}");
+            let (_,host) = ws.extension_test_inputs();
+            assert_eq!(host.finish_ipc_command(work.evaluation,Ok(found.clone())).unwrap(),found);
+        }
+    }
+
+    #[test]
+    fn library_body_with_unindexed_declarations_is_not_retained() {
+        let fixture = Fixture::new();
+        fixture.write_sources("\nclass Unindexed {}\n");
+        let mut ws = fixture.workspace();
+        let expected = ws.index.lookup_type("Factory").into_iter()
+            .find(|entry|entry.sym.package=="arrayfixture").unwrap().path.to_string();
+        let entries = ws.index.entries_for_file(&expected);
+        assert!(entries.iter().any(|entry|entry.sym.name=="Unindexed"),"the real jar body must declare the extra type");
+        let symbols = entries.into_iter().filter(|entry|entry.sym.name!="Unindexed")
+            .map(|entry|(*entry.sym).clone()).collect();
+        assert!(ws.index_dependency_file(&expected,symbols));
+        ws.bump_index_revision();
+        let requests = ws.begin_extension_source_batch();
+        assert!(requests.iter().find(|request|request.file==expected).unwrap().stamp.symbols.iter()
+            .all(|symbol|symbol.name!="Unindexed"),"the current index stamp must deliberately omit that type");
+        let prepared = prepare_sources(requests);
+        assert!(!prepared.iter().any(|source|source.request.file==expected),"body facts must match the complete indexed symbol inventory");
+        ws.finish_extension_source_batch(prepared);
+        assert!(!bound(&mut ws));
+        let (_,host) = ws.extension_test_inputs();
+        assert!(host.store.source_declarations(&expected).is_none());
+        assert!(!host.inputs.contains_key(&expected));
+    }
+
+    #[test]
     fn failed_archive_demand_survives_unrelated_edits_but_changed_archive_retries() {
         let fixture = Fixture::new();
         let mut ws = fixture.workspace();
@@ -807,6 +877,14 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
             } else {
                 crate::parser::KotlinParser::new().parse(&text)
             };
+            if request.stamp.origin.representation == SourceRepresentation::Source {
+                let language = crate::language::SourceLanguage::for_project_path(path)?;
+                let mut actual = crate::language::symbol_facts(language,&tree,&text).symbols;
+                let mut expected: Vec<_> = request.stamp.symbols.iter().map(|symbol|symbol.as_ref()).collect();
+                actual.sort_unstable_by_key(|symbol|(symbol.start_byte,symbol.end_byte));
+                expected.sort_unstable_by_key(|symbol|(symbol.start_byte,symbol.end_byte));
+                if !actual.iter().eq(expected) { return None; }
+            }
             let mut local = Index::new();
             local.replace_file(
                 &request.file,
@@ -1038,6 +1116,8 @@ impl AnalysisExtensions {
     }
 
     pub(crate) fn accept_sources(&mut self, index: &Index, prepared: Vec<PreparedSource>) -> bool {
+        if prepared.is_empty() { return false; }
+        self.flush_index_changed(index);
         let mut wanted = self.store.requested_source_files();
         wanted.extend(self.wanted_ipc_sources());
         let mut accepted = Vec::new();
@@ -1054,6 +1134,10 @@ impl AnalysisExtensions {
                 }
                 continue;
             }
+            // The body matched this complete symbol stamp during preparation, and the
+            // current origin/symbols/epoch above prove no indexed names changed since then.
+            let retain_namespace = source.request.stamp.origin.representation == SourceRepresentation::Source
+                && self.store.source_declarations(file).is_none();
             if source.request.stamp.origin.representation == SourceRepresentation::Stub {
                 // Only nominal identities: preview declarations/members are not authored facts.
                 if self.store.replace_prepared_source_declarations(
@@ -1080,13 +1164,13 @@ impl AnalysisExtensions {
             }
             self.hydrated_sources
                 .insert(file.clone(), source.request.stamp);
-            accepted.push(file.clone());
+            accepted.push((file.clone(),retain_namespace));
         }
         if accepted.is_empty() {
             return false;
         }
-        for file in accepted {
-            if self.normalize(index, &file).is_err() {
+        for (file,retain_namespace) in accepted {
+            if self.normalize_input(index,&file,false,retain_namespace).is_err() {
                 self.forget_hydrated_source(&file);
             }
         }

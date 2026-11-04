@@ -1032,7 +1032,7 @@ impl ExtensionStore {
         coverage: Fact<()>,
         declarations: Vec<source::SourceDeclaration>,
     ) -> Result<(), ContractError> {
-        self.replace_source_declarations_impl(index, file, text, coverage, declarations, None, false)
+        self.replace_source_declarations_impl(index, file, text, coverage, declarations, None, false, false)
     }
 
     /// A background host parser may supply the same source eligibility without parsing again
@@ -1054,7 +1054,22 @@ impl ExtensionStore {
             declarations,
             Some(prepared),
             false,
+            false,
         )
+    }
+
+    /// Retain the first body of an already indexed dependency. The host must revalidate its
+    /// complete symbol stamp, source provenance and model/epoch before calling this method.
+    pub fn retain_prepared_library_source_declarations(&mut self,index:&dyn InferenceIndex,
+        prepared:source::PreparedSourceReferences,coverage:Fact<()>,declarations:Vec<source::SourceDeclaration>)
+        ->Result<(),ContractError> {
+        if self.sources.contains_key(&prepared.file) {return Err(ContractError::Stale);}
+        if !index.origin_facts().and_then(|facts|facts.file_origin(&prepared.file))
+            .is_some_and(|origin|origin.representation==SourceRepresentation::Source && origin.project_scope.is_none()) {
+            return Err(ContractError::ForeignFile);
+        }
+        let file=prepared.file.clone();let text=prepared.text.clone();
+        self.replace_source_declarations_impl(index,&file,text,coverage,declarations,Some(prepared),false,true)
     }
 
     /// Recompute index-dependent facts without replacing the validated source input.
@@ -1062,7 +1077,7 @@ impl ExtensionStore {
         prepared:source::PreparedSourceReferences,coverage:Fact<()>,declarations:Vec<source::SourceDeclaration>)
         ->Result<(),ContractError> {
         let file=prepared.file.clone();let text=prepared.text.clone();
-        self.replace_source_declarations_impl(index,&file,text,coverage,declarations,Some(prepared),true)
+        self.replace_source_declarations_impl(index,&file,text,coverage,declarations,Some(prepared),true,false)
     }
 
     /// Bind annotation sites to the same validated AST, text and source scope used for normalization.
@@ -1091,6 +1106,7 @@ impl ExtensionStore {
         declarations: Vec<source::SourceDeclaration>,
         prepared: Option<source::PreparedSourceReferences>,
         refresh: bool,
+        retain_namespace: bool,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let java = file.ends_with(".java");
@@ -1183,7 +1199,7 @@ impl ExtensionStore {
             && coverage == unknown(IncompleteReason::UnsupportedSource)
             && index.origin_facts().and_then(|facts| facts.file_origin(file))
                 .is_some_and(|origin| origin.representation == SourceRepresentation::Stub);
-        self.replace_source_impl(index, file, text, coverage, members, prepared, refresh, nominal_proof)?;
+        self.replace_source_impl(index, file, text, coverage, members, prepared, refresh, nominal_proof || retain_namespace)?;
         self.sources.get_mut(file).unwrap().declarations = declarations;
         Ok(())
     }
@@ -1210,7 +1226,7 @@ impl ExtensionStore {
         members: Vec<DeclaredMemberFacts>,
         prepared: Option<source::PreparedSourceReferences>,
         refresh: bool,
-        nominal_proof: bool,
+        indexed_admission: bool,
     ) -> Result<(), ContractError> {
         let entries = index.entries_for_file(file);
         let mut types: Vec<_> = entries
@@ -1223,8 +1239,8 @@ impl ExtensionStore {
         let namespace_changed = self
             .sources
             .get(file)
-            // A verified Stub proof admits an already indexed identity, not a new name.
-            .map_or(!nominal_proof, |source| source.types != types);
+            // Verified dependency retention admits facts for indexed names, not new names.
+            .map_or(!indexed_admission, |source| source.types != types);
         let mut normalized = BTreeMap::new();
         for member in members {
             if member.definition.file != file {

@@ -285,6 +285,48 @@ mod tests {
     }
 
     #[test]
+    fn unanchored_library_body_admission_still_invalidates_namespace_and_pending() {
+        const FILE: &str = "/library/java/lang/Class.java";
+        let text: Arc<str> = Arc::from("package java.lang; public class Class<T> {}");
+        let tree = crate::java::JavaParser::new().parse(&text);
+        let (mut index, mut host) = host();
+        host.register_ipc_commands(&index,"test.ipc",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
+        let facts = crate::language::symbol_facts(crate::language::SourceLanguage::Java,&tree,&text);
+        index.replace_file(FILE,facts.symbols,Tier::Durable);
+        index.set_file_origin(FILE,ktcore::project_model::FileOrigin {
+            origin_id:"jdk:fixture".into(),representation:ktcore::project_model::SourceRepresentation::Source,
+            project_scope:None,
+        });
+        host.mark_index_changed();host.flush_index_changed(&index);
+        let owner = host.source_input_identity("/ipc/Owner.kt").unwrap();
+        let work = host.begin_ipc_command(&index,None,"test.ipc","/ipc/Owner.kt","fixture.echo".into(),vec![],json!({})).unwrap();
+        let params = json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"java.lang.Class"}]});
+        let missing = host.ipc_batch(&index,work.evaluation,"analysis/readFacts",params.clone()).unwrap();
+        assert_eq!(missing["facts"][0],json!({"state":"unknown","reasons":[{"code":"MissingSource"}]}));
+        assert!(host.store.source_declarations(FILE).is_none());
+        let namespace = host.store.namespace_revision();
+        // Unanchored normalization keeps the default namespace guard, even with an unchanged index.
+        host.inputs.insert(FILE.into(),SourceInput {
+            prepared_references:Some(ktcore::extensions::source::prepare_source_references(&index,FILE,text.clone(),&tree)),
+            text,tree,compiled:None,compiler_classes:Vec::new(),
+        });
+        host.normalize(&index,FILE).unwrap();
+        assert!(Arc::ptr_eq(&owner,&host.source_input_identity("/ipc/Owner.kt").unwrap()));
+        let failure = host.store.validate_pending_detailed(host.ipc_evaluations[&work.evaluation].pending.as_ref().unwrap()).unwrap_err();
+        assert_eq!(failure.reason,"namespace");
+        assert_eq!(failure.expected,Some(namespace));
+        assert_eq!(failure.current,Some(namespace+1));
+        assert_eq!(host.reread_ipc_facts(&index,work.evaluation,params).unwrap_err(),"Stale");
+        let evaluation = &host.ipc_evaluations[&work.evaluation];
+        assert!(evaluation.pending.is_none());
+        assert!(evaluation.failure.is_none());
+        eprintln!("{}",json!({"scope":"unanchored native admission, not original eval44","guard":failure.reason,
+            "expected":failure.expected,"current":failure.current,"evaluation_present":true,
+            "pending_present":false,"owner_input_unchanged":true,"index_edited_during_admission":false}));
+        assert_eq!(host.finish_ipc_command(work.evaluation,Err("Stale".into())).unwrap_err(),"Stale");
+    }
+
+    #[test]
     fn staged_source_frontier_does_not_enter_completion_wait() {
         let (mut index, mut host) = host();
         let file = "/ipc/Unopened.kt";
@@ -896,6 +938,10 @@ impl AnalysisExtensions {
             .filter(|slot| slot.worker.id == evaluation.instance)
             .map_or(0, |slot| slot.worker.project_operations());
         let owner = evaluation.owner.clone();
+        // A failed resume consumes pending; record its guard before that evidence is lost.
+        if crate::trace::enabled() {
+            if let Some(pending)=evaluation.pending.as_ref() {let _=self.validate_ipc_pending(&evaluation,pending);}
+        }
         let Some(pending) = evaluation.pending.take() else {
             self.ipc_evaluations.insert(id, evaluation);
             return Err("Stale".into());
