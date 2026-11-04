@@ -60,6 +60,33 @@ Evidence: `original85-member-comparison.json` under the external run
 `cem-project-20261105-034633094-d1b9e197`, rooted at
 `C:/Users/gummy/.codex/worktrees/ktlsp-rust/mc-dev-lsp/build/cem-readiness60-source-9e30558-20261105/build/rust-test-logs`.
 
+The later MC consumer fix9badd764 permits the current selector of a proven owned
+injector when annotation inventory coverage is partial; other Unknown guards remain.
+Its host102 receipts report the original aggregate385 assertions and live Blink
+cache33 assertions passing, including two authentic narrow0/backspace23 replies
+and the exact BlockItem set. The original four snippets pass105 assertions with
+four authentic host102 replies using the older fixed MC8a42 binary. Existing
+Neovim0.12.5 supplies Blink's real context API. These are separate component runs,
+not a successful replay of the old full suite. Receipts are under the MC worktree
+`build/host-artifacts/candidate102-d31c9e623a6b/`.
+
+A separate Drill/Create attempt stops before dependency navigation: the consumer
+requires `declarationMember` for its local generic callback handler and receives
+an unavailable authored-member result. Its raw Unknown reasons were not saved.
+Static inspection confirms two independent limitations: the disposable Gradle
+fixture includes only Create/Ponder/Mixin/MixinExtras and two Mixin source files;
+none of its five archives supplies the handler's Minecraft parameter classes.
+Also, `ReadSession::source_jvm_type` currently rejects parameterized reference
+types with nonempty arguments, so its generic callback needs source-ABI
+normalization support even after the real dependencies are supplied. Existing
+`declarationMember` is the appropriate operation; names or consumer-built
+descriptors cannot replace its exact correspondence. This is not evidence of a
+`sourceLocation` failure, which the run never reached. No runner was repeated for
+this contract inspection, and the32 Kotlin assertions remain unrun. Evidence:
+MC `build/rust-test-logs/kotlin-drill-native-20261105/recovery-and-run-receipt.json`;
+implementation boundaries are `crates/ktcore/src/extensions.rs` functions
+`declaration_member`, `source_member_signature` and `source_jvm_type`.
+
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable
 checkout supplied configuration-build prerequisites; the LSP did not regenerate them.
