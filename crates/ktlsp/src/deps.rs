@@ -58,7 +58,7 @@ pub struct FileSymbols {
 /// A resolved source location for a dependency coordinate. The `identity` is stable for the actual
 /// source artifact, not just the requested coordinate, so `foo` and its `foo-jvm` fallback can be
 /// recognized as the same library before parsing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibrarySource {
     dest: PathBuf,
     jar: Option<PathBuf>,

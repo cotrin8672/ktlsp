@@ -6,7 +6,9 @@ its related native/editor evidence is separate from the earlier broad workspace 
 Library-source preparation105 passes its focused guards and real-archive proof
 comparison; its consumer failure and subsequent106 repair are recorded separately.
 Indexed library-body retention106, public code7327a04, passes its92 related native
-checks; the actual MC106 consumer run remains unverified.
+checks; the actual MC106 consumer run fails its definition command at the child deadline.
+Equivalent-input proof sharing107 passes13 hydration checks; its consumer deadline
+result remains unverified.
 The agreed [MC responsibility boundary](architecture/extension-ipc.md#current-mc-dev-responsibility-boundary)
 keeps MC source-syntax projection and host-authoritative semantic facts in the mixed
 pipeline. This Kotlin connection needs no new host API; separately demonstrated
@@ -200,6 +202,25 @@ init6528 and verification child629ee037 remain unchanged. Existing code/fixture
 guards are stable. The consumer105 receipt is MC
 `build/rust-test-logs/java-host105-native-20261105/recovery-and-run-receipt.json`.
 
+The single MC106 Java run completed in159.6 seconds with clean shutdown and eight
+original assertions, then failed `mcdev.definition` at the child evaluation deadline.
+Trace624/635 record two different demand frontiers with8 preparations taking
+17.418819/5.732229 seconds; trace636 proves only a successful `declarationMember`
+transport response, not Found. Trace638 records seven existing producers awaited
+before the deadline error at640. Evidence: MC
+`build/java-host106-acceptance-overlay-20261105/build/java-host106-proof/host.trace.jsonl`.
+Fix107 shares selection within a batch across independently allocated `LibrarySource`
+handles only when all six input fields match, including content digest, destination,
+origin and policy. Per-request before/after checks and admission guards remain.
+Its13 hydration checks pass, including separate resolver handles sharing one
+selection, distinct archive origins requiring two selections, per-target rejection
+and changed-content guards. Evidence: `mc107-equivalent-inputs/main-ready.json`.
+The sealed host is25,459,200 bytes, SHA-256
+`c926f65583b9fb81ea6ee25ab419d55c5090ae2173f039aa961b5a8bea75a09c`;
+init6528 is unchanged and416 source guards stayed stable during checks/build.
+Actual106 group counts were not recorded, and no deadline repair or MC acceptance
+is claimed from this change. No additional MC run was made for these checks.
+
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable
 checkout supplied configuration-build prerequisites; the LSP did not regenerate them.
@@ -220,7 +241,7 @@ and unsaved Java member addition followed by Kotlin completion, applied call and
 Both diagnostics are0→1→0: `wire-diagnostics.json` and `wire-java-diagnostics.json` in those artifacts each have3 states with `canonical_certified=true`, `wire_matches_snapshot=true` and no RPC error.
 Indexing records project433/library58974/index_failed0;155 unavailable source JARs are not binary misses.
 The182s duration covers the whole run, not a performance baseline. Existing sealed artifacts were reused; no Cargo, new build, full suite or speed benchmark ran.
-Historical94/98/101 evidence remains above; MC106's original handler is still unverified.
+Historical94/98/101 evidence remains above; MC106's original handler failed at its deadline.
 
 Gradle9.7.1/KGP2.3.21 task inventories, fragment roles and the captured JDK21
 target1.8 Java recipe are now supported with existing custom-action and input guards.
