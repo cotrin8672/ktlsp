@@ -68,6 +68,9 @@ pub struct LibrarySource {
     policy: Result<SourceTextPolicy, String>,
 }
 
+#[cfg(test)]
+thread_local! { static LIBRARY_CURRENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 impl LibrarySource {
     fn jdk_archive(src_zip: &Path, dest: &Path, fingerprint: &str) -> Self {
         Self {
@@ -80,6 +83,8 @@ impl LibrarySource {
         }
     }
     pub(crate) fn is_current(&self) -> bool {
+        #[cfg(test)]
+        LIBRARY_CURRENT_CHECKS.with(|count|count.set(count.get()+1));
         let (Some(jar), Some(expected), Ok(policy)) = (&self.jar, &self.fingerprint, &self.policy)
         else {
             return false;
@@ -87,16 +92,34 @@ impl LibrarySource {
         jar_fingerprint(jar).as_ref() == Some(expected) && policy.validate().is_ok()
     }
 
+    pub(crate) fn binary_types(&self, files: &[&Path]) -> BTreeSet<PathBuf> {
+        let mut verified = BTreeSet::new();
+        let Some(path) = &self.jar else { return verified; };
+        if !self.is_current() { return verified; }
+        let Ok(file) = fs::File::open(path) else { return verified; };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else { return verified; };
+        let Ok(selected) = jar::selected_class_entries(&mut archive,"",None,||self.is_current())
+            else { return verified; };
+        for file in files {
+            let Some(name) = file.strip_prefix(&self.dest).ok()
+                .and_then(|relative| relative.to_str())
+                .and_then(|relative| relative.strip_suffix(".java")) else { continue; };
+            let name = name.replace('\\', "/");
+            if !crate::runtime_bytes::valid_internal_name(&name) { continue; }
+            let Some(entry) = selected.iter().find(|entry|entry.internal_name==name) else { continue; };
+            let Ok(bytes) = jar::read_selected_class_bytes(&mut archive,entry,||self.is_current()) else { continue; };
+            if ktcore::classfile::decode(&self.origin_id, &bytes)
+                .is_ok_and(|class| class.identity.internal_name == name) {
+                verified.insert(file.to_path_buf());
+            }
+        }
+        if !self.is_current() { verified.clear(); }
+        verified
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_binary_type(&self, file: &Path) -> bool {
-        let Some(jar) = &self.jar else { return false; };
-        let Some(name) = file.strip_prefix(&self.dest).ok()
-            .and_then(|relative| relative.to_str())
-            .and_then(|relative| relative.strip_suffix(".java")) else { return false; };
-        let name = name.replace('\\', "/");
-        let Ok(Some(bytes)) = jar::read_effective_class_bytes(jar, &name, "", None, || self.is_current())
-        else { return false; };
-        ktcore::classfile::decode(&self.origin_id, &bytes)
-            .is_ok_and(|class| class.identity.internal_name == name)
+        self.binary_types(&[file]).contains(file)
     }
 
     pub(crate) fn content_is_current(&self) -> bool {
@@ -2611,6 +2634,52 @@ fn parse_java_source_file(path: &Path, java: &mut JavaParser) -> Option<FileSymb
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires KTLSP_LIBRARY_BATCH_JAR pinned NeoForge archive; reports one isolated comparison"]
+    fn real_binary_type_batch_probe_matches_scalar_proofs_and_reports_work() {
+        let path = PathBuf::from(std::env::var("KTLSP_LIBRARY_BATCH_JAR").expect("set the pinned NeoForge jar path"));
+        let expected = "fc3c376175026bacfabcd1f7feaea70981fcd36cc3765f6b7b7c7f0186095b54";
+        let content = file_content_digest(&path).unwrap();
+        assert_eq!(content.iter().map(|byte|format!("{byte:02x}")).collect::<String>(),expected);
+        assert_eq!(fs::metadata(&path).unwrap().len(),32_218_181);
+        let source = LibrarySource {
+            dest:std::env::temp_dir().join("ktlsp-isolated-binary-proof"),jar:Some(path.clone()),
+            fingerprint:jar_fingerprint(&path),binary_content:Some(content),
+            origin_id:crate::classpath::file_origin_id(&path),policy:Ok(SourceTextPolicy::default()),
+        };
+        let names = ["net/minecraft/core/BlockPos", "net/minecraft/world/InteractionHand",
+            "net/minecraft/world/entity/player/Player", "net/minecraft/world/item/ItemStack",
+            "net/minecraft/world/level/Level", "net/minecraft/world/level/block/state/BlockState",
+            "net/minecraft/world/phys/BlockHitResult", "net/minecraft/world/ItemInteractionResult"];
+        let files:Vec<_> = names.iter().map(|name|source.dest.join(format!("{name}.java"))).collect();
+        assert!(source.content_is_current() && source.is_current());
+        let selections = jar::class_selection_count();
+        let checks = LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get);
+        let start = Instant::now();
+        let scalar:Vec<_> = files.iter().map(|file|source.has_binary_type(file)).collect();
+        let scalar_us = start.elapsed().as_micros();
+        let scalar_selections = jar::class_selection_count()-selections;
+        let scalar_checks = LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get)-checks;
+        let selections = jar::class_selection_count();
+        let checks = LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get);
+        let start = Instant::now();
+        let batch = source.binary_types(&files.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+        let batch_us = start.elapsed().as_micros();
+        let batch_selections = jar::class_selection_count()-selections;
+        let batch_checks = LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get)-checks;
+        let batched:Vec<_> = files.iter().map(|file|batch.contains(file)).collect();
+        assert_eq!(scalar,batched);
+        assert!(scalar.iter().all(|found|*found),"every selected class must have a real decoded identity");
+        assert_eq!(scalar_selections,8);assert_eq!(batch_selections,1);
+        assert!(scalar_checks>batch_checks);
+        assert!(source.content_is_current() && source.is_current());
+        eprintln!("{}",serde_json::json!({"scope":"isolated nominal binary proof, representative classes; not the original trace's exact eight",
+            "samples":1,"jar":path,"jar_sha256":expected,"jar_bytes":32_218_181,"classes":names,
+            "scalar":{"proofs":scalar,"selections":scalar_selections,"current_checks":scalar_checks,"elapsed_us":scalar_us},
+            "batch":{"proofs":batched,"selections":batch_selections,"current_checks":batch_checks,"elapsed_us":batch_us},
+            "timing_threshold":null,"semantic_credit":0}));
+    }
+
     #[test]
     fn pending_gradle_source_query_keeps_exact_binary_import_facts_available() {
         let root = std::env::temp_dir().join(format!(

@@ -50,6 +50,11 @@ pub(crate) struct SelectedClassEntry {
     pub version: u16,
 }
 
+#[cfg(test)]
+thread_local! { static CLASS_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn class_selection_count() -> usize { CLASS_SELECTIONS.with(std::cell::Cell::get) }
+
 /// JAR specification / JarFile(File,boolean,int,Runtime.Version): canonical N>=9,
 /// main-section opt-in, highest N<=feature. META-INF resources are never versioned.
 /// An unknown profile can read ordinary JARs but cannot authorize an MR class view.
@@ -57,6 +62,8 @@ pub(crate) fn selected_class_entries<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>, prefix: &str, feature: Option<u16>,
     current: impl Fn() -> bool,
 ) -> Result<Vec<SelectedClassEntry>, String> {
+    #[cfg(test)]
+    CLASS_SELECTIONS.with(|count|count.set(count.get()+1));
     if archive.len()>MAX_BINARY_ARCHIVE_ENTRIES {return Err("class archive entry limit".into());}
     if archive.has_duplicate_names() {return Err("ambiguous class archive entries".into());}
     let mut manifests=Vec::new();
@@ -141,6 +148,12 @@ pub(crate) fn read_effective_class_bytes(path:&Path, internal_name:&str, prefix:
     let mut archive=zip::ZipArchive::new(fs::File::open(path).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
     let selected=selected_class_entries(&mut archive,prefix,feature,&current)?.into_iter().find(|entry|entry.internal_name==internal_name);
     let Some(selected)=selected else {return Ok(None);};
+    read_selected_class_bytes(&mut archive,&selected,current).map(Some)
+}
+
+pub(crate) fn read_selected_class_bytes<R: Read + io::Seek>(archive:&mut zip::ZipArchive<R>,
+    selected:&SelectedClassEntry,current:impl Fn()->bool)->Result<Vec<u8>,String> {
+    if !current() {return Err("Stale".into());}
     let limit=ktcore::classfile::MAX_CLASS_FILE_BYTES;
     if selected.size>limit as u64 {return Err("class entry too large".into());}
     let mut entry=archive.by_index(selected.index).map_err(|error|error.to_string())?;
@@ -150,7 +163,7 @@ pub(crate) fn read_effective_class_bytes(path:&Path, internal_name:&str, prefix:
         return Err("versioned class exceeds its Java release".into());
     }
     if !current() {return Err("Stale".into());}
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 /// Read one selected entry without rewriting attributes or loading the whole archive.
@@ -3317,6 +3330,15 @@ mod tests {
         let oversized_main=format!("Manifest-Version: 1.0\nLong-Attribute: {}\n\n","x".repeat(64*1024));
         write_binary_jar(&path,&[("META-INF/MANIFEST.MF",oversized_main.as_bytes()),("mr/Api.class",base)]);
         assert_eq!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).unwrap_err(),"JAR manifest limit");
+        write_binary_jar(&path,&[("mr/Api.class",base)]);
+        let mut archive=zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        let selected=selected_class_entries(&mut archive,"",None,||true).unwrap();
+        let checks=std::cell::Cell::new(0);
+        assert_eq!(read_selected_class_bytes(&mut archive,&selected[0],|| {
+            checks.set(checks.get()+1);checks.get()==1
+        }).unwrap_err(),"Stale","a batch class read must recheck its input after reading bytes");
+        assert_eq!(checks.get(),2);
+        drop(archive);
         write_binary_jar(&path,&[("META-INF/MANIFEST.MF",b"Manifest-Version: 1.0\nMulti-Release: true\n\n"),
             ("META-INF/versions/17/mr/../Api.class",base)]);
         assert!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).is_err());

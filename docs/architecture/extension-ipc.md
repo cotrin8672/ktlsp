@@ -214,6 +214,9 @@ files are read. Installing the body invalidates and requeues the old evaluation,
 so an initial Unknown cannot publish an obsolete empty result. Namespace coverage
 Unknown alone never grants a guessed file read. No source-inventory capability is
 needed for this shared semantic hydration.
+Requests sharing the same accepted library archive handle reuse class selection
+within one preparation batch. Content/currentness and per-class identity checks
+remain; no proof is cached across batches or promoted to authored source authority.
 
 Found is a single exact normalized source definition:
 

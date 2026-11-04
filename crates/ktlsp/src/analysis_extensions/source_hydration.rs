@@ -447,7 +447,21 @@ mod tests {
             assert!(matches!(read.resolve_type("decoy.Mixin"), Knowledge::Unknown(_)));
             let pending = read.finish();
             host.store.commit(pending).unwrap();
-            assert_eq!(drain(&mut ws), 3);
+            let requests = ws.begin_extension_source_batch();
+            assert_eq!(requests.len(),3);
+            let selections = crate::jar::class_selection_count();
+            let scalar: std::collections::BTreeSet<_> = requests.iter()
+                .filter(|request|request.source.has_binary_type(Path::new(&request.file)))
+                .map(|request|request.file.clone()).collect();
+            assert_eq!(crate::jar::class_selection_count()-selections,3);
+            let selections = crate::jar::class_selection_count();
+            let prepared = prepare_sources(requests);
+            assert_eq!(crate::jar::class_selection_count()-selections, 1,
+                "one accepted archive handle is selected once for all three requested types");
+            assert_eq!(prepared.iter().map(|source|source.request.file.clone()).collect::<std::collections::BTreeSet<_>>(),scalar);
+            assert_eq!(prepared.len(),2,"the decoy's different internal name must stay unproved");
+            ws.finish_extension_source_batch(prepared);
+            assert!(ws.begin_extension_source_batch().is_empty(),"accepted batch must not repeat its fetches");
             let (index, host) = ws.extension_test_inputs();
             let mut read = host.store.begin(index, "library-probe", file).unwrap();
             let mut resolved_files = std::collections::BTreeSet::new();
@@ -510,9 +524,20 @@ mod tests {
                 let _ = fs::remove_file(entry.path.as_ref());
             }
         }
-        let source = crate::deps::resolve_local_jar_stubs(
+        let mut ws = Workspace::with_analysis_providers(vec![Arc::new(Probe)]);
+        for batch in crate::deps::resolve_local_jar_stubs(
             &fixture.binary, &fixture.extract, &mut KotlinParser::new(), &mut JavaParser::new(),
-        ).unwrap().remove(0).library_source.unwrap();
+        ).unwrap() { assert!(ws.index_dependency_batch(batch)); }
+        ws.bump_index_revision();
+        ws.open("Changed.java", "class Changed {}".into());
+        let (index, host) = ws.extension_test_inputs();
+        let mut read = host.store.begin(index,"library-probe","Changed.java").unwrap();
+        assert!(matches!(read.resolve_type("org.spongepowered.asm.mixin.Mixin"),Knowledge::Unknown(_)));
+        let pending = read.finish();
+        host.store.commit(pending).unwrap();
+        let requests = ws.begin_extension_source_batch();
+        assert_eq!(requests.len(),1);
+        let source = requests[0].source.clone();
         assert!(source.content_is_current());
         let modified = fs::metadata(&fixture.binary).unwrap().modified().unwrap();
         let mut bytes = fs::read(&fixture.binary).unwrap();
@@ -522,6 +547,9 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
         assert!(source.is_current(), "the metadata-only identity is deliberately unchanged");
         assert!(!source.content_is_current(), "binary hydration must also check selected content");
+        let selections = crate::jar::class_selection_count();
+        assert!(prepare_sources(requests).is_empty(),"changed bytes cannot reuse an earlier batch's proof");
+        assert_eq!(crate::jar::class_selection_count(),selections,"reject changed content before archive selection");
     }
 
     #[test]
@@ -745,13 +773,28 @@ pub(crate) struct PreparedSource {
 
 /// No network lookup: the dependency resolver has already selected this exact source archive.
 pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSource> {
+    let mut archives: Vec<(&Arc<LibrarySource>, Vec<&Path>)> = Vec::new();
+    for request in &requests {
+        if request.stamp.origin.representation != SourceRepresentation::Stub { continue; }
+        if let Some((_,files)) = archives.iter_mut().find(|(source,_)|Arc::ptr_eq(source,&request.source)) {
+            files.push(Path::new(&request.file));
+        } else {
+            archives.push((&request.source,vec![Path::new(&request.file)]));
+        }
+    }
+    // Reuse selection only within this batch and this exact accepted archive handle.
+    let mut binary_types = std::collections::BTreeMap::new();
+    for (source,files) in archives {
+        if source.content_is_current() { binary_types.insert(Arc::as_ptr(source),source.binary_types(&files)); }
+    }
     requests
         .into_iter()
         .filter_map(|request| {
             let path = Path::new(&request.file);
             // A name-only preview is not proof that the selected archive declares this type.
             if request.stamp.origin.representation == SourceRepresentation::Stub
-                && (!request.source.content_is_current() || !request.source.has_binary_type(path))
+                && (!request.source.content_is_current()
+                    || !binary_types.get(&Arc::as_ptr(&request.source)).is_some_and(|files|files.contains(path)))
             {
                 return None;
             }

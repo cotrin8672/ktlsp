@@ -3,6 +3,8 @@
 Updated 2026-11-05 (Asia/Tokyo). **Selected Wire editing and Java/Kotlin diagnostic cases pass. Discovered Rust regressions are fixed and remaining workspace targets checked. Original CEM first completion and the85-member comparison also pass.**
 Java reference erasure through the existing extension API is verified on103;
 its related native/editor evidence is separate from the earlier broad workspace run.
+Library-source preparation105 passes its focused guards and real-archive proof
+comparison; the corrected consumer Java editor run is being checked separately.
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.
@@ -125,6 +127,37 @@ incomplete Drill profile and later Java/Kotlin quota failures remain separate
 failed/unfinished consumer cases, not host103 acceptance conditions. Quota
 evidence is in MC `build/rust-test-logs/java-only-host103-native-20261105/`
 and `build/rust-test-logs/kotlin-only-classpath-native-20261105/`.
+
+After the consumer respected `DiscoveryNeeds.resources=false`, the Java103 profile
+used11 read-facts batches totalling4095 microseconds. Its two accepted library
+preparation waves still took11.596229 and13.933468 seconds and expired before
+`declarationMember`. The trace records9/13 candidate files and8 prepared per wave;
+it does not identify each exact selected eight. Evidence is the MC
+`build/java-quota25c-acceptance-overlay-20261105/build/java-quota25c-proof/host.trace.jsonl`.
+Each binary type previously repeated two full archive-entry walks with currentness
+checks. Fix105 shares that selection only among requests holding the same accepted
+`Arc<LibrarySource>` within one preparation batch. Per-source content/currentness,
+per-class decoded identity, MR/duplicate/path/size limits and final admission checks
+remain. A bad class does not poison valid peers. There is no cross-batch cache,
+whole-archive byte copy, new thread pool, deadline or quota increase.
+
+The105 native batch passes15 checks, including the explicit external-child first
+command and real-archive opt-in probe;416 code-input guards remain stable. In the
+same release test binary, one scalar8 versus batch1 comparison on representative
+NeoForge classes returns eight matching positive proofs. Selection passes drop
+8→1 and currentness checks279544→34957. Observed elapsed times are14.722172 versus
+1.815277 seconds. This is one ordered observation, with no timing pass threshold,
+not the original trace's exact eight or a general latency distribution. Archive:
+32218181 bytes, SHA-256
+`fc3c376175026bacfabcd1f7feaea70981fcd36cc3765f6b7b7c7f0186095b54`.
+Evidence: `integrated-input105/{main-ready,batch-performance}.json`.
+Set `KTLSP_LIBRARY_BATCH_JAR` to that pinned archive and run
+`cargo test --locked -p ktlsp --lib --release real_binary_type_batch_probe_matches_scalar_proofs_and_reports_work -- --ignored --nocapture`
+to repeat this isolated diagnostic. It grants no MC editing acceptance credit.
+The sealed105 host is25348096 bytes, SHA-256
+`3c26a5208d64ea85209f2c5b9650b43992769cdaa64bdbd986439c0dfa03c4f5`;
+init input6528 and verification child629ee037 are unchanged from103. The relevant
+consumer editor check uses only its failed Java group, not the full/85 replay.
 
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable
