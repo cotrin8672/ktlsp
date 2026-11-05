@@ -1362,6 +1362,34 @@ impl ProjectSnapshot {
         Some((path.clone(),physical.clone()))
     }
 
+    /// A stub must come from the same unique physical compile input in every scope exposing its
+    /// logical origin. A variant conflict is unknown; archive order never chooses the ABI.
+    pub(crate) fn dependency_binary_origin(&self, origin:&FileOrigin, source:&crate::deps::LibrarySource)
+        ->Option<String> {
+        if origin.project_scope.is_some() || origin.representation!=SourceRepresentation::Stub {return None;}
+        let binary=source.selected_archive()?;
+        let physical=self.artifact_origin(binary)?;
+        if source.origin_id()!=physical {return None;}
+        let mut found=false;
+        for scope in self.modules.iter().flat_map(|module|&module.source_sets) {
+            let mut matches=0;
+            for path in &scope.entries {
+                let components:Vec<_>=scope.artifacts.iter().filter(|artifact|path_key(&artifact.path)==path_key(path)).collect();
+                if components.len()>1 && path_key(path)==path_key(binary) {return None;}
+                let component=components.first().map(|artifact|&artifact.component);
+                let origins=self.origins_for_entry(path,component);
+                if !origins.contains(&origin.origin_id) {continue;}
+                if origins.len()!=1 {return None;}
+                if components.len()>1 || scope.classpath_incomplete || !scope.unresolved.is_empty()
+                    || path_key(path)!=path_key(binary) || self.artifact_origin(path)!=Some(physical) {return None;}
+                matches+=1;
+            }
+            if matches>1 {return None;}
+            found|=matches==1;
+        }
+        found.then(||physical.to_owned())
+    }
+
     pub fn coordinate_binaries(&self, coord: &Coordinate) -> Option<Vec<(PathBuf, String)>> {
         self.modules
             .iter()

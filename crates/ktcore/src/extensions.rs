@@ -683,6 +683,7 @@ struct SourceFacts {
     compiled_revision: u64,
     compiled: Option<(TypeId, Arc<crate::classfile::ClassFileFacts>)>,
     compiler_classes: Vec<(TypeId, CompilerClassInput)>,
+    dependency_abi: Vec<(Def, Arc<crate::classfile::ClassFileFacts>, Arc<dyn HostInputGuard>)>,
 }
 
 #[derive(Clone)]
@@ -888,6 +889,45 @@ impl ExtensionStore {
                 self.dirty.insert((provider.clone(), file.clone()));
             }
         }
+        Ok(())
+    }
+
+    /// The host proves one selected physical binary and guards its bytes off-lock. This grants
+    /// only ABI reads for existing stub identities, never source or generated-member authority.
+    pub fn bind_dependency_abi(&mut self, index: &dyn InferenceIndex, file: &str,
+        physical_origin: &str, classes: Vec<Arc<crate::classfile::ClassFileFacts>>,
+        guard: Arc<dyn HostInputGuard>) -> Result<(), ContractError> {
+        if !guard.is_current() { return Err(ContractError::Stale); }
+        let source = self.sources.get(file).ok_or(ContractError::MissingSource)?;
+        if source.coverage != unknown(IncompleteReason::UnsupportedSource) || !source.declarations.is_empty()
+            || !index.origin_facts().and_then(|facts|facts.file_origin(file)).is_some_and(|origin|
+            origin.project_scope.is_none() && origin.representation == SourceRepresentation::Stub) {
+            return Err(ContractError::ForeignFile);
+        }
+        let entries=index.entries_for_file(file);
+        let mut names=BTreeSet::new();
+        let mut bound=Vec::new();
+        for class in classes {
+            if !names.insert(class.identity.internal_name.clone()) || physical_origin.is_empty()
+                || class.identity.origin_id != physical_origin
+                || !matches!(class.identity.input, crate::jvm::InputIdentity::Binary {..}) {
+                return Err(ContractError::ForeignIdentity);
+            }
+            let matches:Vec<_>=entries.iter().filter(|entry| {
+                let name=entry.sym.container.as_ref().map_or_else(||entry.sym.name.clone(),
+                    |owner|format!("{owner}.{}",entry.sym.name)).replace('.',"$");
+                let internal=if entry.sym.package.is_empty() {name} else {format!("{}/{name}",entry.sym.package.replace('.',"/"))};
+                source.reference_types.contains(&(entry.sym.start_byte,entry.sym.end_byte))
+                    && entry.sym.kind.is_type_like() && internal==class.identity.internal_name
+            }).collect();
+            let [entry]=matches.as_slice() else {return Err(ContractError::NotIndexedDeclaration);};
+            bound.push((definition(entry),class,guard.clone()));
+        }
+        self.next_generation+=1;
+        let source=self.sources.get_mut(file).unwrap();
+        source.compiled_revision=self.next_generation;
+        source.dependency_abi=bound;
+        self.remove_stale_sets();
         Ok(())
     }
 
@@ -1314,6 +1354,7 @@ impl ExtensionStore {
                 compiled_revision: self.next_generation,
                 compiled: None,
                 compiler_classes: Vec::new(),
+                dependency_abi: Vec::new(),
             },
         );
         if namespace_changed {
@@ -1345,6 +1386,7 @@ impl ExtensionStore {
     /// An accepted classpath/project-model change invalidates scoped and negative reads.
     pub fn invalidate_model(&mut self) {
         self.model_generation += 1;
+        for source in self.sources.values_mut() { source.dependency_abi.clear(); }
         self.invalidate_semantic_index();
     }
 
@@ -2436,6 +2478,13 @@ impl ReadSession<'_> {
         }
         let mut abi = unknown(IncompleteReason::MissingFacts);
         if let Knowledge::Found(name) = &binary_name {
+            let dependency=self.store.sources[&owner.definition().file].dependency_abi.iter()
+                .find(|(definition,class,_)|definition==owner.definition() && class.identity.internal_name==name.internal_name)
+                .map(|(_,class,guard)|(class.clone(),guard.clone()));
+            if let Some((class,guard))=dependency {
+                self.observe_host_input(guard)?;
+                abi=Knowledge::Found(class);
+            }
             for input in inputs {
                 self.check_compiled_class(&input)?;
                 if input.class.identity.internal_name != name.internal_name

@@ -29,6 +29,7 @@ pub(super) struct HydratedSource {
     pub(super) revision: u64,
     source: Arc<LibrarySource>,
     retired: Arc<std::sync::atomic::AtomicBool>,
+    abi_guard: Option<Arc<dyn HostInputGuard>>,
 }
 impl Drop for HydratedSource {
     fn drop(&mut self) { self.retired.store(true,std::sync::atomic::Ordering::Release); }
@@ -39,6 +40,60 @@ struct DependencyProvenanceGuard {
     retired: Arc<std::sync::atomic::AtomicBool>,
     lease: Arc<crate::compiled_watch::HostInputLease>,
 }
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct BinaryLeaseKey {
+    model: usize,
+    epoch: u64,
+    archive: String,
+    physical_origin: String,
+    inputs: Vec<std::path::PathBuf>,
+}
+
+#[derive(Default)]
+pub(super) struct BinaryLeasePool {
+    leases: std::sync::Mutex<
+        std::collections::BTreeMap<
+            BinaryLeaseKey,
+            std::sync::Weak<crate::compiled_watch::HostInputLease>,
+        >,
+    >,
+}
+
+impl BinaryLeasePool {
+    // Called only during off-lock preparation; the pool never owns a native lease strongly.
+    fn current(
+        &self,
+        request: &SourceRequest,
+        physical_origin: &str,
+    ) -> Option<Arc<crate::compiled_watch::HostInputLease>> {
+        let mut inputs = request.source.provenance_inputs();
+        inputs.sort();
+        inputs.dedup();
+        let key = BinaryLeaseKey {
+            model: Arc::as_ptr(request.model.as_ref()?) as usize,
+            epoch: request.epoch,
+            archive: request.stamp.archive.clone(),
+            physical_origin: physical_origin.into(),
+            inputs,
+        };
+        let mut leases = self.leases.lock().ok()?;
+        leases.retain(|_, lease| lease.upgrade().is_some_and(|lease| lease.is_current()));
+        if let Some(lease) = leases
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|lease| lease.is_current())
+        {
+            return Some(lease);
+        }
+        // Serialize creation in this off-lock pool so concurrent batches cannot duplicate watches.
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&key.inputs).ok()?;
+        let lease = crate::compiled_watch::HostInputLease::new(plan, Arc::new(|| {})).ok()?;
+        leases.insert(key, Arc::downgrade(&lease));
+        Some(lease)
+    }
+}
+
 impl ktcore::extensions::HostInputGuard for DependencyProvenanceGuard {
     fn is_current(&self)->bool {
         !self.retired.load(std::sync::atomic::Ordering::Acquire) && self.lease.is_current()
@@ -307,6 +362,153 @@ mod tests {
         ws.bump_index_revision(); ws.open(&owner,OWNER.into());
         assert_eq!(drain(&mut ws),2);
         (fixture,ws,model,owner)
+    }
+
+    fn binary_abi_fixture() -> (Fixture,Workspace,Arc<crate::classpath::ProjectSnapshot>,String) {
+        use crate::classpath::*;
+        let fixture=Fixture::new();
+        fs::remove_file(&fixture.sources).unwrap();
+        let root=fixture.root.join("src");fs::create_dir_all(&root).unwrap();
+        let owner=crate::paths::file_key(&root.join("Owner.java"));
+        let model=Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
+            module:":fixture".into(),project_dir:fixture.root.clone(),build:"fixture".into(),
+            source_sets:vec![SourceSetClasspath {name:"main".into(),source_roots:vec![root],
+                entries:vec![fixture.binary.clone()],artifacts:vec![ResolvedArtifact {
+                    path:fixture.binary.clone(),component:ComponentId::File}],..Default::default()}],
+            entries:Vec::new(),unresolved:Vec::new(),
+        }]));
+        let mut ws=Workspace::with_analysis_providers(vec![Arc::new(Probe)]);
+        ws.set_project_model(model.clone());fixture.index(&mut ws);ws.open(&owner,OWNER.into());
+        (fixture,ws,model,owner)
+    }
+
+    #[test]
+    fn selected_binary_type_jvm_abi_has_physical_identity_without_source_authority() {
+        let (fixture, mut ws, model, owner) = binary_abi_fixture();
+        let mut requests = ws.begin_extension_source_batch();
+        assert_eq!(requests.len(), 2);
+        let later = requests.pop().unwrap();
+        let first = prepare_sources(requests);
+        let first_lease = first[0].binary.as_ref().unwrap().2.clone();
+        ws.finish_extension_source_batch(first);
+        let second = prepare_sources(vec![later]);
+        assert!(
+            Arc::ptr_eq(&first_lease, &second[0].binary.as_ref().unwrap().2),
+            "the same archive must share its native lease across preparation batches"
+        );
+        ws.finish_extension_source_batch(second);
+        let physical = model.artifact_origin(&fixture.binary).unwrap();
+        let expected = ktcore::classfile::decode(
+            physical,
+            include_bytes!("../../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class"),
+        )
+        .unwrap();
+        let (index, host) = ws.extension_test_inputs();
+        let mut read = host.store.begin(index, "library-probe", &owner).unwrap();
+        let Knowledge::Found(ty) = read.resolve_type("arrayfixture.Factory") else {
+            panic!("missing binary type");
+        };
+        let facts = read.type_jvm(&ty).unwrap();
+        let Knowledge::Found(class) = facts.abi else {
+            panic!("missing selected binary ABI");
+        };
+        assert_eq!(class.identity, expected.identity);
+        assert_eq!(facts.class_flags, Knowledge::Found(expected.access_flags));
+        assert!(
+            matches!(facts.declared_members_coverage,Knowledge::Unknown(ref reasons)
+            if reasons.contains(&IncompleteReason::UnsupportedSource))
+        );
+        assert!(matches!(facts.jvm_abi_coverage, Knowledge::Unknown(_)));
+        assert!(
+            matches!(read.type_source_location(&ty).unwrap(),Knowledge::Unknown(ref reasons)
+            if reasons.contains(&IncompleteReason::UnsupportedSource))
+        );
+        let pending = read.finish();
+        host.store.commit(pending).unwrap();
+        let guards: Vec<_> = host
+            .hydrated_sources
+            .values()
+            .map(|source| {
+                (
+                    source.retired.clone(),
+                    source.abi_guard.as_ref().unwrap().clone(),
+                )
+            })
+            .collect();
+        assert_eq!(guards.len(), 2);
+        assert!(
+            !Arc::ptr_eq(&guards[0].1, &guards[1].1),
+            "type retirement guards stay independent"
+        );
+        guards[0].0.store(true, Ordering::Release);
+        assert!(!guards[0].1.is_current());
+        assert!(guards[1].1.is_current());
+        assert!(
+            first_lease.is_current(),
+            "retiring a type must not retire the shared archive watch"
+        );
+    }
+
+    #[test]
+    fn selected_binary_type_jvm_abi_refuses_workspace_shadow_and_changed_epoch() {
+        let (fixture,mut ws,_model,owner)=binary_abi_fixture();
+        assert_eq!(drain(&mut ws),2);
+        let shadow=crate::paths::file_key(&fixture.root.join("src/Factory.java"));
+        ws.open(&shadow,"package arrayfixture; public class Factory { public int own() {return 1;} }".into());
+        let (index,host)=ws.extension_test_inputs();
+        let mut read=host.store.begin(index,"library-probe",&owner).unwrap();
+        let Knowledge::Found(ty)=read.resolve_type("arrayfixture.Factory") else {panic!("missing workspace shadow");};
+        assert_eq!(ty.definition().file,shadow);
+        assert!(matches!(read.type_jvm(&ty).unwrap().abi,Knowledge::Unknown(_)));
+        assert!(matches!(read.type_source_location(&ty).unwrap(),Knowledge::Found(_)));
+        drop(read);
+        let (fixture,mut ws,model,owner)=binary_abi_fixture();
+        let prepared=prepare_sources(ws.begin_extension_source_batch());
+        assert!(prepared.iter().any(|source|source.binary.is_some()));
+        // Replacing the accepted model retires even a successfully decoded off-lock batch.
+        ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(model.modules.clone())));
+        ws.finish_extension_source_batch(prepared);
+        assert!(ws.extension_test_inputs().1.hydrated_sources.is_empty());
+        let _=(fixture,owner);
+    }
+
+    #[test]
+    fn selected_binary_type_jvm_abi_rejects_duplicate_variant_and_changed_content() {
+        for change in ["duplicate","variant","content"] {
+            let (fixture,mut ws,model,owner)=binary_abi_fixture();
+            if change!="content" {
+                let mut modules=model.modules.clone();
+                let scope=&mut modules[0].source_sets[0];
+                if change=="duplicate" {scope.entries.push(fixture.binary.clone());}
+                else {
+                    let different=fixture.root.join("different.jar");fs::copy(&fixture.binary,&different).unwrap();
+                    scope.entries=vec![different.clone()];scope.artifacts[0].path=different;
+                }
+                ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(modules)));
+                drain(&mut ws);
+            } else {
+                assert_eq!(drain(&mut ws),2);
+                let (index,host)=ws.extension_test_inputs();
+                let mut read=host.store.begin(index,"library-probe",&owner).unwrap();
+                let Knowledge::Found(ty)=read.resolve_type("arrayfixture.Factory") else {panic!("missing binary type");};
+                assert!(matches!(read.type_jvm(&ty).unwrap().abi,Knowledge::Found(_)));
+                let pending=read.finish();
+                let guard=host.hydrated_sources[&ty.definition().file].abi_guard.as_ref().unwrap().clone();
+                fs::write(&fixture.binary,b"changed selected binary").unwrap();
+                for _ in 0..100 {
+                    if !guard.is_current() {break;}
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(!guard.is_current(),"selected binary native guard did not retire");
+                assert_eq!(host.store.resume(index,&owner,pending).err(),Some(ContractError::Stale));
+                host.refresh_host_inputs();
+            }
+            let (index,host)=ws.extension_test_inputs();
+            let mut read=host.store.begin(index,"library-probe",&owner).unwrap();
+            if let Knowledge::Found(ty)=read.resolve_type("arrayfixture.Factory") {
+                assert!(matches!(read.type_jvm(&ty).unwrap().abi,Knowledge::Unknown(_)),"{change}");
+            }
+        }
     }
 
     fn planned_provenance(ws:&mut Workspace,model:&Arc<crate::classpath::ProjectSnapshot>,owner:&str,name:&str)
@@ -1121,6 +1323,8 @@ pub(crate) struct SourceRequest {
     stamp: SourceStamp,
     epoch: u64,
     source: Arc<LibrarySource>,
+    pub(crate) model: Option<Arc<crate::classpath::ProjectSnapshot>>,
+    binary_leases: Arc<BinaryLeasePool>,
     _signal: SourceSignal,
 }
 
@@ -1129,6 +1333,7 @@ pub(crate) struct PreparedSource {
     text: Arc<str>,
     tree: Tree,
     references: PreparedSourceReferences,
+    binary: Option<(String,Vec<Arc<ktcore::classfile::ClassFileFacts>>,Arc<crate::compiled_watch::HostInputLease>)>,
 }
 
 /// No network lookup: the dependency resolver has already selected this exact source archive.
@@ -1187,6 +1392,21 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
                 Tier::Volatile,
             );
             let references = prepare_source_references(&local, &request.file, text.clone(), &tree);
+            let binary=(|| {
+                let physical=request.model.as_ref()?.dependency_binary_origin(&request.stamp.origin,&request.source)?;
+                let archive=request.source.selected_archive()?;
+                if crate::classpath::file_origin_id(archive)!=physical {return None;}
+                let guard=request.binary_leases.current(&request,&physical)?;
+                let mut classes=Vec::new();
+                for symbol in request.stamp.symbols.iter().filter(|symbol|symbol.kind.is_type_like()) {
+                    let name=symbol.container.as_ref().map_or_else(||symbol.name.clone(),
+                        |owner|format!("{owner}.{}",symbol.name)).replace('.',"$");
+                    let internal=if symbol.package.is_empty() {name} else {format!("{}/{name}",symbol.package.replace('.',"/"))};
+                    classes.push(request.source.binary_class(&internal,&physical,||guard.is_current())?);
+                }
+                (!classes.is_empty() && guard.is_current() && crate::classpath::file_origin_id(archive)==physical)
+                    .then_some((physical,classes,guard))
+            })();
             if !request.source.is_current() || !request.source.content_is_current() {
                 return None;
             }
@@ -1195,6 +1415,7 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
                 text,
                 tree,
                 references,
+                binary,
             })
         })
         .collect()
@@ -1419,6 +1640,8 @@ impl AnalysisExtensions {
                 file,
                 stamp,
                 epoch: self.source_epoch,
+                model: None,
+                binary_leases: self.binary_leases.clone(),
                 _signal: signal,
             });
         }
@@ -1435,6 +1658,7 @@ impl AnalysisExtensions {
             let file = &source.request.file;
             if self.suspended
                 || source.request.epoch != self.source_epoch
+                || source.request.stamp.origin.representation == SourceRepresentation::Stub && self.inputs.contains_key(file)
                 || !wanted.contains(file)
                 || self.source_stamp(index, file).as_ref() != Some(&source.request.stamp)
             {
@@ -1472,9 +1696,15 @@ impl AnalysisExtensions {
                     },
                 );
             }
+            let retired=Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let abi_guard=if let Some((physical,classes,lease))=source.binary {
+                let guard:Arc<dyn HostInputGuard>=Arc::new(DependencyProvenanceGuard {retired:retired.clone(),lease});
+                if self.store.bind_dependency_abi(index,file,&physical,classes,guard.clone()).is_err() {continue;}
+                Some(guard)
+            } else {None};
             self.hydrated_sources.insert(file.clone(), HydratedSource {
                 stamp:source.request.stamp, revision:0, source:source.request.source,
-                retired:Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                retired,abi_guard,
             });
             accepted.push((file.clone(),retain_namespace));
         }
@@ -1507,6 +1737,16 @@ impl AnalysisExtensions {
             self.inputs.remove(file);
             self.store.remove_source(file);
         }
+    }
+
+    pub(super) fn retire_stale_binary_sources(&mut self) -> bool {
+        let stale:Vec<_>=self.hydrated_sources.iter().filter(|(_,source)|
+            source.abi_guard.as_ref().is_some_and(|guard|!guard.is_current())).map(|(file,_)|file.clone()).collect();
+        for file in &stale {
+            self.forget_hydrated_source(file);
+            self.attempted_sources.remove(file);
+        }
+        !stale.is_empty()
     }
 
     pub(super) fn invalidate_hydrated_sources(&mut self) {

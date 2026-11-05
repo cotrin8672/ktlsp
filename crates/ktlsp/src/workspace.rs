@@ -1133,6 +1133,7 @@ impl Workspace {
         let owner=owner.to_owned();
         capture.waiting=self.analysis_extensions.source_waits_for(&self.index,&requested);
         capture.libraries=self.analysis_extensions.take_source_requests_for(&self.index,&requested);
+        for request in &mut capture.libraries { request.model=capture.model.clone(); }
         crate::trace::span("extension.ipc.project_source_demand", "extension", std::time::Instant::now(),
             serde_json::json!({"evaluation":evaluation,"owner":owner,"requested_files":requested,
                 "eligible_files":capture.expected.keys().collect::<Vec<_>>(),
@@ -1293,7 +1294,8 @@ impl Workspace {
         if self.extension_sources_running {
             return Vec::new();
         }
-        let requests = self.analysis_extensions.take_source_requests(&self.index);
+        let mut requests = self.analysis_extensions.take_source_requests(&self.index);
+        for request in &mut requests { request.model=self.project_model.clone(); }
         self.extension_sources_running = !requests.is_empty();
         requests
     }

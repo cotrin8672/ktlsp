@@ -42,6 +42,7 @@ pub(crate) struct AnalysisExtensions {
     attempted_sources: BTreeMap<String, source_hydration::SourceStamp>,
     hydrated_sources: BTreeMap<String, source_hydration::HydratedSource>,
     source_producers: BTreeMap<String, source_hydration::SourceProducer>,
+    binary_leases: Arc<source_hydration::BinaryLeasePool>,
 }
 
 impl AnalysisExtensions {
@@ -262,7 +263,7 @@ impl AnalysisExtensions {
     /// happen under the ordinary host lock with atomic liveness checks only.
     pub(crate) fn refresh_host_inputs(&mut self)->bool {
         let changed=self.store.refresh_host_inputs();
-        let any=!changed.is_empty();
+        let any=self.retire_stale_binary_sources() || !changed.is_empty();
         for(provider,owner) in changed {
             self.changed.insert(owner.clone());
             if let Some(slot)=self.ipc_providers.get_mut(&provider).filter(|slot|slot.enabled) {

@@ -124,6 +124,19 @@ impl LibrarySource {
         verified
     }
 
+    /// Exact selected bytes for a verified stub; declaration rendering is not ABI authority.
+    pub(crate) fn binary_class(&self, internal_name: &str, physical_origin: &str, current:impl Fn()->bool)
+        -> Option<std::sync::Arc<ktcore::classfile::ClassFileFacts>> {
+        let path=self.jar.as_deref()?;
+        if !current() || self.binary_content.is_none() || self.origin_id!=physical_origin
+            || !self.is_current() || !self.content_is_current() { return None; }
+        // shortcut: MR-JAR ABI stays unknown until a selected Java feature profile is available.
+        let bytes=jar::read_effective_class_bytes(path,internal_name,"",None,&current).ok()??;
+        let class=ktcore::classfile::decode(physical_origin,&bytes).ok()?;
+        (class.identity.internal_name==internal_name && current() && self.is_current() && self.content_is_current())
+            .then(||std::sync::Arc::new(class))
+    }
+
     #[cfg(test)]
     pub(crate) fn has_binary_type(&self, file: &Path) -> bool {
         self.binary_types(&[file]).contains(file)
