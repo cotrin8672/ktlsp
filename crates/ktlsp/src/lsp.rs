@@ -1072,13 +1072,14 @@ fn verified_empty_binaries(binaries: &[(std::path::PathBuf, String)]) -> anyhow:
     let mut empty = !binaries.is_empty();
     for (binary, expected_origin) in binaries {
         anyhow::ensure!(
-            binary.is_file() && classpath::file_origin_id(binary) == *expected_origin,
+            (binary.is_file() || binary.is_dir()) && classpath::file_origin_id(binary) == *expected_origin,
             "binary artifact changed since project discovery: {}",
             binary.display()
         );
-        empty &= !crate::jar::may_contain_definitions(binary)?;
+        empty &= if binary.is_dir() {crate::jar::class_directory_entries(binary)?.is_empty()}
+            else {!crate::jar::may_contain_definitions(binary)?};
         anyhow::ensure!(
-            binary.is_file() && classpath::file_origin_id(binary) == *expected_origin,
+            (binary.is_file() || binary.is_dir()) && classpath::file_origin_id(binary) == *expected_origin,
             "binary artifact changed while inspecting {}",
             binary.display()
         );
@@ -1695,7 +1696,8 @@ fn index_dependency_model_with_jdk_plan<'scope, 'env>(
                     .and_then(|m| m.artifact_origin(&jar_path))
                     .map(str::to_string)
                     .unwrap_or_else(|| classpath::file_origin_id(&jar_path));
-                if ws.lock().dependency_origin_complete(&origin_id) {
+                if jar_path.extension().and_then(|ext|ext.to_str())==Some("jar")
+                    && ws.lock().dependency_origin_complete(&origin_id) {
                     stats.reused_local_jars += 1;
                     continue;
                 }
@@ -2902,7 +2904,8 @@ fn model_archive_origins(model: &classpath::ProjectSnapshot) -> HashMap<String, 
     let mut origins: HashMap<_, _> = local_jars
         .iter()
         .chain(project_jars)
-        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jar"))
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jar")
+            || local_jars.iter().any(|selected|crate::paths::file_key(selected)==crate::paths::file_key(path)))
         .map(|path| crate::paths::file_key(path))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()

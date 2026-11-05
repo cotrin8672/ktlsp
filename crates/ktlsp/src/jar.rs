@@ -771,12 +771,69 @@ pub(crate) fn extract_class_stub_file(
     Ok(found)
 }
 
+/// Only a selected binary directory is walked, with the same binary entry bound as archives.
+pub(crate) fn class_directory_entries(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let metadata = fs::symlink_metadata(root)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "invalid class directory"
+    );
+    let mut classes = Vec::new();
+    for (count, entry) in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        anyhow::ensure!(
+            count <= MAX_BINARY_ARCHIVE_ENTRIES,
+            "class directory entry limit"
+        );
+        let entry = entry?;
+        anyhow::ensure!(!entry.file_type().is_symlink(), "class directory symlink");
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("class")
+        {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root)?.to_path_buf();
+        let name = relative
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
+        anyhow::ensure!(
+            crate::runtime_bytes::valid_internal_name(&name),
+            "invalid class directory path"
+        );
+        classes.push(relative);
+    }
+    classes.sort();
+    Ok(classes)
+}
+
 fn visit_class_stub_facts_selected(
     jar: &Path,
     out_dir: &Path,
     selected: Option<&Path>,
     mut visit: impl FnMut(&Path, &str, Option<BinaryOwnerMembers>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    if jar.is_dir() {
+        let origin=crate::classpath::file_origin_id(jar);
+        for entry in class_directory_entries(jar)? {
+            let internal=entry.with_extension("").to_string_lossy().replace('\\',"/");
+            // shortcut: nested directory declarations need reciprocal InnerClasses owner grouping.
+            if internal.contains('$') {continue;}
+            let path=out_dir.join(entry.with_extension("java"));
+            if selected.is_some_and(|selected|selected!=path) {continue;}
+            let class=read_class_file(jar,&entry.to_string_lossy().replace('\\',"/"),&origin)
+                .map_err(anyhow::Error::msg)?.ok_or_else(||anyhow::anyhow!("missing selected class"))?;
+            anyhow::ensure!(class.identity.internal_name==internal,"class directory identity mismatch");
+            if let Some((source,unavailable))=java_class_stub_facts(&class) {
+                let name=internal.rsplit('/').next().unwrap();
+                visit(&path,&source,Some(BinaryOwnerMembers::from([(name.to_owned(),unavailable)])))?;
+            }
+        }
+        return Ok(());
+    }
     let bytes = fs::read(jar).with_context(|| format!("open jar {}", jar.display()))?;
     // zip's indexed map may coalesce duplicate central names. A non-ZIP64 EOCD count
     // must agree before it can prove a unique enclosing class; otherwise nested

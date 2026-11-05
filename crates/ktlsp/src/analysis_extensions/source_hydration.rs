@@ -365,9 +365,19 @@ mod tests {
     }
 
     fn binary_abi_fixture() -> (Fixture,Workspace,Arc<crate::classpath::ProjectSnapshot>,String) {
+        binary_abi_fixture_kind(false)
+    }
+
+    fn binary_abi_fixture_kind(directory:bool) -> (Fixture,Workspace,Arc<crate::classpath::ProjectSnapshot>,String) {
         use crate::classpath::*;
-        let fixture=Fixture::new();
+        let mut fixture=Fixture::new();
         fs::remove_file(&fixture.sources).unwrap();
+        if directory {
+            fixture.binary=fixture.root.join("selected-classes");
+            fs::create_dir_all(fixture.binary.join("arrayfixture")).unwrap();
+            fs::write(fixture.binary.join("arrayfixture/Factory.class"),include_bytes!("../../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class")).unwrap();
+            fs::write(fixture.binary.join("arrayfixture/Item.class"),include_bytes!("../../../ktcore/tests/fixtures/classfile/arrayfixture/Item.class")).unwrap();
+        }
         let root=fixture.root.join("src");fs::create_dir_all(&root).unwrap();
         let owner=crate::paths::file_key(&root.join("Owner.java"));
         let model=Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {
@@ -507,6 +517,59 @@ mod tests {
             let mut read=host.store.begin(index,"library-probe",&owner).unwrap();
             if let Knowledge::Found(ty)=read.resolve_type("arrayfixture.Factory") {
                 assert!(matches!(read.type_jvm(&ty).unwrap().abi,Knowledge::Unknown(_)),"{change}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_class_directory_java_kotlin_type_ref_member_and_abi() {
+        let (fixture,mut ws,model,_)=binary_abi_fixture_kind(true);
+        assert_eq!(model.local_jars(),vec![fixture.binary.clone()]);
+        assert_eq!(drain(&mut ws),2);
+        for (name,text) in [("Use.java","package client; class Use {}"),("Use.kt","package client\nclass Use")] {
+            let file=crate::paths::file_key(&fixture.root.join("src").join(name));ws.open(&file,text.into());
+            let (index,host)=ws.extension_test_inputs();
+            let mut read=host.store.begin(index,"library-probe",&file).unwrap();
+            let mut reference=ktcore::types::TypeRef::simple("Factory");reference.qualification=Some("arrayfixture".into());
+            let Knowledge::Found(ty)=read.resolve_type_ref(&reference) else {panic!("directory TypeRef {name}");};
+            assert!(matches!(read.reference_type(&ty).unwrap(),Knowledge::Found(_)));
+            assert!(read.declared_members(&ty).unwrap().0.iter().any(|member|member.name=="rows"));
+            let Knowledge::Found(class)=read.type_jvm(&ty).unwrap().abi else {panic!("directory ABI {name}");};
+            let bytes=include_bytes!("../../../ktcore/tests/fixtures/classfile/arrayfixture/Factory.class");
+            assert_eq!(class.identity,ktcore::classfile::decode(model.artifact_origin(&fixture.binary).unwrap(),bytes).unwrap().identity);
+            assert!(matches!(read.type_source_location(&ty).unwrap(),Knowledge::Unknown(_)));
+        }
+        let mut modules=model.modules.clone();modules[0].source_sets[0].output_roots=vec![fixture.binary.clone()];
+        let owned=crate::classpath::ProjectSnapshot::new(modules);
+        assert!(owned.local_jars().is_empty(),"workspace outputs must keep existing receipt ownership");
+    }
+
+    #[test]
+    fn selected_class_directory_edit_removal_membership_and_shadow_retire_facts() {
+        for change in ["edit","remove","add","shadow"] {
+            let (fixture,mut ws,_,owner)=binary_abi_fixture_kind(true);assert_eq!(drain(&mut ws),2);
+            let before=crate::deps::file_content_digest(&fixture.binary).unwrap();
+            let (index,host)=ws.extension_test_inputs();let mut read=host.store.begin(index,"library-probe",&owner).unwrap();
+            let Knowledge::Found(ty)=read.resolve_type("arrayfixture.Factory") else {panic!("missing initial directory type");};
+            assert!(read.declared_members(&ty).unwrap().0.iter().any(|member|member.name=="rows"));
+            let pending=read.finish();
+            if change=="shadow" {
+                let path=crate::paths::file_key(&fixture.root.join("src/Factory.java"));
+                ws.open(&path,"package arrayfixture; public class Factory {}".into());
+                let (index,host)=ws.extension_test_inputs();let mut read=host.store.begin(index,"library-probe",&owner).unwrap();
+                let Knowledge::Found(ty)=read.resolve_type("arrayfixture.Factory") else {panic!("missing source shadow");};
+                assert_eq!(ty.definition().file,path);assert!(matches!(read.type_jvm(&ty).unwrap().abi,Knowledge::Unknown(_)));
+            } else {
+                let guard=host.hydrated_sources[&ty.definition().file].abi_guard.as_ref().unwrap().clone();
+                let class=fixture.binary.join("arrayfixture/Factory.class");
+                match change {
+                    "edit"=>fs::write(class,b"changed class bytes").unwrap(),
+                    "remove"=>fs::remove_file(class).unwrap(),
+                    _=>fs::write(fixture.binary.join("arrayfixture/Added.class"),b"new member").unwrap(),
+                }
+                assert_ne!(crate::deps::file_content_digest(&fixture.binary).unwrap(),before);
+                for _ in 0..100 {if !guard.is_current() {break;}std::thread::sleep(std::time::Duration::from_millis(10));}
+                assert!(!guard.is_current());assert_eq!(host.store.resume(index,&owner,pending).err(),Some(ContractError::Stale));
             }
         }
     }

@@ -1527,7 +1527,7 @@ impl ProjectSnapshot {
             source
                 .entries
                 .iter()
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jar"))
+                .filter(|p| local_binary_entry(source,p) && !self.workspace_binary_output(p))
                 .filter(|p| !known.contains(&path_key(p)))
                 .cloned()
                 .collect(),
@@ -1549,9 +1549,22 @@ impl ProjectSnapshot {
             .iter()
             .filter(|module| !module.source_sets.is_empty())
             .flat_map(module_local_jars)
+            .filter(|path| !self.workspace_binary_output(path))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    fn workspace_binary_output(&self, path: &Path) -> bool {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            return false;
+        }
+        let key = path_key(path);
+        self.modules
+            .iter()
+            .flat_map(|module| &module.source_sets)
+            .flat_map(|source| source.output_roots.iter().chain(&source.source_roots))
+            .any(|root| key == path_key(root) || path_under_key(&key, &path_key(root)))
     }
 
     pub fn live_origins(&self) -> std::collections::BTreeSet<String> {
@@ -3389,7 +3402,7 @@ pub fn local_jars_from_classpath(root: &Path) -> Vec<PathBuf> {
     if let Ok(model) = resolve_snapshot(root) {
         authoritative = model.modules.iter().any(|m| !m.source_sets.is_empty());
         for module in &model.modules {
-            out.extend(module_local_jars(module));
+            out.extend(module_local_jars(module).into_iter().filter(|path|!model.workspace_binary_output(path)));
         }
     }
     if !authoritative {
@@ -3515,6 +3528,29 @@ fn module_coordinates(module: &ModuleClasspath) -> std::collections::BTreeSet<Co
         .collect()
 }
 
+fn local_binary_entry(source: &SourceSetClasspath, entry: &Path) -> bool {
+    if entry.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+        return true;
+    }
+    if source.classpath_incomplete || !source.unresolved.is_empty() {
+        return false;
+    }
+    let selected: Vec<_> = source
+        .artifacts
+        .iter()
+        .filter(|artifact| path_key(&artifact.path) == path_key(entry))
+        .collect();
+    matches!(selected.as_slice(),[artifact] if matches!(artifact.component,ComponentId::File))
+        && !source
+            .output_roots
+            .iter()
+            .chain(&source.source_roots)
+            .any(|root| {
+                path_key(entry) == path_key(root)
+                    || path_under_key(&path_key(entry), &path_key(root))
+            })
+}
+
 fn module_local_jars(module: &ModuleClasspath) -> std::collections::BTreeSet<PathBuf> {
     if module.source_sets.is_empty() {
         return local_jars_from_entries(module.entries.clone());
@@ -3529,8 +3565,7 @@ fn module_local_jars(module: &ModuleClasspath) -> std::collections::BTreeSet<Pat
     module
         .source_sets
         .iter()
-        .flat_map(|source| &source.entries)
-        .filter(|entry| entry.extension().and_then(|ext| ext.to_str()) == Some("jar"))
+        .flat_map(|source| source.entries.iter().filter(|entry|local_binary_entry(source,entry)))
         .filter(|entry| !known.contains(&path_key(entry)))
         .cloned()
         .collect()

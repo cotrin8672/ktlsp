@@ -103,6 +103,16 @@ impl LibrarySource {
         let mut verified = BTreeSet::new();
         let Some(path) = &self.jar else { return verified; };
         if !self.is_current() { return verified; }
+        if path.is_dir() {
+            for file in files {
+                let Some(relative)=file.strip_prefix(&self.dest).ok() else {continue;};
+                let name=relative.with_extension("class").to_string_lossy().replace('\\',"/");
+                if jar::read_class_file(path,&name,&self.origin_id).is_ok_and(|class|class.is_some_and(|class|
+                    class.identity.internal_name==name.trim_end_matches(".class"))) {verified.insert(file.to_path_buf());}
+            }
+            if !self.is_current() || !self.content_is_current() {verified.clear();}
+            return verified;
+        }
         let Ok(file) = fs::File::open(path) else { return verified; };
         let Ok(mut archive) = zip::ZipArchive::new(file) else { return verified; };
         let Ok(selected) = jar::selected_class_entries(&mut archive,"",None,||self.is_current())
@@ -809,10 +819,24 @@ fn jar_fingerprint(path: &Path) -> Option<String> {
     hasher.update(mtime.to_le_bytes());
     hasher.update(b"|");
     hasher.update(meta.len().to_le_bytes());
+    if meta.is_dir() {hasher.update(file_content_digest(path)?);}
     Some(format!("{:x}", hasher.finalize()))
 }
 
 pub(crate) fn file_content_digest(path: &Path) -> Option<[u8; 32]> {
+    if path.is_dir() {
+        let classes=jar::class_directory_entries(path).ok()?;
+        let mut hash=Sha256::new();
+        for relative in &classes {
+            let name=relative.to_str()?.replace('\\',"/");
+            hash.update((name.len() as u64).to_le_bytes());hash.update(name.as_bytes());
+            let class=path.join(relative);
+            if fs::metadata(&class).ok()?.len()>ktcore::classfile::MAX_CLASS_FILE_BYTES as u64 {return None;}
+            hash.update(file_content_digest(&class)?);
+        }
+        if jar::class_directory_entries(path).ok()?!=classes {return None;}
+        return Some(hash.finalize().into());
+    }
     let mut file = fs::File::open(path).ok()?;
     let before = file.metadata().ok()?;
     if !before.is_file() {
@@ -939,7 +963,7 @@ struct BinaryJarMarker {
 
 impl BinaryJarMarker {
     fn current(&self) -> bool {
-        self.jar.is_file()
+        (self.jar.is_file() || self.jar.is_dir())
             && jar_fingerprint(&self.jar).as_deref() == Some(self.fingerprint.as_str())
             && crate::classpath::file_origin_id(&self.jar) == self.origin
     }
@@ -1498,7 +1522,9 @@ pub(crate) fn resolve_local_jar_stubs_for_origin_while_current(
     current: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<FileSymbols>> {
     anyhow::ensure!(current(), "binary indexing generation cancelled");
-    if !jar_path.is_file() || crate::classpath::file_origin_id(jar_path) != origin_id {
+    anyhow::ensure!(jar_path.is_dir() || jar_path.extension().and_then(|ext|ext.to_str())==Some("jar"),
+        "unsupported local binary input");
+    if !(jar_path.is_file() || jar_path.is_dir()) || crate::classpath::file_origin_id(jar_path) != origin_id {
         anyhow::bail!(
             "local artifact {} changed since project discovery",
             jar_path.display()
@@ -1650,7 +1676,7 @@ fn resolve_local_jar_stubs_unowned(
     live: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<FileSymbols>> {
     anyhow::ensure!(live(), "binary indexing generation cancelled");
-    if !jar_path.is_file() {
+    if !(jar_path.is_file() || jar_path.is_dir()) {
         anyhow::bail!("local artifact {} is missing", jar_path.display());
     }
     let dest = extract_root.join("local-jars").join(&fingerprint);

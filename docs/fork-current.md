@@ -31,7 +31,13 @@ replacement, stale declaration retirement and publication-before-next-archive.
 Its single release build has SHA-256
 `57b17d0216fa31b22f47f6b7922aefa74fdc385d40c3155d6095446f6313b097`.
 Evidence: `selected-maven114/{receipt,main-ready}.json`. The original Sodium editor
-run on114 is delegated to the MC task; it has not passed yet. The failed112 receipt
+run on114 also fails its initial readiness observation: project indexing succeeds,
+but library indexing and shutdown do not complete. Its saved trace has generation1
+only and no watch refresh causes; the earlier repeated-refresh loop is absent.
+Archive hashing covers108 inputs, and Gradle model/source queries exit0 without
+cancellation. Dependency installs continue through the observation limit; JDK install
+completion is not established. A40.88s workspace-lock wait is recorded, without a
+new performance-fix claim. The failed112 receipt
 is retained at `sodium-watch112/receipt.json`; no identical-artifact editor replay
 was made, and the original notifications are not asserted to have unchanged bytes.
 
@@ -43,9 +49,17 @@ The subsequent original Java → Placement → Kotlin full chain also passes on1
 Its MC receipt `host113-mc05f-create-full-20261105/recovery-and-run-receipt.json`
 has independently checked SHA-256
 `66c3928e6b7a8732f2a56da2cd14c8867db251169fe7138cd227e65e6a8b3fd8`.
-Separately, a selected class-directory dependency is absent from the existing
-JAR-only nominal producer. Its responsibility and smallest repair boundary have
-been assessed; no directory-support implementation or new check is claimed here.
+Class-directory115 connects accepted File dependency directories to the existing
+decoder, Stub nominal index, ordinary Java/Kotlin TypeRef resolution and positive
+ABI facts. Two focused regressions pass, including members/identity, workspace
+shadow and edit/add/remove retirement. Source/output ownership, bounded traversal,
+symlink rejection and directory content/membership guards remain enforced. The
+slice handles top-level Java declarations; nested-owner grouping is not supported.
+Its single release build has SHA-256
+`814daeb5dd260ae7ad32370dc8308e0d9f5071ba26ba484868ff8e6deaa2982d`.
+Evidence: `class-directory115/native-verification/{receipt,main-ready}.json`.
+The original multi-source-set and Forge editor cases are delegated to the MC task;
+their success is not established by these focused native checks.
 
 Java extract-local109 passes the seven focused refactor tests and actual Neovim
 edit application. Standard `textDocument/codeAction` offers `Extract to local variable`

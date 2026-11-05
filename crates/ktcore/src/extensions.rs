@@ -3047,13 +3047,16 @@ impl ReadSession<'_> {
             .get(entry.path.as_ref())
             .ok_or(ContractError::MissingSource)?;
         validate_entry(&source.text, entry)?;
+        let generation=source.generation;
+        let guard=source.dependency_abi.first().map(|(_,_,guard)|guard.clone());
+        if let Some(guard)=guard {self.observe_host_input(guard)?;}
         self.reads.missing_sources.remove(entry.path.as_ref());
         self.reads
             .files
-            .insert(entry.path.to_string(), source.generation);
+            .insert(entry.path.to_string(), generation);
         Ok(DeclarationId {
             host: self.store.host,
-            generation: source.generation,
+            generation,
             definition: definition(entry),
         })
     }
@@ -3070,9 +3073,12 @@ impl ReadSession<'_> {
         if source.generation != declaration.generation {
             return Err(ContractError::Stale);
         }
+        let generation=source.generation;
+        let guard=source.dependency_abi.first().map(|(_,_,guard)|guard.clone());
+        if let Some(guard)=guard {self.observe_host_input(guard)?;}
         self.reads
             .files
-            .insert(declaration.definition.file.clone(), source.generation);
+            .insert(declaration.definition.file.clone(), generation);
         Ok(())
     }
 
