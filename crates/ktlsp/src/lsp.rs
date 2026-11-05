@@ -2899,7 +2899,7 @@ fn model_archive_origins(model: &classpath::ProjectSnapshot) -> HashMap<String, 
         .flat_map(|source| &source.artifacts)
         .filter(|artifact| matches!(artifact.component, classpath::ComponentId::Project { .. }))
         .map(|artifact| &artifact.path);
-    local_jars
+    let mut origins: HashMap<_, _> = local_jars
         .iter()
         .chain(project_jars)
         .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jar"))
@@ -2910,7 +2910,45 @@ fn model_archive_origins(model: &classpath::ProjectSnapshot) -> HashMap<String, 
             let origin = model.artifact_origin(Path::new(&key))?.to_string();
             Some((key, origin))
         })
-        .collect()
+        .collect();
+    for source in model.modules.iter().flat_map(|module| &module.source_sets) {
+        let selected: std::collections::BTreeSet<_> = source
+            .entries
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
+        for artifact in &source.artifacts {
+            let classpath::ComponentId::Module {
+                group,
+                name,
+                version,
+            } = &artifact.component
+            else {
+                continue;
+            };
+            if artifact
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("jar")
+            {
+                continue;
+            }
+            let key = crate::paths::file_key(&artifact.path);
+            if selected.contains(&key) {
+                // Hash the selected physical file; retire the origin used by Maven indexing.
+                origins.insert(
+                    key,
+                    classpath::maven_origin_id(&crate::coords::Coordinate {
+                        group: group.clone(),
+                        artifact: name.clone(),
+                        version: version.clone(),
+                    }),
+                );
+            }
+        }
+    }
+    origins
 }
 
 fn stage_archive_inputs(
@@ -2936,6 +2974,7 @@ fn stage_archive_inputs_with(
         .any(|module| module.source_sets.iter().any(|source| !source.output_roots.is_empty())))
         .then(|| output_capture.lock());
     let read_start = Instant::now();
+    let archive_origins = model.map(model_archive_origins).unwrap_or_default();
     // A generation may suppress matching watches before publication, never rebase changed inputs.
     let (before, observed) = {
         let state = watches.lock();
@@ -2969,7 +3008,11 @@ fn stage_archive_inputs_with(
             *inputs = (generation, HashMap::new());
         }
         if inputs.1.get(key).is_some_and(|before| before != &content) {
-            if let Some(origin) = model.and_then(|model| model.artifact_origin(Path::new(key))) {
+            if let Some(origin) = archive_origins
+                .get(key)
+                .map(String::as_str)
+                .or_else(|| model.and_then(|model| model.artifact_origin(Path::new(key))))
+            {
                 guard.retire_dependency_origin(origin);
             }
             state.pending_model_jar = true;
@@ -3022,7 +3065,11 @@ fn stage_archive_inputs_with(
             .keys()
             .filter(|key| inputs.get(*key) != before.get(*key))
         {
-            if let Some(origin) = model.and_then(|model| model.artifact_origin(Path::new(key))) {
+            if let Some(origin) = archive_origins
+                .get(key)
+                .map(String::as_str)
+                .or_else(|| model.and_then(|model| model.artifact_origin(Path::new(key))))
+            {
                 guard.retire_dependency_origin(origin);
             }
         }
@@ -9769,7 +9816,8 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             );
             let contents = project_archive_contents(&root, Some(&model));
             assert!(contents.contains_key(&key));
-            for excluded in [&immutable, &unknown, &wrapper] {
+            assert!(contents.contains_key(&crate::paths::file_key(&immutable)));
+            for excluded in [&unknown, &wrapper] {
                 assert!(
                     !contents.contains_key(&crate::paths::file_key(excluded)),
                     "unexpected baseline: {}",
@@ -9790,14 +9838,16 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             );
             backend.watches.lock().model_loading = true;
             let initial = backend.refresh.lock().requested;
-            backend
-                .did_change_watched_files(DidChangeWatchedFilesParams {
-                    changes: vec![FileEvent::new(
-                        Uri::from_file_path(&binary).unwrap(),
-                        FileChangeType::CHANGED,
-                    )],
-                })
-                .await;
+            for file in [&binary, &immutable] {
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![FileEvent::new(
+                            Uri::from_file_path(file).unwrap(),
+                            FileChangeType::CHANGED,
+                        )],
+                    })
+                    .await;
+            }
             assert_eq!(
                 backend.refresh.lock().requested,
                 initial,
@@ -9823,7 +9873,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             );
             assert_eq!(
                 contents.len(),
-                2,
+                3,
                 "selected paths and tracked inventory must be deduplicated"
             );
             let before = backend.refresh.lock().requested;
@@ -10503,6 +10553,161 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             }));
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_maven_jar_digest_baseline_preserves_true_change_retirement() {
+        use std::io::Write;
+
+        for stage_change in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "ktlsp_maven_digest_{}_{stage_change}",
+                std::process::id()
+            ));
+            let cache = root.join(".gradle/caches/modules-2/files-2.1/fixture/api/1");
+            std::fs::create_dir_all(&cache).unwrap();
+            let binary = cache.join("selected/api-1.jar");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            let unselected = cache.join("unselected.jar");
+            std::fs::write(&unselected, b"unselected operational bytes").unwrap();
+            let original = include_bytes!(
+                "../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class"
+            );
+            let mut replacement = original.to_vec();
+            let offset = replacement
+                .windows(5)
+                .position(|part| part == b"LABEL")
+                .unwrap();
+            replacement[offset..offset + 5].copy_from_slice(b"TITLE");
+            let write = |bytes: &[u8]| {
+                let mut archive = zip::ZipWriter::new(std::fs::File::create(&binary).unwrap());
+                archive
+                    .start_file(
+                        "fieldfixture/FieldOnly.class",
+                        zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored),
+                    )
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+                archive.finish().unwrap();
+            };
+            write(original);
+            let metadata = std::fs::metadata(&binary).unwrap();
+            let modified = metadata.modified().unwrap();
+            let key = crate::paths::file_key(&binary);
+            let model = Arc::new(classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+                "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\tMODULE\tfixture\tapi\t1\nEND\t:app\n",
+                root.display()
+            ))));
+            let coordinate = crate::coords::Coordinate::parse("fixture:api:1").unwrap();
+            let origin = classpath::maven_origin_id(&coordinate);
+            assert_eq!(model_archive_origins(&model).get(&key), Some(&origin));
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            *backend.root.lock() = Some(root.clone());
+            *backend.gradle_project.lock() = true;
+            backend.ws.lock().set_project_model(model.clone());
+            let generation = backend.ws.lock().analysis_generation();
+            let cancelled = {
+                let mut state = backend.refresh.lock();
+                state.requested = generation;
+                state.active_generation = Some(generation);
+                state.running = true;
+                state.cancelled.clone()
+            };
+            assert!(stage_archive_inputs_with(
+                &root,
+                Some(&model),
+                generation,
+                &backend.ws,
+                &backend.watches,
+                |read| {
+                    assert_eq!(read, key);
+                    assert!(
+                        backend
+                            .watches
+                            .lock()
+                            .archive_content(&key, generation)
+                            .is_some(),
+                        "first digest must already be published at the callback boundary"
+                    );
+                }
+            ));
+            let accepted = backend.watches.lock().archive_inputs.clone().unwrap();
+            assert_eq!(accepted.1.len(), 1);
+            assert_eq!(
+                accepted.1.get(&key),
+                configuration_content(&binary).as_ref()
+            );
+            for batch in crate::deps::resolve_module_binary_stubs_while_current(
+                &coordinate,
+                &[(
+                    binary.clone(),
+                    model.artifact_origin(&binary).unwrap().into(),
+                )],
+                &root.join("extract"),
+                &mut crate::parser::KotlinParser::new(),
+                &mut crate::java::JavaParser::new(),
+                &|| true,
+            )
+            .unwrap()
+            {
+                assert!(backend.ws.lock().index_dependency_batch(batch));
+            }
+            backend.ws.lock().complete_dependency_origin(origin.clone());
+            assert_eq!(backend.ws.lock().index.lookup_type("FieldOnly").len(), 1);
+            let event = |file: &Path| DidChangeWatchedFilesParams {
+                changes: vec![FileEvent::new(
+                    Uri::from_file_path(file).unwrap(),
+                    FileChangeType::CHANGED,
+                )],
+            };
+            backend.did_change_watched_files(event(&binary)).await;
+            backend.did_change_watched_files(event(&unselected)).await;
+            assert_eq!(backend.refresh.lock().requested, generation);
+            assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+            assert!(backend.ws.lock().dependency_origin_complete(&origin));
+            assert!(!backend.watches.lock().pending_model_jar);
+            write(&replacement);
+            std::fs::File::options()
+                .write(true)
+                .open(&binary)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(std::fs::metadata(&binary).unwrap().len(), metadata.len());
+            assert_eq!(
+                std::fs::metadata(&binary).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_ne!(
+                configuration_content(&binary).as_ref(),
+                accepted.1.get(&key)
+            );
+            if stage_change {
+                assert!(!stage_archive_inputs(
+                    &root,
+                    Some(&model),
+                    generation,
+                    &backend.ws,
+                    &backend.watches
+                ));
+                assert_eq!(
+                    backend.watches.lock().archive_inputs.as_ref(),
+                    Some(&accepted)
+                );
+                assert!(backend.watches.lock().pending_model_jar);
+                assert!(!backend.ws.lock().dependency_origin_complete(&origin));
+                assert!(backend.ws.lock().index.lookup_type("FieldOnly").is_empty());
+            }
+            backend.did_change_watched_files(event(&binary)).await;
+            assert!(backend.refresh.lock().requested > generation);
+            assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!backend.ws.lock().dependency_origin_complete(&origin));
+            assert!(backend.ws.lock().index.lookup_type("FieldOnly").is_empty());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]

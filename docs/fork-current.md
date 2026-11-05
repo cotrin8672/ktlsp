@@ -1,5 +1,52 @@
 # Current fork state
 
+Selected binary dependency ABI113 is published at `b04f13bb`, following the Gradle
+operational-watch repair112 at `444deae2`. Six focused regressions pass (three per
+repair); one shared release build has SHA-256
+`04ce9199ce8c2cce7f9bb642942623c63b98ebb166b4ef0817aa916e580442f9`.
+Ordinary binary-only type tokens now expose checked selected class ABI without
+claiming authored source, complete member coverage or complete JVM ABI coverage.
+Physical selection, content, model/source epochs and workspace-shadow checks guard
+the input. Native archive leases are weakly shared across preparation batches;
+each type retains its independent retirement guard. Unselected MR profiles stay Unknown.
+The real Ponder consumer passes158 original assertions: evaluation88 returns the
+selected `PlacementOffset` ABI, exact class digest, flags33 and `placeInWorld`
+descriptor, independently checked against the JAR. The original1026-byte unsaved
+Kotlin buffer matches its recorded hash. Source location/provenance and both coverage
+facts remain Unknown. Host shutdown exits0; proxy and child are absent afterward,
+but the proxy's missing exit receipt leaves the child's own exit code unproved.
+Evidence: `combined112-113/{receipt,main-ready}.json` and
+`ponder-abi113/run/receipt.json` under the acceptance run root.
+
+Sodium112 is qualified, not an overall passing editor run. Neovim really sends four
+Gradle temporary-init-script events; none triggers a refresh, and models/source
+installs are accepted for generations1,2,3,4,6. The full driver still fails its180s
+library-readiness observation and shutdown. All eight remaining refresh causes are
+selected JAR notifications with `build_output_only:true`; no digest before those
+notifications proves whether bytes changed. The existing archive baseline omits
+selected Maven JARs. Follow-up114 extends that existing strong-digest baseline to
+selected Maven compile JARs and retires their logical indexing origins on real
+content changes. Three targeted regressions pass, including same-size/mtime byte
+replacement, stale declaration retirement and publication-before-next-archive.
+Its single release build has SHA-256
+`57b17d0216fa31b22f47f6b7922aefa74fdc385d40c3155d6095446f6313b097`.
+Evidence: `selected-maven114/{receipt,main-ready}.json`. The original Sodium editor
+run on114 is delegated to the MC task; it has not passed yet. The failed112 receipt
+is retained at `sodium-watch112/receipt.json`; no identical-artifact editor replay
+was made, and the original notifications are not asserted to have unchanged bytes.
+
+The original MC Java selected entry is separately confirmed:53 original assertions,
+native extract-local edit application and host exit0. Receipt
+`host110-mc6bc7-java-lifecycle-20261105/recovery-and-run-receipt.json` in the MC run
+tree has SHA-256 `3faee7cba1e0430d2daa1350d5e5703c4bc1153d798099b1d0b56fa9ccd589af`.
+The subsequent original Java → Placement → Kotlin full chain also passes on113.
+Its MC receipt `host113-mc05f-create-full-20261105/recovery-and-run-receipt.json`
+has independently checked SHA-256
+`66c3928e6b7a8732f2a56da2cd14c8867db251169fe7138cd227e65e6a8b3fd8`.
+Separately, a selected class-directory dependency is absent from the existing
+JAR-only nominal producer. Its responsibility and smallest repair boundary have
+been assessed; no directory-support implementation or new check is claimed here.
+
 Java extract-local109 passes the seven focused refactor tests and actual Neovim
 edit application. Standard `textDocument/codeAction` offers `Extract to local variable`
 with native `refactor.extract` edits for an exact whole return expression directly in
