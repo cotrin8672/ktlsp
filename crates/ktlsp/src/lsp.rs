@@ -2778,6 +2778,118 @@ fn is_project_configuration(file: &Path) -> bool {
         || is_gradle_wrapper(file)
 }
 
+fn gradle_watch_key(root: &Path, path: &Path) -> String {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component),
+        }
+    }
+    let key = crate::paths::file_key(&normalized);
+    #[cfg(windows)]
+    let key = key.to_ascii_lowercase();
+    key
+}
+
+fn gradle_operational_path(root: &Path, file: &Path, home: &Path) -> bool {
+    let file = gradle_watch_key(root, file);
+    let home = gradle_watch_key(root, home);
+    if path_is_under(&file, &home) {
+        return [".tmp", "caches", "daemon", "wrapper"]
+            .iter()
+            .any(|directory| {
+                path_is_under(
+                    &file,
+                    &format!("{}/{directory}", home.trim_end_matches('/')),
+                )
+            });
+    }
+    let root = gradle_watch_key(root, root);
+    file.strip_prefix(root.trim_end_matches('/'))
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .is_some_and(|suffix| suffix.split('/').any(|part| part == ".gradle"))
+}
+
+fn ignored_gradle_input(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    key: &str,
+    home: &Path,
+) -> bool {
+    if !gradle_operational_path(root, Path::new(key), home) {
+        return false;
+    }
+    // Selected inputs keep their authority even inside Gradle's operational directories.
+    !model.is_some_and(|model| {
+        if model.has_dependency_key(key)
+            || model.is_output_key(key)
+            || model
+                .owner_for_key(key)
+                .is_some_and(|(_, source)| source.is_some())
+            || model.has_selected_kotlin_source_key(key)
+        {
+            return true;
+        }
+        let normalized = gradle_watch_key(root, Path::new(key));
+        let exact = |path: &PathBuf| normalized == gradle_watch_key(root, path);
+        let under = |path: &PathBuf| input_within(&normalized, &gradle_watch_key(root, path));
+        model.modules.iter().any(|module| {
+            module.entries.iter().any(exact)
+                || module.source_sets.iter().any(|source| {
+                    source
+                        .entries
+                        .iter()
+                        .chain(
+                            source
+                                .source_artifacts
+                                .iter()
+                                .flatten()
+                                .chain(source.source_poms.iter().flatten())
+                                .map(|artifact| &artifact.path),
+                        )
+                        .any(exact)
+                        || source
+                            .source_roots
+                            .iter()
+                            .chain(&source.output_roots)
+                            .any(under)
+                        || source
+                            .compiler_tasks
+                            .iter()
+                            .flat_map(|task| {
+                                task.declared_input_files
+                                    .iter()
+                                    .chain(&task.annotation_processor_path)
+                                    .chain(&task.classpath)
+                                    .chain(&task.source_files)
+                                    .chain(&task.output_roots)
+                                    .chain(&task.declared_output_roots)
+                            })
+                            .chain(
+                                source
+                                    .resources
+                                    .iter()
+                                    .flat_map(|claims| &claims.configuration_inputs),
+                            )
+                            .any(|input| {
+                                let input = gradle_watch_key(root, input);
+                                input_within(&normalized, &input)
+                                    || input_within(&input, &normalized)
+                            })
+                })
+        })
+    })
+}
+
 fn model_archive_origins(model: &classpath::ProjectSnapshot) -> HashMap<String, String> {
     let local_jars = model.local_jars();
     let project_jars = model
@@ -3197,6 +3309,10 @@ fn changed_archive_inputs_while_current(
 }
 
 fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
+    configuration_contents_with_gradle_home(root, &crate::paths::gradle_user_home())
+}
+
+fn configuration_contents_with_gradle_home(root: &Path, home: &Path) -> HashMap<String, [u8; 32]> {
     let discovery_start = Instant::now();
     let paths = crate::workspace::git_project_files(
         root,
@@ -3212,7 +3328,10 @@ fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
     .unwrap_or_else(|| {
         walkdir::WalkDir::new(root)
             .into_iter()
-            .filter_entry(|entry| !crate::workspace::is_excluded(entry))
+            .filter_entry(|entry| {
+                !crate::workspace::is_excluded(entry)
+                    && !gradle_operational_path(root, entry.path(), home)
+            })
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_type().is_file() && is_project_configuration(entry.path()))
             .map(|entry| entry.into_path())
@@ -3228,7 +3347,7 @@ fn configuration_contents(root: &Path) -> HashMap<String, [u8; 32]> {
     let mut attempted = 0_usize;
     let contents: HashMap<_, _> = paths
         .into_iter()
-        .filter(|path| is_project_configuration(path))
+        .filter(|path| is_project_configuration(path) && !gradle_operational_path(root, path, home))
         .filter_map(|path| {
             attempted += 1;
             Some((crate::paths::file_key(&path), configuration_content(&path)?))
@@ -3249,6 +3368,18 @@ fn project_change(
     model: Option<&classpath::ProjectSnapshot>,
     key: &str,
 ) -> Option<bool> {
+    project_change_with_gradle_home(root, model, key, &crate::paths::gradle_user_home())
+}
+
+fn project_change_with_gradle_home(
+    root: &Path,
+    model: Option<&classpath::ProjectSnapshot>,
+    key: &str,
+    home: &Path,
+) -> Option<bool> {
+    if ignored_gradle_input(root, model, key, home) {
+        return None;
+    }
     let file = Path::new(key);
     let name = file
         .file_name()
@@ -3793,6 +3924,9 @@ impl LanguageServer for Backend {
             return;
         };
         let model = self.ws.lock().project_snapshot();
+        if ignored_gradle_input(&root, model.as_deref(), &key, &crate::paths::gradle_user_home()) {
+            return;
+        }
         if self
             .watches
             .lock()
@@ -3837,6 +3971,7 @@ impl LanguageServer for Backend {
             let _ = tokio::task::spawn_blocking(move || drop(capture.lock())).await;
         }
         let model = self.ws.lock().project_snapshot();
+        let gradle_home = crate::paths::gradle_user_home();
         // Disk reads may be large. Hash only selected event paths, outside the
         // workspace/watch locks so completion can proceed while IO is pending.
         let generation = self.ws.lock().analysis_generation();
@@ -3882,6 +4017,9 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter_map(|change| {
                     let key = uri_to_key(&change.uri)?;
+                    if ignored_gradle_input(&root, model.as_deref(), &key, &gradle_home) {
+                        return None;
+                    }
                     let mut watches = self.watches.lock();
                     let unchanged = (change.typ == FileChangeType::CHANGED)
                         .then(|| unchanged_contents.get(&key)).flatten();
@@ -9911,6 +10049,256 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             "an unselected in-project archive keeps the existing discovery policy"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gradle_operational_inputs_are_not_implicit_configuration_or_jars() {
+        let root =
+            std::env::temp_dir().join(format!("ktlsp_operational_watch_{}", std::process::id()));
+        let home = root.join("gradle-home");
+        let ignored = [
+            home.join(
+                ".tmp/gradle-kotlin-dsl-16431459925585604807.tmp/ktlsp-classpath.init.gradle.kts",
+            ),
+            home.join("wrapper/dists/gradle-9/bin/lib/gradle-core.jar"),
+            home.join("caches/generated/build.gradle.kts"),
+            home.join("daemon/init.gradle.kts"),
+            root.join("nested/.gradle/cache/generated.gradle.kts"),
+        ];
+        let authored = [
+            root.join("build.gradle.kts"),
+            root.join("new-conventions.gradle.kts"),
+            root.join("gradle/libs.versions.toml"),
+            home.join("gradle.properties"),
+            home.join("init.gradle.kts"),
+            home.join("init.d/company.gradle.kts"),
+        ];
+        for path in ignored.iter().chain(&authored) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        let baseline = configuration_contents_with_gradle_home(&root, &home);
+        for path in &ignored {
+            let key = crate::paths::file_key(path);
+            assert_eq!(
+                project_change_with_gradle_home(&root, None, &key, &home),
+                None,
+                "{key}"
+            );
+            assert!(
+                !baseline.contains_key(&key),
+                "operational input entered baseline: {key}"
+            );
+            assert!(gradle_operational_path(
+                &root,
+                path,
+                Path::new("gradle-home/./")
+            ));
+        }
+        for path in &authored {
+            let key = crate::paths::file_key(path);
+            assert_eq!(
+                project_change_with_gradle_home(&root, None, &key, &home),
+                Some(true),
+                "{key}"
+            );
+            assert!(
+                baseline.contains_key(&key),
+                "authored input lost from baseline: {key}"
+            );
+        }
+        for path in [
+            root.join("gradle-home-other/.tmp/authored.gradle.kts"),
+            home.join("../gradle-home-other/caches/authored.gradle.kts"),
+            home.join("caches-other/authored.gradle.kts"),
+        ] {
+            assert!(!gradle_operational_path(&root, &path, &home));
+        }
+        assert!(!gradle_operational_path(
+            &root,
+            &root.join(".gradle/init.d/company.gradle.kts"),
+            &root.join(".gradle")
+        ));
+        #[cfg(windows)]
+        assert!(gradle_operational_path(
+            Path::new(r"C:\work"),
+            Path::new(r"c:\WORK\GRADLE-HOME\.tmp\generated.gradle.kts"),
+            Path::new("C:/work/gradle-home")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gradle_operational_notifications_do_not_cancel_bootstrap_model() {
+        let home = crate::paths::gradle_user_home();
+        let root = if home.is_absolute() {
+            home.parent().unwrap().to_path_buf()
+        } else {
+            std::env::temp_dir().join("ktlsp_relative_gradle_watch")
+        };
+        let home = if home.is_absolute() {
+            home
+        } else {
+            root.join(home)
+        };
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root);
+        *backend.gradle_project.lock() = true;
+        let generation = backend.ws.lock().begin_analysis_generation();
+        let cancelled = {
+            let mut state = backend.refresh.lock();
+            state.requested = generation;
+            state.active_generation = Some(generation);
+            state.running = true;
+            state.cancelled.clone()
+        };
+        backend.watches.lock().model_loading = true;
+        for kind in [
+            FileChangeType::CREATED,
+            FileChangeType::CHANGED,
+            FileChangeType::DELETED,
+        ] {
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: [
+                        home.join(
+                            ".tmp/gradle-kotlin-dsl-ktlsp112.tmp/ktlsp-classpath.init.gradle.kts",
+                        ),
+                        home.join("wrapper/dists/ktlsp112/lib/gradle-core.jar"),
+                    ]
+                    .into_iter()
+                    .map(|file| FileEvent::new(Uri::from_file_path(file).unwrap(), kind))
+                    .collect(),
+                })
+                .await;
+        }
+        assert!(backend.ws.lock().project_snapshot().is_none());
+        assert_eq!(backend.ws.lock().analysis_generation(), generation);
+        assert_eq!(backend.refresh.lock().requested, generation);
+        assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+        let watches = backend.watches.lock();
+        assert!(watches.model_loading);
+        assert!(!watches.pending_model_jar);
+        assert!(watches.observed_archives.is_empty());
+        assert!(watches.configuration_contents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gradle_operational_filter_preserves_selected_inputs_and_authored_configuration() {
+        let root = std::env::temp_dir().join("ktlsp_selected_gradle_watch");
+        let home = crate::paths::gradle_user_home();
+        let home = if home.is_absolute() {
+            home
+        } else {
+            root.join(home)
+        };
+        let jar = home.join("caches/ktlsp112/selected.jar");
+        let output = home.join("caches/ktlsp112/classes");
+        let source = home.join("caches/ktlsp112/generated");
+        let config = home.join(".tmp/ktlsp112/selected.gradle.kts");
+        let mut modules = classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCE\tmain\t{}\nOUTPUT\tmain\t{}\nSCP\tmain\t{}\nEND\t:app\n",
+            root.display(),
+            source.display(),
+            output.display(),
+            jar.display()
+        ));
+        modules[0].source_sets[0].resources = Some(crate::resource_model::ResourceClaims {
+            adapter: "gradle-source-set-resources-v1".into(),
+            roots: vec![],
+            trees: vec![],
+            files: vec![],
+            output_roots: vec![],
+            configuration_inputs: vec![config.clone()],
+            default_excludes: vec![],
+            complete: true,
+            problem: None,
+        });
+        let model = Arc::new(classpath::ProjectSnapshot::new(modules));
+        for (file, force, cancel) in [
+            (jar, true, false),
+            (output.join("Changed.class"), true, false),
+            (source.join("Generated.kt"), false, true),
+            (config, true, true),
+            (root.join("new-conventions.gradle.kts"), true, true),
+            (home.join("gradle.properties"), true, true),
+            (home.join("init.d/company.gradle.kts"), true, true),
+        ] {
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            *backend.root.lock() = Some(root.clone());
+            *backend.gradle_project.lock() = true;
+            backend.ws.lock().set_project_model(model.clone());
+            let generation = backend.ws.lock().analysis_generation();
+            let cancelled = {
+                let mut state = backend.refresh.lock();
+                state.requested = generation;
+                state.active_generation = Some(generation);
+                state.running = true;
+                state.cancelled.clone()
+            };
+            backend.watches.lock().model_loading = true;
+            let key = crate::paths::file_key(&file);
+            let lexical = file
+                .parent()
+                .unwrap()
+                .join("unused/../.")
+                .join(file.file_name().unwrap());
+            assert!(
+                !ignored_gradle_input(
+                    &root,
+                    Some(&model),
+                    &crate::paths::file_key(&lexical),
+                    &home
+                ),
+                "lexical alias lost selected input: {key}"
+            );
+            #[cfg(windows)]
+            {
+                let alias = PathBuf::from(
+                    file.parent()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_ascii_uppercase(),
+                )
+                .join(file.file_name().unwrap());
+                assert!(
+                    !ignored_gradle_input(
+                        &root,
+                        Some(&model),
+                        &crate::paths::file_key(&alias),
+                        &home
+                    ),
+                    "case alias lost selected input: {key}"
+                );
+            }
+            assert_eq!(
+                project_change(&root, Some(&model), &key),
+                Some(force),
+                "{key}"
+            );
+            backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent::new(
+                        Uri::from_file_path(file).unwrap(),
+                        FileChangeType::CREATED,
+                    )],
+                })
+                .await;
+            assert!(
+                backend.refresh.lock().requested > generation,
+                "selected input lost: {key}"
+            );
+            assert_eq!(
+                cancelled.load(std::sync::atomic::Ordering::Acquire),
+                cancel,
+                "{key}"
+            );
+            assert_eq!(backend.refresh.lock().force, force);
+        }
     }
 
     #[test]

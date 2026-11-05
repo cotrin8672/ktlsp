@@ -37,10 +37,7 @@ impl Repos {
     /// so we never scatter caches into the current working directory).
     pub fn defaults() -> Self {
         let home = crate::paths::user_home().unwrap_or_else(std::env::temp_dir);
-        let gradle = std::env::var_os("GRADLE_USER_HOME")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".gradle"));
+        let gradle = crate::paths::gradle_user_home();
         Repos {
             gradle_cache: gradle.join("caches"),
             m2: home.join(".m2/repository"),

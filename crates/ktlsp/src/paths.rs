@@ -8,6 +8,13 @@ pub(crate) fn user_home() -> Option<PathBuf> {
         .or_else(std::env::home_dir)
 }
 
+pub(crate) fn gradle_user_home() -> PathBuf {
+    std::env::var_os("GRADLE_USER_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home().unwrap_or_else(std::env::temp_dir).join(".gradle"))
+}
+
 /// Match editor file-URI keys without resolving the filesystem or changing Unix filenames.
 pub fn file_key(path: &Path) -> String {
     let path = path.to_string_lossy();
