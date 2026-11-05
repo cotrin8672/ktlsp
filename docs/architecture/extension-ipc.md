@@ -788,6 +788,16 @@ recorded in the [current acceptance record](../fork-current.md); the earlier
 runtime/source/resource results remain separate. This does not declare the full
 eleven-command Minecraft integration ready.
 
+The owner's SDK comes from its language-specific selected compiler task and a
+unique matching SDK caller view. A Gradle Kotlin owner needs a Kotlin JVM producer;
+adding its directory to Java `srcDirs` does not supply that producer. Configure the
+existing Kotlin JVM plugin's `kotlin { jvmToolchain(21) }` when that is the intended
+JDK. `JAVA_HOME` or `KTLSP_JDK_SRC` alone cannot attest an unconfigured Kotlin
+producer, and no LSP initialization field or CLI flag overrides this selection.
+Java and Kotlin select their own SDK views; common resource scope requires their
+configured SDK/API selections to agree, including the selected release. SDK
+selection from the Gradle model does not require application compilation or generation.
+
 Negotiate the capability and the operations used in the child initialize response:
 
 ```json

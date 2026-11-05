@@ -233,6 +233,18 @@ does not require complete owner-wide coverage for a known exact member; missing,
 ambiguous or edited inputs retain their guards. No host feature request follows
 from this error alone, and no additional Java run has been made during triage.
 
+The separate marker-absent Kotlin run with MC6c36/host107 completed in46.1 seconds,
+then failed its first completion after eight assertions with `MissingFacts` and
+`producerProblems=[missing-selected-sdk]`. The saved model lists Java and Kotlin
+roots under `:`/`main`, but has `kotlin_present=false` and only JDK21 `:compileJava`;
+no Kotlin compiler task, SDK or release is recorded. Adding a Kotlin directory to
+Java roots did not establish its language-specific SDK view. Evidence:
+`mc107-sdk-triage/summary.json` and MC
+`build/rust-test-logs/kotlin-source-6c36-host107-native-20261105/recovery-and-run-receipt.json`.
+The next prerequisite is a real Kotlin producer/toolchain in the disposable
+fixture model. No host change or extra run was made during this investigation,
+and this does not establish the cause of Java's incomplete method coverage.
+
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable
 checkout supplied configuration-build prerequisites; the LSP did not regenerate them.
