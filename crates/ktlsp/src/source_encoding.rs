@@ -71,6 +71,10 @@ impl Default for SourceTextPolicy {
 }
 
 impl SourceTextPolicy {
+    pub(crate) fn input_paths(&self) -> impl Iterator<Item = &Path> {
+        self.poms.iter().map(|pom| pom.path.as_path())
+    }
+
     /// The lookup is the existing cached exact-coordinate artifact lookup: no downloads/relativePath.
     pub(crate) fn resolve(
         selected: &Coordinate,

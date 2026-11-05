@@ -1001,6 +1001,11 @@ impl ExtensionStore {
             .map(|source| source.declarations.as_slice())
     }
 
+    /// Revision of the accepted body, for host-owned input provenance (not a read capability).
+    pub fn source_revision(&self, file: &str) -> Option<u64> {
+        self.sources.get(file).map(|source| source.generation)
+    }
+
     pub fn contribution_sets(&self) -> impl Iterator<Item = (&str, &str, &ContributionSet)> {
         self.sets
             .iter()
@@ -2411,7 +2416,7 @@ impl ReadSession<'_> {
         })))
     }
 
-    fn type_binary_name(&mut self, owner: &TypeId) -> Result<Fact<JvmBinaryName>, ContractError> {
+    pub fn type_binary_name(&mut self, owner: &TypeId) -> Result<Fact<JvmBinaryName>, ContractError> {
         Ok(match self.reference_type(owner)? {
             Knowledge::Found(JvmType::Reference(reference)) => Knowledge::Found(JvmBinaryName {
                 descriptor: format!("L{};", reference.internal_name),

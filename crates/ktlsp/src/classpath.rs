@@ -1328,6 +1328,40 @@ impl ProjectSnapshot {
         self.file_origins.get(&path_key(path)).map(String::as_str)
     }
 
+    /// Bridge the accepted source selection to one physical binary in this caller's two views.
+    pub(crate) fn dependency_runtime_selection(&self, owner: &Path, origin: &FileOrigin,
+        source: &crate::deps::LibrarySource) -> Option<(PathBuf,String)> {
+        if origin.project_scope.is_some() || origin.representation != SourceRepresentation::Source { return None; }
+        let context = self.extension_project_context(owner)?;
+        if !context.classpath_complete { return None; }
+        let scope = context.source;
+        let runtime = scope.runtime.as_ref().filter(|runtime|runtime.usable())?;
+        let mut artifacts: BTreeMap<_,Vec<_>> = BTreeMap::new();
+        for artifact in &scope.artifacts { artifacts.entry(path_key(&artifact.path)).or_default().push(artifact); }
+        let mut selected = Vec::new();
+        for path in &scope.entries {
+            let components = artifacts.get(&path_key(path)).map(Vec::as_slice).unwrap_or(&[]);
+            if components.len()>1 { return None; }
+            let component = components.first().map(|artifact| &artifact.component);
+            if matches!(component,Some(ComponentId::Project {..})) { continue; }
+            if self.origins_for_entry(path,component) != vec![origin.origin_id.clone()] { continue; }
+            let physical = self.artifact_origin(path)?;
+            if matches!(component,Some(ComponentId::Module {..})) {
+                if scope.source_artifacts_incomplete || source.origin_id()!=origin.origin_id { return None; }
+                let sources: Vec<_> = scope.source_artifacts.as_ref()?.iter()
+                    .filter(|artifact|Some(&artifact.component)==component).collect();
+                if sources.len()!=1 || source.selected_archive().map(path_key)!=Some(path_key(&sources[0].path))
+                    || self.artifact_origin(&sources[0].path).is_none() { return None; }
+            } else if source.origin_id()!=physical || origin.origin_id!=physical { return None; }
+            selected.push((path.clone(),physical.to_owned()));
+        }
+        let [(path,physical)] = selected.as_slice() else { return None; };
+        let runtime_matches: Vec<_> = runtime.classpath.iter()
+            .filter(|candidate|self.artifact_origin(candidate)==Some(physical.as_str())).collect();
+        if runtime_matches.len()!=1 || path_key(runtime_matches[0])!=path_key(path) { return None; }
+        Some((path.clone(),physical.clone()))
+    }
+
     pub fn coordinate_binaries(&self, coord: &Coordinate) -> Option<Vec<(PathBuf, String)>> {
         self.modules
             .iter()

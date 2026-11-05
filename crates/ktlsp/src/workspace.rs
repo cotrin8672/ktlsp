@@ -1101,6 +1101,16 @@ impl Workspace {
         ->Result<Option<crate::jvm_catalog::CatalogPlan>,String> {
         self.analysis_extensions.begin_ipc_jvm_reads(id,method,params)
     }
+
+    pub(crate) fn begin_ipc_source_provenance(&mut self,id:u64,method:&str,params:&serde_json::Value)
+        ->Result<Option<crate::analysis_extensions::ProvenancePlan>,String> {
+        let open=self.open_docs.keys().chain(self.owned_documents.keys()).cloned().collect();
+        self.analysis_extensions.begin_ipc_source_provenance(&self.index,&open,id,method,params)
+    }
+
+    pub(crate) fn finish_ipc_source_provenance(&mut self,prepared:crate::analysis_extensions::PreparedProvenance)->Result<(),String> {
+        self.analysis_extensions.finish_ipc_source_provenance(prepared)
+    }
     pub(crate) fn finish_ipc_jvm_read(&mut self,prepared:crate::jvm_catalog::PreparedCatalog)->Result<(),String> {
         self.analysis_extensions.finish_ipc_jvm_read(&self.index,prepared)
     }

@@ -13,7 +13,21 @@ The agreed [MC responsibility boundary](architecture/extension-ipc.md#current-mc
 keeps MC source-syntax projection and host-authoritative semantic facts in the mixed
 pipeline. This Kotlin connection needs no new host API; separately demonstrated
 unresolved requests remain open. MC's agreement is docs-only at2919962, with runtime
-unchanged atb0d102c. It adds no acceptance credit or raw-DTO prerequisite.
+unchanged atb0d102c at that decision. It adds no acceptance credit or raw-DTO prerequisite.
+The target-bound `sourceProvenance` addition passes17 focused native checks. It
+distinguishes current workspace sources from verified selected dependency sources,
+including an opaque physical artifact identity for runtime comparison. Existing
+coverage meanings are unchanged; the original MC Java consumer is not verified by
+this contract addition. See [the contract](architecture/extension-ipc.md#target-source-provenance).
+The checks are hydration16 and optional-operation negotiation1, with416 source
+guards stable. Actual serializer fixtures and the release receipt are in
+`mc108-source-provenance-retry/{wire-samples,main-ready}.json`. The sealed108 host
+is25,431,552 bytes, SHA-256
+`e12eb95f8b0ef3cf42e6e5f0897fbbf42dcdea9d1b86364efc11f1d414612d54`;
+init6528 is unchanged. The first compile failed for a missing `Debug` implementation;
+its receipt remains in `mc108-source-provenance/receipt.json`. Only that one-line
+fix preceded the successful checks; no tests had run during the failed compile.
+No original MC/extra editor run or full old workspace suite was repeated here.
 The earlier blanket completion declaration remains retracted: these are finite,
 reproducible editing and extension workflows, not proof of all-language IDEA parity.
 Qualified CEM38 and five-project50 are retained with their original limits below.

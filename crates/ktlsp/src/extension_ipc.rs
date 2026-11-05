@@ -28,6 +28,7 @@ static NEXT_EVALUATION: AtomicU64 = AtomicU64::new(1);
 const PROJECT_FACTS: &str = "project-class-facts-v1";
 const PROJECT_CONTEXT: u32 = 1;
 const TYPE_JVM: u32 = 2;
+const SOURCE_PROVENANCE: u32 = 262144;
 const SOURCE_SNAPSHOTS: &str = "source-snapshots-v1";
 const SOURCE_INVENTORY: u32 = 4;
 const SOURCE_SNAPSHOT: u32 = 8;
@@ -103,7 +104,7 @@ fn project_operations(result: &Value) -> u32 {
     let mut selected = if result["capabilities"].as_array().is_some_and(|values|
         values.iter().any(|value|value==BINARY_ANNOTATION_CAPABILITY)) {BINARY_ANNOTATIONS} else {0};
     for (capability, operations) in [
-        (PROJECT_FACTS, &[("projectContext",PROJECT_CONTEXT),("typeJvm",TYPE_JVM)][..]),
+        (PROJECT_FACTS, &[("projectContext",PROJECT_CONTEXT),("typeJvm",TYPE_JVM),("sourceProvenance",SOURCE_PROVENANCE)][..]),
         (SOURCE_SNAPSHOTS, &[("sourceInventory",SOURCE_INVENTORY),("sourceSnapshot",SOURCE_SNAPSHOT)][..]),
         (RESOURCES, &[("resourceInventory",RESOURCE_INVENTORY),("resourceLookup",RESOURCE_LOOKUP),("resourceSnapshot",RESOURCE_SNAPSHOT)][..]),
         (RUNTIME_CLASSES, &[("runtimeClass",RUNTIME_CLASS),("classBytes",CLASS_BYTES)][..]),
@@ -129,7 +130,7 @@ fn initialize_message(provider:&str,commands:&std::collections::BTreeSet<String>
         "protocol":{"major":PROTOCOL_MAJOR,"minor":0},"provider":provider,
         "capabilities":["semantic-v1",PROJECT_FACTS,SOURCE_SNAPSHOTS,RESOURCES,RUNTIME_CLASSES,JVM_CATALOG,SOURCE_LOCATIONS,SOURCE_FACTS_V2,PROJECT_INPUT_CAPABILITY,BINARY_ANNOTATION_CAPABILITY,ROOT_FILES,"provider-commands-v1"],
         "commands":commands,"supportedOps":{
-            PROJECT_FACTS:["projectContext","typeJvm"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"],
+            PROJECT_FACTS:["projectContext","typeJvm","sourceProvenance"],SOURCE_SNAPSHOTS:["sourceInventory","sourceSnapshot"],
             RESOURCES:["resourceInventory","resourceLookup","resourceSnapshot"],RUNTIME_CLASSES:["runtimeClass","classBytes"],
             JVM_CATALOG:["jvmCatalog","jvmClass"],SOURCE_LOCATIONS:["sourceLocation"],PROJECT_INPUT_CAPABILITY:["projectInputs"],SOURCE_FACTS_V2:["sourceFacts","annotationSites"],ROOT_FILES:["rootFileInventory","rootFileSnapshot"]
         }}})
@@ -337,6 +338,7 @@ pub(crate) struct Evaluation {
     jvm_catalog_token: Option<String>,
     jvm_catalog_error: Option<String>,
     jvm_classes: BTreeMap<usize, Result<Arc<ktcore::classfile::ClassFileFacts>,String>>,
+    pub(crate) source_provenance_proofs: BTreeMap<String,Result<crate::analysis_extensions::ProvenanceProof,String>>,
     handles: BTreeMap<String, Handle>,
     declaration_tokens:std::collections::HashMap<DeclarationId,String>,
     snapshot_declaration_tokens:std::collections::HashMap<SourceHandle,std::collections::HashMap<DeclarationId,String>>,
@@ -368,6 +370,7 @@ impl Evaluation {
             class_scope: None,
             class_results: BTreeMap::new(),
             jvm_catalog:None, jvm_catalog_token:None, jvm_catalog_error:None, jvm_classes:BTreeMap::new(),
+            source_provenance_proofs:BTreeMap::new(),
             handles: BTreeMap::new(),
             declaration_tokens:Default::default(),snapshot_declaration_tokens:Default::default(),
             batches: 0,
@@ -1270,6 +1273,46 @@ impl Evaluation {
                 "sha256":format!("{:x}",Sha256::digest(location.text.as_bytes()))}}}))
     }
 
+    pub(crate) fn source_provenance_targets(&self,method:&str,params:&Value)->Result<Vec<(String,TypeId)>,String> {
+        if method!="analysis/readFacts" { return Ok(Vec::new()); }
+        self.ensure_input_read_budget(params)?;
+        let queries:Vec<ReadQuery>=serde_json::from_value(params["queries"].clone()).map_err(|error|error.to_string())?;
+        let mut targets=Vec::new();
+        for query in queries {
+            if let ReadQuery::SourceProvenance {target}=query {
+                if self.project_operations&SOURCE_PROVENANCE==0 { return Err("sourceProvenance was not negotiated".into()); }
+                targets.push((target.clone(),self.ty(&json!(target))?));
+            }
+        }
+        Ok(targets)
+    }
+
+    fn source_provenance(&self,read:&mut ReadSession<'_>,target:&str)->Result<Value,String> {
+        use sha2::{Digest,Sha256};
+        if self.project_operations&SOURCE_PROVENANCE==0 { return Err("sourceProvenance was not negotiated".into()); }
+        let ty=self.ty(&json!(target))?;
+        let location=read.type_source_location(&ty).map_err(contract)?;
+        let Knowledge::Found(location)=location else {return Ok(fact(&location,|_|Value::Null));};
+        let proof=match self.source_provenance_proofs.get(target) {
+            Some(Ok(proof))=>proof,
+            _=>return Ok(missing_fact()),
+        };
+        if proof.revision!=location.revision {return Err("Stale".into());}
+        let mut value=json!({"target":target,"kind":"currentWorkspaceSource",
+            "source":{"identity":{"kind":"source","revision":location.revision.to_string()},
+                "sha256":format!("{:x}",Sha256::digest(location.text.as_bytes()))}});
+        if let Some(origin)=&proof.origin {
+            let Some(guard)=&proof.guard else {return Ok(missing_fact());};
+            read.observe_host_input(guard.clone()).map_err(contract)?;
+            let name=read.type_binary_name(&ty).map_err(contract)?;
+            let Knowledge::Found(name)=name else {return Ok(fact(&name,|_|Value::Null));};
+            value["kind"]=json!("selectedDependencySource");
+            value["jvmOwner"]=json!(name.internal_name);
+            value["originId"]=json!(origin);
+        }
+        Ok(json!({"state":"found","value":value}))
+    }
+
     fn type_jvm(&mut self, facts: &TypeJvmFacts) -> Value {
         let abi = match &facts.abi {
             Knowledge::Found(class) => class_abi(class,self.project_operations&BINARY_ANNOTATIONS!=0)
@@ -1752,6 +1795,7 @@ impl Evaluation {
                                 self.type_jvm(&facts)
                             }
                         }
+                        ReadQuery::SourceProvenance {target} => self.source_provenance(read,&target)?,
                         ReadQuery::ResolveType {name} => self.type_fact(&read.resolve_type(&name)),
                         ReadQuery::ResolveTypeRef {reference} => {
                             let (reference,source)=match self.handles.get(&reference) {
@@ -2190,6 +2234,7 @@ enum ReadQuery {
     ProjectInputs { #[serde(default)] after:Option<String> },
     ProjectContext,
     TypeJvm { target: String },
+    SourceProvenance { target: String },
     ResolveType { name: String },
     ResolveTypeRef { reference: String },
     DeclarationType { declaration: String },
@@ -2904,7 +2949,7 @@ impl Worker {
                     };
                     let batch_start=Instant::now();
                     let prepared_inputs=(||->Result<(),String> {
-                        let (roots,reads,class,jvm)={
+                        let (roots,reads,class,jvm,provenance)={
                             let mut workspace=workspace.lock();
                             stage="prepay-input";
                             workspace.prepay_ipc_input_read(work.evaluation,method,&message["params"])?;
@@ -2916,7 +2961,8 @@ impl Worker {
                             let class=workspace.begin_ipc_class_reads(work.evaluation,method,&message["params"])?;
                             stage="plan-jvm-read";
                             let jvm=workspace.begin_ipc_jvm_reads(work.evaluation,method,&message["params"])?;
-                            (roots,reads,class,jvm)
+                            let provenance=workspace.begin_ipc_source_provenance(work.evaluation,method,&message["params"])?;
+                            (roots,reads,class,jvm,provenance)
                         };
                         for root in roots {
                             stage="root-capture-prepare";
@@ -2947,6 +2993,11 @@ impl Worker {
                         if let Some(jvm)=jvm {
                             let prepared=crate::jvm_catalog::prepare(jvm,after_batch.clone());
                             workspace.lock().finish_ipc_jvm_read(prepared)?;
+                        }
+                        stage="source-provenance";
+                        if let Some(provenance)=provenance {
+                            let prepared=crate::analysis_extensions::prepare_source_provenance(provenance,after_batch.clone());
+                            workspace.lock().finish_ipc_source_provenance(prepared)?;
                         }
                         Ok(())
                     })();
@@ -3177,6 +3228,11 @@ mod tests {
         let selected = json!({"capabilities":["semantic-v1",PROJECT_FACTS],
             "supportedOps":{PROJECT_FACTS:["projectContext","typeJvm","unsupported"]}});
         assert_eq!(project_operations(&selected), PROJECT_CONTEXT | TYPE_JVM);
+        assert_eq!(project_operations(&json!({"supportedOps":{PROJECT_FACTS:["sourceProvenance"]}})),0);
+        assert_eq!(project_operations(&json!({"capabilities":[PROJECT_FACTS],
+            "supportedOps":{PROJECT_FACTS:["sourceProvenance"]}})),SOURCE_PROVENANCE);
+        assert!(initialize_message("proof",&Default::default())["params"]["supportedOps"][PROJECT_FACTS]
+            .as_array().unwrap().iter().any(|operation|operation=="sourceProvenance"));
         let first = Worker::new(vec!["first".into()]);
         let second = Worker::new(vec!["second".into()]);
         first.project_operations.store(project_operations(&selected), Ordering::Release);

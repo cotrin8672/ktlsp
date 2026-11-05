@@ -148,6 +148,36 @@ publication; a model change rejects old batches and final contributions. Metadat
 projection uses accepted in-memory selections without filesystem reads. No MC-specific
 generation counters are introduced.
 
+### Target source provenance
+
+`sourceProvenance` is an independently selected operation under
+`project-class-facts-v1`; acknowledge it in `supportedOps` as well as the capability.
+`{"op":"sourceProvenance","target":"<current ordinary type token>"}` returns a Fact.
+Snapshot tokens keep their existing read-only restrictions. Existing `typeJvm` DTOs
+are unchanged. A positive dependency example is:
+
+```json
+{"state":"found","value":{"target":"4:8","kind":"selectedDependencySource","source":{"identity":{"kind":"source","revision":"42"},"sha256":"<accepted-source-sha256>"},"jvmOwner":"example/Target","originId":"<selected-physical-artifact-identity>"}}
+```
+
+`currentWorkspaceSource` uses the same target/source fields without `jvmOwner` or
+`originId`; generated project sources remain workspace sources even when not editable.
+Dependency admission requires the current hydrated body revision and selected archive,
+no open overlay, and a unique model-owned compile/runtime physical artifact match.
+Logical Maven origins are bridged through selected model artifacts, never parsed from
+coordinates or inferred from source paths. Unknown/ambiguous variants remain Unknown.
+The dependency `originId` can be compared directly with `runtimeClass.originId`; name
+equality alone cannot substitute for that comparison or exact source-member mapping.
+Body replacement (including identical-text open), source/index/model changes and
+archive/policy guards withdraw old evidence. Archive IO/watch preparation runs off-lock
+and only covers the requested selection. This fact does not change `sourceCurrent`,
+runtime ABI coverage, source member coverage, or permit workspace binary fallback.
+Focused verification passes17 checks (hydration16 plus negotiation1), including
+same-text dependency open, comment/member edits, generated ownership, selected variants
+and inflight input changes. Actual local/Maven/workspace/Unknown serializer fixtures are
+in `mc108-source-provenance-retry/wire-samples.json` under the acceptance run root.
+The original MC consumer's combined editor verification remains pending.
+
 ### Optional current source snapshots
 
 `source-snapshots-v1` adds two independently negotiated `analysis/readFacts`

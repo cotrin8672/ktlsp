@@ -72,6 +72,13 @@ pub struct LibrarySource {
 thread_local! { static LIBRARY_CURRENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 impl LibrarySource {
+    pub(crate) fn selected_archive(&self) -> Option<&Path> { self.jar.as_deref() }
+    pub(crate) fn origin_id(&self) -> &str { &self.origin_id }
+    pub(crate) fn provenance_inputs(&self) -> Vec<PathBuf> {
+        self.jar.iter().cloned().chain(self.policy.as_ref().ok().into_iter()
+            .flat_map(|policy|policy.input_paths().map(Path::to_path_buf))).collect()
+    }
+
     fn jdk_archive(src_zip: &Path, dest: &Path, fingerprint: &str) -> Self {
         Self {
             dest: dest.into(),

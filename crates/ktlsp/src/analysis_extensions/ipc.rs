@@ -882,6 +882,34 @@ impl AnalysisExtensions {
             .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance).map_or(0,|slot|slot.worker.project_operations());
         evaluation.begin_jvm_reads(method,params)
     }
+
+    pub(crate) fn begin_ipc_source_provenance(&mut self,index:&Index,open:&BTreeSet<String>,id:u64,
+        method:&str,params:&Value)->Result<Option<ProvenancePlan>,String> {
+        let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
+        if evaluation.failure.is_some() || !evaluation.pending.as_ref().is_some_and(|pending|
+            self.store.validate_pending(pending).is_ok()) { return Err("Stale".into()); }
+        evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
+            .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance).map_or(0,|slot|slot.worker.project_operations());
+        let targets=evaluation.source_provenance_targets(method,params)?;
+        if targets.is_empty() { return Ok(None); }
+        let Some(model)=evaluation.project.clone() else { return Ok(None); };
+        let owner=evaluation.owner.clone();
+        let inputs=targets.into_iter().filter_map(|(token,target)| {
+            let file=&target.definition().file;
+            self.provenance_input(index,&model,std::path::Path::new(&owner),file,open.contains(file))
+                .map(|input|(token,input))
+        }).collect();
+        Ok(Some(ProvenancePlan {evaluation:id,model,inputs}))
+    }
+
+    pub(crate) fn finish_ipc_source_provenance(&mut self,prepared:PreparedProvenance)->Result<(),String> {
+        let evaluation=self.ipc_evaluations.get_mut(&prepared.evaluation).ok_or("Stale")?;
+        if !evaluation.project.as_ref().is_some_and(|model|Arc::ptr_eq(model,&prepared.model))
+            || !evaluation.pending.as_ref().is_some_and(|pending|self.store.validate_pending(pending).is_ok())
+            || prepared.proofs.values().any(|proof|proof.as_ref().is_err_and(|error|error=="Stale")) { return Err("Stale".into()); }
+        evaluation.source_provenance_proofs=prepared.proofs;
+        Ok(())
+    }
     pub(crate) fn finish_ipc_jvm_read(&mut self,index:&dyn InferenceIndex,prepared:crate::jvm_catalog::PreparedCatalog)->Result<(),String> {
         let id=prepared.evaluation;
         let mut evaluation=self.ipc_evaluations.remove(&id).ok_or("Stale")?;

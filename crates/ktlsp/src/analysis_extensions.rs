@@ -12,6 +12,7 @@ use tree_sitter::Tree;
 mod ipc;
 mod source_hydration;
 pub(crate) use source_hydration::{prepare_sources, PreparedSource, SourceRequest};
+pub(crate) use source_hydration::{prepare_source_provenance, PreparedProvenance, ProvenancePlan, ProvenanceProof};
 
 pub use ktcore::extensions::AnalysisProvider;
 
@@ -39,7 +40,7 @@ pub(crate) struct AnalysisExtensions {
         ),
     >,
     attempted_sources: BTreeMap<String, source_hydration::SourceStamp>,
-    hydrated_sources: BTreeMap<String, source_hydration::SourceStamp>,
+    hydrated_sources: BTreeMap<String, source_hydration::HydratedSource>,
     source_producers: BTreeMap<String, source_hydration::SourceProducer>,
 }
 
@@ -336,11 +337,17 @@ impl AnalysisExtensions {
         }.and_then(|_|self.store.cache_annotation_sites(index,&annotation_source,&annotation_scope));
         if let Err(error) = replaced {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
+            self.hydrated_sources.remove(key);
             self.store.remove_source(key);
             tracing::warn!(file = key, ?error, "invalid normalized extension source");
             return Err(format!("invalid normalized extension source: {error:?}"));
         }
         let result = self.attach_compiled(index, key);
+        if result.is_ok() {
+            if let Some(hydrated)=self.hydrated_sources.get_mut(key) {
+                hydrated.revision=self.store.source_revision(key).unwrap_or(0);
+            }
+        }
         if let Err(error) = &result {
             tracing::warn!(file = key, %error, "invalid compiled source owner");
         }
@@ -692,6 +699,8 @@ impl AnalysisExtensions {
             .filter_map(|(key, input)| input.compiled.take().map(|_| key.clone()))
             .collect();
         for key in compiled_keys {
+            self.hydrated_sources.remove(&key);
+            self.forget_source_producer(&key);
             self.changed.insert(key.clone());
             if !self.retain_all_sources {
                 self.inputs.remove(&key);
@@ -717,6 +726,8 @@ impl AnalysisExtensions {
         self.invalidate_compiled(index);
         self.compiled_receipt = Some(receipt);
         for owner in owners {
+            self.hydrated_sources.remove(&owner.file);
+            self.forget_source_producer(&owner.file);
             let receipt = self.compiled_receipt.as_ref().unwrap();
             if let Err(error) = receipt.verify_compiled_output(
                 &owner.class_file,
@@ -837,6 +848,8 @@ impl AnalysisExtensions {
         }
         self.store.clear_compiled_inputs();
         for key in std::mem::take(&mut self.compiler_api_sources) {
+            self.hydrated_sources.remove(&key);
+            self.forget_source_producer(&key);
             self.changed.insert(key.clone());
             if self.retain_all_sources {
                 if let Some(input) = self.inputs.get_mut(&key) {
@@ -882,6 +895,8 @@ impl AnalysisExtensions {
                     Arc::make_mut(&mut class.class).identity.origin_id = origin.origin_id.clone();
                 }
                 self.compiler_api_sources.insert(key.clone());
+                self.hydrated_sources.remove(&key);
+                self.forget_source_producer(&key);
                 self.changed.insert(key.clone());
                 self.inputs.insert(
                     key.clone(),
@@ -912,6 +927,7 @@ impl AnalysisExtensions {
         for key in keys {
             let Some(input) = self.inputs.get_mut(&key) else { continue };
             if input.compiled.take().is_none() { continue; }
+            self.hydrated_sources.remove(&key);
             self.compiler_api_sources.remove(&key);
             self.changed.insert(key.clone());
             self.store.remove_source(&key);
@@ -936,6 +952,8 @@ impl AnalysisExtensions {
         }
         let mut keys = Vec::new();
         for (key, text, tree, class) in owners {
+            self.hydrated_sources.remove(&key);
+            self.forget_source_producer(&key);
             self.compiler_api_sources.insert(key.clone());
             self.changed.insert(key.clone());
             keys.push(key.clone());

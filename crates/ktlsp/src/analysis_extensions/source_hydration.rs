@@ -4,6 +4,7 @@
 use std::{path::Path, sync::Arc};
 
 use ktcore::{
+    extensions::HostInputGuard,
     extensions::source::{prepare_source_references, PreparedSourceReferences},
     index::{Index, Tier},
     project_model::{FileOrigin, SourceRepresentation},
@@ -23,6 +24,71 @@ pub(super) struct SourceStamp {
     symbols: Vec<Arc<IndexedSymbol>>,
 }
 
+pub(super) struct HydratedSource {
+    stamp: SourceStamp,
+    pub(super) revision: u64,
+    source: Arc<LibrarySource>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for HydratedSource {
+    fn drop(&mut self) { self.retired.store(true,std::sync::atomic::Ordering::Release); }
+}
+
+#[derive(Debug)]
+struct DependencyProvenanceGuard {
+    retired: Arc<std::sync::atomic::AtomicBool>,
+    lease: Arc<crate::compiled_watch::HostInputLease>,
+}
+impl ktcore::extensions::HostInputGuard for DependencyProvenanceGuard {
+    fn is_current(&self)->bool {
+        !self.retired.load(std::sync::atomic::Ordering::Acquire) && self.lease.is_current()
+    }
+}
+
+pub(crate) struct ProvenanceInput {
+    pub revision: u64,
+    pub archive_origin: Option<String>,
+    pub selected: Option<(Arc<LibrarySource>, std::path::PathBuf, String, Arc<std::sync::atomic::AtomicBool>)>,
+}
+pub(crate) struct ProvenancePlan {
+    pub evaluation: u64,
+    pub model: Arc<crate::classpath::ProjectSnapshot>,
+    pub inputs: std::collections::BTreeMap<String, ProvenanceInput>,
+}
+pub(crate) struct ProvenanceProof {
+    pub revision: u64,
+    pub origin: Option<String>,
+    pub guard: Option<Arc<dyn ktcore::extensions::HostInputGuard>>,
+}
+pub(crate) struct PreparedProvenance {
+    pub evaluation: u64,
+    pub model: Arc<crate::classpath::ProjectSnapshot>,
+    pub proofs: std::collections::BTreeMap<String, Result<ProvenanceProof,String>>,
+}
+
+/// Archive/policy IO and native watch registration stay outside the workspace lock.
+pub(crate) fn prepare_source_provenance(plan: ProvenancePlan, wake: Arc<dyn Fn()+Send+Sync>) -> PreparedProvenance {
+    let proofs = plan.inputs.into_iter().map(|(token,input)| {
+        let proof = (|| {
+            let Some((source,binary,origin,retired)) = input.selected else {
+                return Ok(ProvenanceProof {revision:input.revision,origin:None,guard:None});
+            };
+            let current = || !retired.load(std::sync::atomic::Ordering::Acquire) && source.is_current() && source.content_is_current()
+                && crate::classpath::file_origin_id(&binary)==origin
+                && input.archive_origin.as_ref().is_none_or(|expected|
+                    source.selected_archive().is_some_and(|archive|crate::classpath::file_origin_id(archive)==*expected));
+            if !current() { return Err("Stale".into()); }
+            let mut paths=source.provenance_inputs(); paths.push(binary.clone());
+            let plan=crate::compiled_watch::WatchPlan::read_inputs(&paths).map_err(|error|error.to_string())?;
+            let guard=crate::compiled_watch::HostInputLease::new(plan,wake.clone()).map_err(|error|error.to_string())?;
+            if !current() || !guard.is_current() { return Err("Stale".into()); }
+            Ok(ProvenanceProof {revision:input.revision,origin:Some(origin),guard:Some(Arc::new(DependencyProvenanceGuard {retired,lease:guard}))})
+        })();
+        (token,proof)
+    }).collect();
+    PreparedProvenance {evaluation:plan.evaluation,model:plan.model,proofs}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +104,7 @@ mod tests {
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
+    use sha2::Digest;
 
     const OWNER: &str =
         "package client; abstract class Owner { abstract arrayfixture.Item[][] mirror(); }";
@@ -209,6 +276,189 @@ mod tests {
         ws.diagnostics("Owner.java")
             .iter()
             .any(|d| d.message == "library-probe:true")
+    }
+
+    fn provenance_fixture(module: bool) -> (Fixture,Workspace,Arc<crate::classpath::ProjectSnapshot>,String) {
+        use crate::classpath::*;
+        let fixture=Fixture::new();
+        let root=fixture.root.join("src"); fs::create_dir_all(&root).unwrap();
+        let owner=crate::paths::file_key(&root.join("Owner.java"));
+        let component=if module {ComponentId::Module {group:"fixture".into(),name:"library".into(),version:"1".into()}} else {ComponentId::File};
+        let pom=fixture.root.join("library.pom");
+        fs::write(&pom,"<project><modelVersion>4.0.0</modelVersion><groupId>fixture</groupId><artifactId>library</artifactId><version>1</version></project>").unwrap();
+        let source=SourceSetClasspath {name:"main".into(),source_roots:vec![root],entries:vec![fixture.binary.clone()],
+            artifacts:vec![ResolvedArtifact {path:fixture.binary.clone(),component:component.clone()}],
+            source_artifacts:Some(vec![ResolvedArtifact {path:fixture.sources.clone(),component:component.clone()}]),
+            source_poms:Some(vec![ResolvedArtifact {path:pom,component}]),
+            runtime:Some(RuntimeClassInputs {adapter:"gradle-runtime-class-inputs-v1".into(),classpath:vec![fixture.binary.clone()],
+                class_outputs:Vec::new(),complete:true,problem:None}),..Default::default()};
+        let model=Arc::new(ProjectSnapshot::new(vec![ModuleClasspath {module:":fixture".into(),project_dir:fixture.root.clone(),
+            build:"fixture".into(),source_sets:vec![source],entries:Vec::new(),unresolved:Vec::new()}]));
+        let mut ws=Workspace::with_analysis_providers(vec![Arc::new(Probe)]);
+        ws.set_project_model(model.clone());
+        let batches=if module {
+            let coord=crate::coords::Coordinate::parse("fixture:library:1").unwrap();
+            let source=crate::deps::coordinate_source_for_model(&coord,&crate::artifacts::Repos::defaults(),&fixture.extract,Some(&model)).unwrap().unwrap();
+            crate::deps::resolve_library_source(&source,&mut KotlinParser::new(),&mut JavaParser::new()).unwrap()
+        } else {
+            crate::deps::resolve_local_jar_stubs(&fixture.binary,&fixture.extract,&mut KotlinParser::new(),&mut JavaParser::new()).unwrap()
+        };
+        for batch in batches {assert!(ws.index_dependency_batch(batch));}
+        ws.bump_index_revision(); ws.open(&owner,OWNER.into());
+        assert_eq!(drain(&mut ws),2);
+        (fixture,ws,model,owner)
+    }
+
+    fn planned_provenance(ws:&mut Workspace,model:&Arc<crate::classpath::ProjectSnapshot>,owner:&str,name:&str)
+        ->(crate::extension_ipc::Evaluation,PendingContributions,String,ProvenancePlan) {
+        use serde_json::json;
+        let open=ws.open_doc_keys();
+        let (index,host)=ws.extension_test_inputs();
+        let mut evaluation=crate::extension_ipc::Evaluation::new("library-probe".into(),owner.into(),1);
+        evaluation.project=Some(model.clone()); evaluation.project_operations=u32::MAX;
+        let mut read=host.store.begin(index,"library-probe",owner).unwrap();
+        let resolved=evaluation.batch(&mut read,"analysis/readFacts",json!({"evaluation":evaluation.id.to_string(),
+            "queries":[{"op":"resolveType","name":name}]})).unwrap();
+        assert_eq!(resolved["facts"][0]["state"],"found","{resolved}");
+        let token=resolved["facts"][0]["value"]["id"].as_str().unwrap().to_owned();
+        let pending=read.finish();
+        let targets=evaluation.source_provenance_targets("analysis/readFacts",&json!({"evaluation":evaluation.id.to_string(),
+            "queries":[{"op":"sourceProvenance","target":token}]})).unwrap();
+        let file=&targets[0].1.definition().file;
+        let inputs=host.provenance_input(index,model,Path::new(owner),file,open.contains(file))
+            .map(|input|std::collections::BTreeMap::from([(token.clone(),input)])).unwrap_or_default();
+        let plan=ProvenancePlan {evaluation:evaluation.id,model:model.clone(),inputs};
+        (evaluation,pending,token,plan)
+    }
+
+    fn read_provenance(ws:&mut Workspace,owner:&str,evaluation:&mut crate::extension_ipc::Evaluation,
+        pending:PendingContributions,token:&str)->Result<(serde_json::Value,PendingContributions),String> {
+        let (index,host)=ws.extension_test_inputs();
+        let mut read=host.store.resume(index,owner,pending).map_err(|error|format!("{error:?}"))?;
+        let facts=evaluation.batch(&mut read,"analysis/readFacts",serde_json::json!({"evaluation":evaluation.id.to_string(),
+            "queries":[{"op":"sourceProvenance","target":token}]}));
+        let pending=read.finish(); facts.map(|facts|(facts,pending))
+    }
+
+    #[test]
+    fn source_provenance_local_and_maven_bind_the_selected_physical_runtime_input() {
+        for module in [false,true] {
+            let (fixture,mut ws,model,owner)=provenance_fixture(module);
+            let (mut evaluation,pending,token,plan)=planned_provenance(&mut ws,&model,&owner,"arrayfixture.Item");
+            assert_eq!(plan.inputs.len(),1);
+            evaluation.source_provenance_proofs=prepare_source_provenance(plan,Arc::new(||{})).proofs;
+            let (facts,_)=read_provenance(&mut ws,&owner,&mut evaluation,pending,&token).unwrap();
+            let fact=&facts["facts"][0];assert_eq!(fact["state"],"found");
+            eprintln!("SOURCE_PROVENANCE_WIRE {} {fact}",if module {"maven"} else {"local"});
+            assert_eq!(fact["value"].as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from(["target","kind","source","jvmOwner","originId"]));
+            assert_eq!(fact["value"]["source"].as_object().unwrap().len(),2);
+            assert_eq!(fact["value"]["source"]["identity"].as_object().unwrap().len(),2);
+            assert_eq!(fact["value"]["source"]["identity"]["kind"],"source");
+            assert!(fact["value"]["source"]["identity"]["revision"].is_string());
+            assert_eq!(fact["value"]["target"],token);assert_eq!(fact["value"]["kind"],"selectedDependencySource");
+            assert_eq!(fact["value"]["jvmOwner"],"arrayfixture/Item");
+            assert_eq!(fact["value"]["originId"],model.artifact_origin(&fixture.binary).unwrap());
+            assert_eq!(fact["value"]["source"]["sha256"],format!("{:x}",sha2::Sha256::digest(ITEM.as_bytes())));
+            let file=evaluation.source_provenance_targets("analysis/readFacts",&serde_json::json!({"evaluation":evaluation.id.to_string(),
+                "queries":[{"op":"sourceProvenance","target":token}]})).unwrap()[0].1.definition().file.clone();
+            let (index,host)=ws.extension_test_inputs();let hydrated=&host.hydrated_sources[&file];
+            let mut different=model.modules.clone();
+            let other=fixture.root.join("different-runtime.jar");fs::copy(&fixture.binary,&other).unwrap();
+            different[0].source_sets[0].runtime.as_mut().unwrap().classpath=vec![other];
+            let different=crate::classpath::ProjectSnapshot::new(different);
+            assert!(different.dependency_runtime_selection(Path::new(&owner),&hydrated.stamp.origin,&hydrated.source).is_none());
+            assert!(host.provenance_input(index,&different,Path::new(&owner),&file,false).is_none());
+            let different=Arc::new(different); ws.set_project_model(different.clone());
+            assert_eq!(drain(&mut ws),2);
+            let (mut evaluation,pending,token,plan)=planned_provenance(&mut ws,&different,&owner,"arrayfixture.Item");
+            assert!(plan.inputs.is_empty());
+            evaluation.source_provenance_proofs=prepare_source_provenance(plan,Arc::new(||{})).proofs;
+            let (facts,_)=read_provenance(&mut ws,&owner,&mut evaluation,pending,&token).unwrap();
+            let fact=&facts["facts"][0];assert_eq!(fact["state"],"unknown");
+            assert!(fact["reasons"].as_array().is_some_and(|reasons|!reasons.is_empty()));
+            eprintln!("SOURCE_PROVENANCE_WIRE variant-mismatch {fact}");
+        }
+    }
+
+    #[test]
+    fn source_provenance_revokes_same_body_overlays_and_inflight_inputs() {
+        for change in ["open","comment","delete","model","index","archive","inflight-open"] {
+            let (fixture,mut ws,model,owner)=provenance_fixture(false);
+            let (mut evaluation,pending,token,plan)=planned_provenance(&mut ws,&model,&owner,"arrayfixture.Item");
+            assert_eq!(plan.inputs.len(),1);
+            let file=ws.index.lookup_type("Item").into_iter().find(|entry|entry.sym.package=="arrayfixture").unwrap().path.to_string();
+            if matches!(change,"archive"|"inflight-open") {
+                if change=="archive" {fixture.write_sources("\n// changed selection\n");}
+                else {ws.open(&file,ITEM.into());}
+                assert!(prepare_source_provenance(plan,Arc::new(||{})).proofs.values().all(|proof|proof.as_ref().is_err_and(|error|error=="Stale")));
+                continue;
+            }
+            evaluation.source_provenance_proofs=prepare_source_provenance(plan,Arc::new(||{})).proofs;
+            let guard=evaluation.source_provenance_proofs[&token].as_ref().unwrap().guard.as_ref().unwrap().clone();
+            let (facts,pending)=read_provenance(&mut ws,&owner,&mut evaluation,pending,&token).unwrap();
+            assert_eq!(facts["facts"][0]["state"],"found");
+            if change=="model" {ws.set_project_model(Arc::new(crate::classpath::ProjectSnapshot::new(model.modules.clone())));}
+            else if change=="index" {
+                ws.index_dependency_file("/other/Added.java",vec![ktcore::symbol::IndexedSymbol::new(
+                    "Added",ktcore::symbol::SymbolKind::Class,"other",None,6,11)]);
+                ws.bump_index_revision();
+            }
+            else {
+                ws.open(&file,ITEM.into());
+                if change=="comment" {ws.change(&file,format!("{ITEM}\n// same symbols\n"));}
+                if change=="delete" {ws.change(&file,"package arrayfixture; class Item {}".into());}
+                assert!(!ws.extension_test_inputs().1.hydrated_sources.contains_key(&file));
+                assert!(!guard.is_current(),"even an identical-text open retires the old dependency proof");
+            }
+            assert!(ws.extension_test_inputs().1.store.validate_pending(&pending).is_err(),"{change}");
+            if matches!(change,"open"|"comment"|"delete") {
+                let (_,_,_,plan)=planned_provenance(&mut ws,&model,&owner,"arrayfixture.Item");
+                assert!(plan.inputs.is_empty(),"an open library body cannot regain readonly dependency authority");
+            }
+        }
+    }
+
+    #[test]
+    fn source_provenance_workspace_generated_and_negotiation_do_not_change_type_jvm() {
+        let (_fixture,mut ws,model,owner)=provenance_fixture(false);
+        let generated=crate::paths::file_key(&model.modules[0].source_sets[0].source_roots[0].join("generated/Generated.java"));
+        let mut modules=model.modules.clone();
+        let root=modules[0].source_sets[0].source_roots[0].clone();
+        modules[0].source_sets[0].compiler_tasks.push(serde_json::from_value(serde_json::json!({
+            "task":":fixture:compileJava","language":"java","task_type":"JavaCompile","arguments":[],
+            "annotation_processor_path":[],"source_files":[owner,generated],"java_home":null,"output_roots":[],
+            "complete":false,"problem":"SDK not needed for source ownership",
+            "options":{"sdkSourcePolicy":{"adapter":"gradle-source-tree-stock-patterns-v1","language":"java",
+                "task":":fixture:compileJava","authored_roots":[root],"future_roots":[],
+                "generated_roots":[root.join("generated")]}}
+        })).unwrap());
+        let model=Arc::new(crate::classpath::ProjectSnapshot::new(modules));
+        ws.set_project_model(model.clone());
+        ws.open(&generated,"package client; class Generated {}".into());
+        assert_eq!(model.extension_source_editable(Path::new(&generated),Path::new(&owner)),Some(false));
+        let (mut evaluation,pending,token,plan)=planned_provenance(&mut ws,&model,&owner,"client.Generated");
+        evaluation.source_provenance_proofs=prepare_source_provenance(plan,Arc::new(||{})).proofs;
+        let (facts,pending)=read_provenance(&mut ws,&owner,&mut evaluation,pending,&token).unwrap();
+        assert_eq!(facts["facts"][0]["value"]["kind"],"currentWorkspaceSource");
+        let fact=&facts["facts"][0];eprintln!("SOURCE_PROVENANCE_WIRE workspace {fact}");
+        assert_eq!(fact["value"].as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["target","kind","source"]));
+        assert_eq!(fact["value"]["source"].as_object().unwrap().len(),2);
+        assert_eq!(fact["value"]["source"]["identity"].as_object().unwrap().len(),2);
+        assert_eq!(fact["value"]["source"]["identity"]["kind"],"source");
+        assert!(fact["value"]["source"]["identity"]["revision"].is_string());
+        assert_eq!(fact["value"]["source"]["sha256"],format!("{:x}",sha2::Sha256::digest(b"package client; class Generated {}")));
+        assert!(facts["facts"][0]["value"].get("originId").is_none());
+        let (index,host)=ws.extension_test_inputs();
+        let mut read=host.store.resume(index,&owner,pending).unwrap();
+        let jvm=evaluation.batch(&mut read,"analysis/readFacts",serde_json::json!({"evaluation":evaluation.id.to_string(),
+            "queries":[{"op":"typeJvm","target":token}]})).unwrap();
+        assert!(jvm["facts"][0].get("sourceProvenance").is_none());
+        assert_eq!(jvm["facts"][0]["declaredMembers"]["coverage"]["state"],"unknown");
+        let pending=read.finish();
+        evaluation.project_operations=0;
+        assert!(read_provenance(&mut ws,&owner,&mut evaluation,pending,&token).err().unwrap().contains("not negotiated"));
     }
     fn drain(ws: &mut Workspace) -> usize {
         let mut count = 0;
@@ -951,6 +1201,25 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
 }
 
 impl AnalysisExtensions {
+    pub(super) fn provenance_input(&self, index: &Index, model: &crate::classpath::ProjectSnapshot,
+        owner: &Path, file: &str, open: bool) -> Option<ProvenanceInput> {
+        let origin=index.file_origin(file)?;
+        let revision=self.store.source_revision(file)?;
+        if origin.representation!=SourceRepresentation::Source { return None; }
+        if origin.project_scope.is_some() {
+            return (model.unique_source_origin(Path::new(file)).as_ref()==Some(origin))
+                .then_some(ProvenanceInput {revision,archive_origin:None,selected:None});
+        }
+        if open { return None; }
+        let hydrated=self.hydrated_sources.get(file)?;
+        let (_,selected)=self.library_sources.get(file)?;
+        if hydrated.revision!=revision || hydrated.source.as_ref()!=selected.as_ref()
+            || self.source_stamp(index,file).as_ref()!=Some(&hydrated.stamp) { return None; }
+        let (binary,physical)=model.dependency_runtime_selection(owner,origin,selected)?;
+        let archive_origin=selected.selected_archive().and_then(|archive|model.artifact_origin(archive)).map(str::to_owned);
+        Some(ProvenanceInput {revision,archive_origin,selected:Some((selected.clone(),binary,physical,hydrated.retired.clone()))})
+    }
+
     fn source_stamp(&self, index: &Index, file: &str) -> Option<SourceStamp> {
         let (origin, source) = self.library_sources.get(file)?;
         // Stub identities are usable, but never acquire authored project-source ownership.
@@ -999,7 +1268,8 @@ impl AnalysisExtensions {
         if self
             .hydrated_sources
             .get(file)
-            .is_some_and(|hydrated| Some(hydrated) != stamp.as_ref())
+            .is_some_and(|hydrated| Some(&hydrated.stamp) != stamp.as_ref()
+                || self.library_sources.get(file).is_none_or(|(_,selected)|selected.as_ref()!=hydrated.source.as_ref()))
         {
             self.forget_hydrated_source(file);
         }
@@ -1202,8 +1472,10 @@ impl AnalysisExtensions {
                     },
                 );
             }
-            self.hydrated_sources
-                .insert(file.clone(), source.request.stamp);
+            self.hydrated_sources.insert(file.clone(), HydratedSource {
+                stamp:source.request.stamp, revision:0, source:source.request.source,
+                retired:Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
             accepted.push((file.clone(),retain_namespace));
         }
         if accepted.is_empty() {
