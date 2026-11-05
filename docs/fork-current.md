@@ -7,8 +7,8 @@ Library-source preparation105 passes its focused guards and real-archive proof
 comparison; its consumer failure and subsequent106 repair are recorded separately.
 Indexed library-body retention106, public code7327a04, passes its92 related native
 checks; the actual MC106 consumer run fails its definition command at the child deadline.
-Equivalent-input proof sharing107 passes13 hydration checks; its consumer deadline
-result remains unverified.
+Equivalent-input proof sharing107 passes13 hydration checks. Its consumer run
+returns a valid response without a deadline failure, but exact definition remains empty.
 The agreed [MC responsibility boundary](architecture/extension-ipc.md#current-mc-dev-responsibility-boundary)
 keeps MC source-syntax projection and host-authoritative semantic facts in the mixed
 pipeline. This Kotlin connection needs no new host API; separately demonstrated
@@ -219,7 +219,19 @@ The sealed host is25,459,200 bytes, SHA-256
 `c926f65583b9fb81ea6ee25ab419d55c5090ae2173f039aa961b5a8bea75a09c`;
 init6528 is unchanged and416 source guards stayed stable during checks/build.
 Actual106 group counts were not recorded, and no deadline repair or MC acceptance
-is claimed from this change. No additional MC run was made for these checks.
+is claimed from these native checks. No additional MC run was made for these checks.
+
+The later single MC107 run with fixed MC25c completed in48.7 seconds, without
+timeout and with clean shutdown. Nine of ten original Java assertions pass;
+`useItemOn` definition remains empty with `INCOMPLETE_PROJECT_CONTEXT`, reporting
+incomplete current source methods for `DrillBlock`. Eval27 reaches `sourceLocation`
+and validates its response, but the exact member/location Found DTO is unobserved.
+Evidence: MC `build/rust-test-logs/java-host107-native-20261105/recovery-and-run-receipt.json`.
+MC is checking its blanket method-coverage precondition. The existing host
+[positive-location contract](architecture/extension-ipc.md#exact-source-locations-source-locations-v1)
+does not require complete owner-wide coverage for a known exact member; missing,
+ambiguous or edited inputs retain their guards. No host feature request follows
+from this error alone, and no additional Java run has been made during triage.
 
 The additional repository is Square Wire revision
 `9a3bce4a6055515b17bb781618409f7703e516ce`. External preparation of its disposable

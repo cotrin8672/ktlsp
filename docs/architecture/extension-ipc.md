@@ -240,8 +240,9 @@ match the captured stamp. Real staged index changes are still flushed first;
 unanchored admission and edits retain their ordinary invalidation behavior. Namespace coverage
 Unknown alone never grants a guessed file read. No source-inventory capability is
 needed for this shared semantic hydration.
-Requests sharing the same accepted library archive handle reuse class selection
-within one preparation batch. Content/currentness and per-class identity checks
+Requests with fully equal accepted library inputs reuse class selection within
+one preparation batch, including separately allocated handles. Archive, destination,
+fingerprint, binary content, origin and text policy must all match. Content/currentness and per-class identity checks
 remain; no proof is cached across batches or promoted to authored source authority.
 
 Found is a single exact normalized source definition:
@@ -257,6 +258,13 @@ absolute source file URI, not a filesystem write grant. Private members and
 overloads retain their exact issued declaration/signature correspondence; no
 same-name search, source reparsing, bytecode-line guessing or child LSP proxy is
 performed. Normalized JVM projections retain their actual source definition.
+
+A known member's location does not require complete owner-wide method coverage.
+The issued member must occur exactly once in the current owner's candidates and
+retain its exact source correspondence. Unknown coverage cannot prove absence;
+an unresolved competing signature still prevents an exact requirement binding.
+This distinction applies to retained dependency sources as well as workspace sources
+and does not authorize binary fallback after a workspace edit or deletion.
 
 Binary-only/non-source inputs, unavailable source bodies, ambiguous correspondence
 and unrepresentable source URIs remain typed Unknown; no successful empty
