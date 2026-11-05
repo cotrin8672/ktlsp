@@ -13,10 +13,19 @@ buffer. Its exact before/after output compiles with `javac --release 8` and retu
 the same integer-overflow result; separately instrumented copies evaluate the
 expression once. Evidence: `java-extract109/{main-ready,editor-control/receipt,
 javac-oracle/receipt}.json` and `editor/artifacts/java-extract-local.json`.
-The complete Java scenario remains failed:420 assertions passed, but the earlier
+The original Java109 scenario remains failed:420 assertions passed, but the earlier
 `workspace/symbol finds Helper` request returned empty before local project scanning
-finished. This startup race is being investigated separately; the successful extract
-checks do not turn that scenario or the original MC consumer into a passing result.
+finished. Fix110 waits for the first successful local source publication, using the
+existing refresh notification. It does not wait for dependency indexing, and an
+already published local view stays immediately searchable during later refreshes.
+Three focused Rust regressions pass, covering first/warm requests, obsolete and
+cancelled publication, empty scans, failure and shutdown. A reduced copy of the
+original editor driver repeats only the failed query: its first request finds Helper,
+with JDK selection still unfinished. Main/Helper fixtures match the original harness
+generator, no index wait or retry was added, and shutdown and source guards pass.
+Evidence: `java-symbol110/{receipt,editor-control/receipt}.json`. The original109
+failure is retained; its420 successful assertions and the extract tests were not
+rerun. This focused repair does not claim a new full-scenario or original MC pass.
 
 Updated 2026-11-05 (Asia/Tokyo). **Selected Wire editing and Java/Kotlin diagnostic cases pass. Discovered Rust regressions are fixed and remaining workspace targets checked. Original CEM first completion and the85-member comparison also pass.**
 Java reference erasure through the existing extension API is verified on103;

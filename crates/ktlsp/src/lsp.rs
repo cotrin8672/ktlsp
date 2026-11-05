@@ -39,11 +39,31 @@ struct RefreshState {
     requested: u64,
     active_generation: Option<u64>,
     settled: Option<(u64, bool)>,
+    local_snapshot: Option<u64>,
     completion: Arc<tokio::sync::Notify>,
     running: bool,
     force: bool,
     stopped: bool,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn publish_local_snapshot(
+    refresh: &Mutex<RefreshState>,
+    ws: &Mutex<Workspace>,
+    generation: u64,
+) -> bool {
+    let mut state = refresh.lock();
+    if state.stopped
+        || state.requested != generation
+        || state.active_generation != Some(generation)
+        || state.cancelled.load(std::sync::atomic::Ordering::Acquire)
+        || !ws.lock().is_current_generation(generation)
+    {
+        return false;
+    }
+    state.local_snapshot = Some(generation);
+    state.completion.notify_waiters();
+    true
 }
 
 #[derive(Default)]
@@ -160,6 +180,34 @@ impl Backend {
             compile_watch: Arc::new(Mutex::new(None)),
             kotlin_diagnostics: Arc::new(Mutex::new(KotlinDiagnosticState::default())),
             jdk_source_seeds: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn await_initial_local_snapshot(&self) -> Result<()> {
+        if self.root.lock().is_none() {
+            return Ok(());
+        }
+        let completion = self.refresh.lock().completion.clone();
+        loop {
+            let notified = completion.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.refresh.lock();
+                if state.stopped {
+                    return Err(tower_lsp_server::jsonrpc::Error::request_cancelled());
+                }
+                // Published local symbols stay searchable throughout later refreshes.
+                if state.local_snapshot.is_some() {
+                    return Ok(());
+                }
+                if state.cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || (!state.running && state.settled.is_some())
+                {
+                    return Err(tower_lsp_server::jsonrpc::Error::request_cancelled());
+                }
+            }
+            notified.await;
         }
     }
 
@@ -349,6 +397,7 @@ impl Backend {
                     generation,
                     force,
                     watches.clone(),
+                    state.clone(),
                     cancelled,
                     compiler_workers.clone(),
                     compiler_state.clone(),
@@ -1941,6 +1990,7 @@ async fn index_workspace(
     generation: u64,
     force: bool,
     watches: Arc<Mutex<WatchState>>,
+    refresh: Arc<Mutex<RefreshState>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     compiler_workers: Arc<tokio::sync::Semaphore>,
     compiler_state: Arc<Mutex<KotlinDiagnosticState>>,
@@ -2171,6 +2221,12 @@ async fn index_workspace(
             }
             return;
         };
+        if !publish_local_snapshot(&refresh, &ws, generation) {
+            if let Some(p) = ongoing {
+                p.finish_with_message("superseded by project changes").await;
+            }
+            return;
+        }
         if model
             .modules
             .iter()
@@ -2205,16 +2261,28 @@ async fn index_workspace(
         );
         count
     } else {
-        tokio::task::spawn_blocking(move || {
+        let scan = tokio::task::spawn_blocking(move || {
             let mut guard = scan_ws.lock();
             if guard.is_current_generation(generation) {
-                guard.scan(&scan_root)
+                Some(guard.scan(&scan_root))
             } else {
-                0
+                None
             }
         })
-        .await
-        .unwrap_or(0)
+        .await;
+        let Ok(Some(count)) = scan else {
+            if let Some(p) = ongoing {
+                p.finish_with_message("project source refresh failed").await;
+            }
+            return;
+        };
+        if !publish_local_snapshot(&refresh, &ws, generation) {
+            if let Some(p) = ongoing {
+                p.finish_with_message("superseded by project changes").await;
+            }
+            return;
+        }
+        count
     };
     if !ws.lock().is_current_generation(generation) {
         if let Some(p) = ongoing {
@@ -4735,6 +4803,7 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         let start = std::time::Instant::now();
+        self.await_initial_local_snapshot().await?;
         let items = {
             let ws = self.ws.lock();
             ws.workspace_symbols(&params.query)
@@ -10250,6 +10319,207 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             kotlin_entries
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_initial_snapshot_then_warm_refresh_does_not_wait_for_dependencies() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let root = std::env::temp_dir().join(format!("ktlsp_symbol_bootstrap_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Helper.java"), "package app; public class Helper {}").unwrap();
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        *backend.root.lock() = Some(root.clone());
+        let generation = backend.ws.lock().begin_analysis_generation();
+        {
+            let mut state = backend.refresh.lock();
+            state.requested = generation;
+            state.active_generation = Some(generation);
+            state.running = true;
+        }
+        let params = WorkspaceSymbolParams {
+            query: "Helper".into(),
+            ..Default::default()
+        };
+        let mut response = Box::pin(backend.symbol(params.clone()));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(backend.ws.lock().scan(&root), 1);
+        assert!(publish_local_snapshot(
+            &backend.refresh,
+            &backend.ws,
+            generation
+        ));
+        let WorkspaceSymbolResponse::Flat(symbols) = response.await.unwrap().unwrap() else {
+            panic!("expected materialized symbols");
+        };
+        assert!(symbols.iter().any(|symbol| symbol.name == "Helper"
+            && symbol.location.uri == Uri::from_file_path(root.join("Helper.java")).unwrap()));
+        {
+            let mut state = backend.refresh.lock();
+            assert!(state.running, "dependency work has not finished");
+            assert!(state.settled.is_none());
+            state.requested = backend.ws.lock().begin_analysis_generation();
+            state.active_generation = Some(state.requested);
+            assert_eq!(state.local_snapshot, Some(generation));
+        }
+        let mut warm = Box::pin(backend.symbol(params));
+        let ready = std::future::poll_fn(|cx| Poll::Ready(warm.as_mut().poll(cx))).await;
+        let Poll::Ready(Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))) = ready else {
+            panic!("published symbols must remain immediately searchable during refresh");
+        };
+        assert!(symbols.iter().any(|symbol| symbol.name == "Helper"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_initial_snapshot_rejects_obsolete_or_cancelled_publication() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+        drop(socket);
+        let backend = service.inner();
+        let root = std::env::temp_dir().join("ktlsp_symbol_superseded");
+        *backend.root.lock() = Some(root.clone());
+        let generation = backend.ws.lock().begin_analysis_generation();
+        {
+            let mut state = backend.refresh.lock();
+            state.requested = generation;
+            state.active_generation = Some(generation);
+            state.running = true;
+        }
+        let mut response = Box::pin(backend.symbol(WorkspaceSymbolParams {
+            query: "Helper".into(),
+            ..Default::default()
+        }));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let current = backend.ws.lock().begin_analysis_generation();
+        assert!(!publish_local_snapshot(
+            &backend.refresh,
+            &backend.ws,
+            generation
+        ));
+        {
+            let mut state = backend.refresh.lock();
+            state.requested = current;
+            state.active_generation = Some(current);
+        }
+        assert!(!publish_local_snapshot(
+            &backend.refresh,
+            &backend.ws,
+            generation
+        ));
+        backend.refresh.lock().completion.notify_waiters();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        {
+            let state = backend.refresh.lock();
+            state
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        assert!(!publish_local_snapshot(&backend.refresh, &backend.ws, current));
+        assert!(backend.refresh.lock().local_snapshot.is_none());
+        // A replacement producer, not the cancelled one, may publish the first snapshot.
+        {
+            let mut state = backend.refresh.lock();
+            state.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            state.requested = backend.ws.lock().begin_analysis_generation();
+            state.active_generation = Some(state.requested);
+        }
+        let current = backend.refresh.lock().requested;
+        backend.ws.lock().open(
+            crate::paths::file_key(&root.join("Helper.java")),
+            "class Helper {}".into(),
+        );
+        assert!(publish_local_snapshot(&backend.refresh, &backend.ws, current));
+        let WorkspaceSymbolResponse::Flat(symbols) = response.await.unwrap().unwrap() else {
+            panic!("expected materialized symbols");
+        };
+        assert!(symbols.iter().any(|symbol| symbol.name == "Helper"));
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_initial_snapshot_empty_failed_and_stopped_boundaries() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        for event in ["empty", "failed", "stopped"] {
+            let root = std::env::temp_dir().join(format!(
+                "ktlsp_symbol_bootstrap_{event}_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let (service, socket) = tower_lsp_server::LspService::new(Backend::new);
+            drop(socket);
+            let backend = service.inner();
+            *backend.root.lock() = Some(root.clone());
+            let generation = backend.ws.lock().begin_analysis_generation();
+            {
+                let mut state = backend.refresh.lock();
+                state.requested = generation;
+                state.active_generation = Some(generation);
+                state.running = true;
+            }
+            let mut response = Box::pin(backend.symbol(WorkspaceSymbolParams {
+                query: "Helper".into(),
+                ..Default::default()
+            }));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            match event {
+                "empty" => {
+                    assert_eq!(backend.ws.lock().scan(&root), 0);
+                    assert!(publish_local_snapshot(
+                        &backend.refresh,
+                        &backend.ws,
+                        generation
+                    ));
+                }
+                "failed" => {
+                    let mut state = backend.refresh.lock();
+                    state.running = false;
+                    state.settled = Some((generation, false));
+                    state.completion.notify_waiters();
+                }
+                _ => {
+                    backend.close_project_refresh();
+                    assert!(!publish_local_snapshot(
+                        &backend.refresh,
+                        &backend.ws,
+                        generation
+                    ));
+                }
+            }
+            let result = response.await;
+            if event == "empty" {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    tower_lsp_server::jsonrpc::Error::request_cancelled()
+                );
+                assert!(backend.refresh.lock().local_snapshot.is_none());
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
