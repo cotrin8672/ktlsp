@@ -484,6 +484,46 @@ do
   end
 end
 
+-- Extract a whole Java return expression in a new unsaved file, through native edits.
+do
+  local path = project .. "/app/KtlspExtractLocalProbe.java"
+  local buffer = vim.fn.bufadd(path)
+  vim.fn.bufload(buffer)
+  vim.bo[buffer].filetype = "java"
+  local before = { "package app;", "class KtlspExtractLocalProbe {", "    long sum(int left, int right) {",
+    "        return left + right;", "    }", "}" }
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, before)
+  vim.lsp.buf_attach_client(buffer, id)
+  require("vim.lsp._changetracking").flush(client)
+  local document = { uri = vim.uri_from_bufnr(buffer) }
+  request_rpc("textDocument/documentSymbol", { textDocument = document }, buffer)
+  local _, range = probe.find(before, "return left + right;", "left + right")
+  local response, observation = request_rpc("textDocument/codeAction", {
+    textDocument = document, range = range, context = { diagnostics = {}, only = { "refactor.extract" } },
+  }, buffer)
+  local action
+  for _, candidate in ipairs(type(response and response.result) == "table" and response.result or {}) do
+    if candidate.title == "Extract to local variable" and candidate.kind == "refactor.extract"
+      and type(candidate.edit) == "table" and (candidate.command == nil or candidate.command == vim.NIL) then action = candidate; break end
+  end
+  check("Java extract local returns native refactor.extract edit", action ~= nil, vim.inspect(response), observation)
+  local applied, message = false, "extract action unavailable"
+  if action then
+    applied, message = pcall(vim.lsp.util.apply_workspace_edit, action.edit, client.offset_encoding)
+    applied = applied and message ~= false
+  end
+  local after = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+  local expected = { "package app;", "class KtlspExtractLocalProbe {", "    long sum(int left, int right) {",
+    "        long extracted = left + right;", "        return extracted;", "    }", "}" }
+  check("Java extract local applies assignment and return", applied and vim.deep_equal(after, expected), vim.inspect(after))
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode({ before = before, after = after, response = response, applied = applied }) },
+      arg[3] .. "/java-extract-local.json")
+  end
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
 -- Implementation should use Java extends/implements edges.
 do
   local l, c = find("Worker worker", "Worker")

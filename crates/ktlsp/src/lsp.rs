@@ -3570,6 +3570,7 @@ impl LanguageServer for Backend {
                     CodeActionOptions {
                         code_action_kinds: Some(vec![
                             CodeActionKind::QUICKFIX,
+                            CodeActionKind::REFACTOR_EXTRACT,
                             CodeActionKind::REFACTOR_REWRITE,
                             CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                             CodeActionKind::SOURCE_FIX_ALL,
@@ -5209,6 +5210,7 @@ fn action_kind_allowed(
 fn action_kind_str(kind: crate::actions::ActionKind) -> &'static str {
     match kind {
         crate::actions::ActionKind::QuickFix => "quickfix",
+        crate::actions::ActionKind::RefactorExtract => "refactor.extract",
         crate::actions::ActionKind::RefactorRewrite => "refactor.rewrite",
         crate::actions::ActionKind::SourceOrganizeImports => "source.organizeImports",
         crate::actions::ActionKind::SourceFixAllKtlsp => "source.fixAll.ktlsp",
@@ -5234,6 +5236,7 @@ fn to_lsp_code_action(
 fn to_lsp_code_action_kind(kind: crate::actions::ActionKind) -> CodeActionKind {
     match kind {
         crate::actions::ActionKind::QuickFix => CodeActionKind::QUICKFIX,
+        crate::actions::ActionKind::RefactorExtract => CodeActionKind::REFACTOR_EXTRACT,
         crate::actions::ActionKind::RefactorRewrite => CodeActionKind::REFACTOR_REWRITE,
         crate::actions::ActionKind::SourceOrganizeImports => {
             CodeActionKind::SOURCE_ORGANIZE_IMPORTS

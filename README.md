@@ -232,6 +232,12 @@ The `java` scenario also records first-response completion for unfinished plain
 and qualified Java/Kotlin annotation names. It checks unknown-package and
 ordinary-class exclusions, exact unsaved document delivery, and buffer/disk
 restoration; raw requests are retained in `annotation-snapshots.json`.
+`dev/ktlsp-harness.sh java` also applies the native `refactor.extract` WorkspaceEdit
+for a whole Java return expression in a new unsaved file, recording the resulting
+assignment and return in `java-extract-local.json`. This first extract-local slice
+uses the method's declared return type; partial expressions, lambda returns,
+unbraced returns, local type declarations, trailing return dimensions and Java
+Unicode escapes are excluded.
 The library scenario also compiles a plain Java owner/caller pair and checks six
 first diagnostic pulls through unsaved edits in both buffers. It covers exact overload
 error ranges, valid Object/generic/varargs calls, delivery identity and restoration.

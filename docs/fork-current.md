@@ -1,5 +1,23 @@
 # Current fork state
 
+Java extract-local109 passes the seven focused refactor tests and actual Neovim
+edit application. Standard `textDocument/codeAction` offers `Extract to local variable`
+with native `refactor.extract` edits for an exact whole return expression directly in
+a block. The local uses the declared method return type and stays at the return site;
+names avoid method identifiers, and comments/Unicode/CRLF indentation are preserved.
+Partial/invalid selections, lambda returns, unbraced returns, void/constructors,
+local type declarations, trailing return dimensions and Java Unicode escapes are
+rejected. Known dependency and generated readonly sources receive no extract edit.
+The existing `java` harness applies and inspects the WorkspaceEdit in a new unsaved
+buffer. Its exact before/after output compiles with `javac --release 8` and returns
+the same integer-overflow result; separately instrumented copies evaluate the
+expression once. Evidence: `java-extract109/{main-ready,editor-control/receipt,
+javac-oracle/receipt}.json` and `editor/artifacts/java-extract-local.json`.
+The complete Java scenario remains failed:420 assertions passed, but the earlier
+`workspace/symbol finds Helper` request returned empty before local project scanning
+finished. This startup race is being investigated separately; the successful extract
+checks do not turn that scenario or the original MC consumer into a passing result.
+
 Updated 2026-11-05 (Asia/Tokyo). **Selected Wire editing and Java/Kotlin diagnostic cases pass. Discovered Rust regressions are fixed and remaining workspace targets checked. Original CEM first completion and the85-member comparison also pass.**
 Java reference erasure through the existing extension API is verified on103;
 its related native/editor evidence is separate from the earlier broad workspace run.

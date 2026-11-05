@@ -4178,6 +4178,19 @@ impl Workspace {
             );
             let mut out =
                 java::unused_import_actions(key, text, tree, &diagnostics, range_start, range_end);
+            let read_only = self.index.file_origin(key).is_some_and(|origin| {
+                origin.representation != crate::project_model::SourceRepresentation::Source
+                    || origin.project_scope.is_none()
+            }) || self.project_model.as_ref().is_some_and(|model| {
+                model.extension_source_editable(Path::new(key), Path::new(key)) == Some(false)
+            });
+            if !read_only {
+                if let Some(action) =
+                    crate::refactor::java_extract_local(key, text, tree, range_start, range_end)
+                {
+                    out.push(action);
+                }
+            }
             if let Some(action) =
                 self.interface_implementation_action(key, text, tree, cursor_offset)
             {

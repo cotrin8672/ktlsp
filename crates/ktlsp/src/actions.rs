@@ -9,6 +9,7 @@ use crate::imports::{self, ImportLine, ImportStyle};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionKind {
     QuickFix,
+    RefactorExtract,
     RefactorRewrite,
     SourceOrganizeImports,
     SourceFixAllKtlsp,

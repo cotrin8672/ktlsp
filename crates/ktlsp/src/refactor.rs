@@ -6,6 +6,125 @@ use crate::actions::{Action, ActionKind};
 use crate::edit::TextEdit;
 use crate::parser::node_text;
 
+/// Keep evaluation and assignment conversion at the original return site and target type.
+// shortcut: whole block-return expressions only; other selections need safe type and hoist analysis.
+pub(crate) fn java_extract_local(
+    file: &str,
+    text: &str,
+    tree: &Tree,
+    start: usize,
+    end: usize,
+) -> Option<Action> {
+    if start >= end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+        || tree.root_node().has_error()
+    {
+        return None;
+    }
+    let expression = tree
+        .root_node()
+        .named_descendant_for_byte_range(start, end)?;
+    if expression.byte_range() != (start..end) {
+        return None;
+    }
+    let statement = expression.parent()?;
+    if statement.kind() != "return_statement" || statement.parent()?.kind() != "block" {
+        return None;
+    }
+    let mut cursor = statement.walk();
+    let mut values = statement
+        .named_children(&mut cursor)
+        .filter(|node| !matches!(node.kind(), "line_comment" | "block_comment"));
+    if values.next()? != expression || values.next().is_some() {
+        return None;
+    }
+    let mut method = statement.parent()?;
+    loop {
+        match method.kind() {
+            "method_declaration" => break,
+            "lambda_expression"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "class_body" => return None,
+            _ => method = method.parent()?,
+        }
+    }
+    // Java preprocesses Unicode escapes even in comments, before lexical scope is known.
+    if node_text(method, text).contains("\\u") {
+        return None;
+    }
+    // Old-style trailing return dimensions need separate placement of type annotations.
+    if method.child_by_field_name("dimensions").is_some() {
+        return None;
+    }
+    let ty = node_text(method.child_by_field_name("type")?, text);
+    if matches!(ty, "void" | "var") {
+        return None;
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut nodes = vec![method];
+    while let Some(node) = nodes.pop() {
+        // A body-local type can rebind the declaration's return type at the insertion site.
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            return None;
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            let name = node_text(node, text);
+            names.insert(name);
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    let mut name = "extracted".to_owned();
+    let mut suffix = 0;
+    while names.contains(name.as_str()) {
+        suffix += 1;
+        name = format!("extracted{suffix}");
+    }
+    let line_start = text[..statement.start_byte()]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let indent = &text[line_start..statement.start_byte()];
+    let separator = if indent.chars().all(|ch| matches!(ch, ' ' | '\t')) {
+        let newline = text[statement.start_byte()..]
+            .find('\n')
+            .map(|offset| statement.start_byte() + offset)
+            .or_else(|| text[..statement.start_byte()].rfind('\n'));
+        let eol =
+            if newline.is_some_and(|offset| offset > 0 && text.as_bytes()[offset - 1] == b'\r') {
+                "\r\n"
+            } else {
+                "\n"
+            };
+        format!("{eol}{indent}")
+    } else {
+        " ".into()
+    };
+    Some(Action {
+        title: "Extract to local variable".into(),
+        kind: ActionKind::RefactorExtract,
+        edits: vec![
+            TextEdit::new(
+                file,
+                statement.start_byte(),
+                statement.start_byte(),
+                format!("{ty} {name} = {};{separator}", node_text(expression, text)),
+            ),
+            TextEdit::new(file, start, end, name),
+        ],
+        is_preferred: false,
+    })
+}
+
 /// A cursor directly in a current, top-level concrete class body. Keep method bodies, interfaces,
 /// nested/local declarations and parse-broken source out of this first implementation slice.
 pub(crate) fn implementation_class<'t>(
