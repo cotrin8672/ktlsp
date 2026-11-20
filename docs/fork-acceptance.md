@@ -6104,3 +6104,11 @@ dispatch. The late-registration regression and dependency enum refresh both
 pass, as does the release build. Real Neovim basic passes all nine assertions;
 its existing script force-stops the server. Extension-enabled Sodium does not
 take the new fast path, and an end-to-end startup speedup remains unmeasured.
+
+The extension scheduler now selects queued open documents first when a provider
+is idle. Closed documents retain their relative order. This gives an open
+`GuiMixin.java` priority over queued background owners once the worker is free.
+Existing snapshot checks, running evaluations, and suspension stay in force.
+The 16 focused IPC tests pass, including a rejected open owner followed by a
+valid open owner and the original closed-owner order. The Sodium Neovim outcome
+with the new ordering still requires the original consumer run.

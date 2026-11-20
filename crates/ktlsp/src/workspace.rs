@@ -936,9 +936,11 @@ impl Workspace {
         self.analysis_extensions.refresh_host_inputs();
         if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
         let revision = self.analysis_extensions.revision();
+        let mut open_owners: Vec<_> = self.open_docs.keys().map(String::as_str).collect();
+        open_owners.sort_unstable();
         let work = self
             .analysis_extensions
-            .take_ipc_work(&self.index, self.project_model.as_ref());
+            .take_ipc_work(&self.index, self.project_model.as_ref(), &open_owners);
         if self.analysis_extensions.revision() != revision {
             self.bump_index_revision();
         }

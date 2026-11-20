@@ -56,7 +56,7 @@ mod tests {
         let model = Arc::new(ProjectSnapshot::new(crate::classpath::parse_dump(
             "PROJECT\t:selected\t/project\nSOURCE\tcustom\t/ipc\nSCP\tcustom\t/library.jar\nEND\t:selected\n",
         )));
-        let work = host.take_ipc_work(&index, Some(&model)).remove(0);
+        let work = host.take_ipc_work(&index, Some(&model), &[]).remove(0);
         assert!(Arc::ptr_eq(
             host.ipc_evaluations[&work.evaluation]
                 .project
@@ -100,7 +100,7 @@ mod tests {
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_completion_pending("/ipc/Target.kt"));
         assert!(!host.ipc_completion_pending("/ipc/Missing.kt"));
-        let work = host.take_ipc_work(&index, None).remove(0);
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
         assert_eq!(work.params["owner"], "/ipc/Owner.kt");
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         host.ipc_batch(
@@ -113,7 +113,7 @@ mod tests {
         assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_completion_pending("/ipc/Target.kt"));
         host.finish_ipc_work(work.evaluation, Ok(()));
-        let other = host.take_ipc_work(&index, None).remove(0);
+        let other = host.take_ipc_work(&index, None, &[]).remove(0);
         assert_eq!(other.params["owner"], "/ipc/Target.kt");
         assert!(host.ipc_completion_pending("/ipc/Target.kt"));
         assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
@@ -128,14 +128,58 @@ mod tests {
         host.store.remove_source("/ipc/Owner.kt");
         assert!(host.store.begin(&index, "test.ipc", "/ipc/Owner.kt").is_err());
 
-        let work = host.take_ipc_work(&index, None);
+        let work = host.take_ipc_work(&index, None, &[]);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].params["owner"], "/ipc/Target.kt");
         assert!(host.ipc_providers["test.ipc"].queued.is_empty());
         assert!(host.ipc_providers["test.ipc"].running);
         assert!(host.ipc_providers["test.ipc"].enabled);
         assert_eq!(host.ipc_evaluations.len(), 1);
-        assert!(host.take_ipc_work(&index, None).is_empty());
+        assert!(host.take_ipc_work(&index, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn open_owners_precede_closed_work_without_bypassing_queue_guards() {
+        let (mut index, mut host) = host();
+        let closed = "/ipc/AClosed.kt";
+        let text = "package ipc\nclass AClosed";
+        let tree = KotlinParser::new().parse(text);
+        index.replace_file(
+            closed,
+            ktcore::indexer::extract_symbols(&tree, text, "ipc"),
+            Tier::Volatile,
+        );
+        host.replace_sources(&index, vec![(closed.into(), Arc::from(text), tree)]);
+        let missing = "/ipc/0Missing.kt";
+        host.ipc_providers
+            .get_mut("test.ipc")
+            .unwrap()
+            .queued
+            .insert(missing.into());
+        let open = [missing, "/ipc/Target.kt"];
+        let queued = host.ipc_providers["test.ipc"].queued.clone();
+
+        host.suspended = true;
+        assert!(host.take_ipc_work(&index, None, &open).is_empty());
+        assert_eq!(host.ipc_providers["test.ipc"].queued, queued);
+        host.suspended = false;
+
+        let work = host.take_ipc_work(&index, None, &open).remove(0);
+        assert_eq!(work.params["owner"], "/ipc/Target.kt");
+        assert!(!host.ipc_providers["test.ipc"].queued.contains(missing));
+        assert!(host.ipc_current(work.evaluation));
+        let closed_tail = BTreeSet::from([closed.into(), "/ipc/Owner.kt".into()]);
+        assert_eq!(host.ipc_providers["test.ipc"].queued, closed_tail);
+        assert!(host.take_ipc_work(&index, None, &open).is_empty());
+        assert_eq!(host.ipc_providers["test.ipc"].queued, closed_tail);
+        host.finish_ipc_work(work.evaluation, Ok(()));
+
+        for owner in [closed, "/ipc/Owner.kt"] {
+            let work = host.take_ipc_work(&index, None, &open).remove(0);
+            assert_eq!(work.params["owner"], owner);
+            host.finish_ipc_work(work.evaluation, Ok(()));
+        }
+        assert!(host.ipc_providers["test.ipc"].queued.is_empty());
     }
 
     #[test]
@@ -151,7 +195,7 @@ mod tests {
         assert!(evaluation.source(&mut read).is_err());
         drop(read);
 
-        assert!(host.take_ipc_work(&index, None).is_empty());
+        assert!(host.take_ipc_work(&index, None, &[]).is_empty());
         assert!(host.ipc_providers["test.ipc"].queued.is_empty());
         assert!(!host.ipc_providers["test.ipc"].running);
         assert!(host.ipc_providers["test.ipc"].enabled);
@@ -163,7 +207,7 @@ mod tests {
     #[test]
     fn stale_evaluation_is_not_pending_until_fresh_work_is_queued() {
         let (index, mut host) = host();
-        let work = host.take_ipc_work(&index, None).remove(0);
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         host.store.invalidate_model();
         assert!(!host.ipc_current(work.evaluation));
@@ -184,7 +228,7 @@ mod tests {
             Tier::Volatile,
         );
         host.replace_sources(&index, vec![(file.into(), Arc::from(text), tree)]);
-        let work = host.take_ipc_work(&index, None).remove(0);
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
         assert_eq!(work.params["source"], text);
         host.publish(&mut index);
         assert!(host.ipc_publication(work.evaluation).is_none());
@@ -240,7 +284,7 @@ mod tests {
     #[test]
     fn replacement_retracts_a_previously_published_evaluation() {
         let (mut index, mut host) = host();
-        let work = host.take_ipc_work(&index, None).remove(0);
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
         host.ipc_batch(
             &index,
             work.evaluation,
@@ -261,7 +305,7 @@ mod tests {
     #[test]
     fn late_old_failure_cannot_disable_or_clear_replacement_success() {
         let (mut index, mut host) = host();
-        let old = host.take_ipc_work(&index, None).remove(0);
+        let old = host.take_ipc_work(&index, None, &[]).remove(0);
         host.register_ipc(&index, "test.ipc", vec!["replacement-child".into()])
             .unwrap();
         assert!(host
@@ -273,12 +317,12 @@ mod tests {
             )
             .is_err());
         assert!(host.ipc_publication(old.evaluation).is_none());
-        let fresh = host.take_ipc_work(&index, None).remove(0);
+        let fresh = host.take_ipc_work(&index, None, &[]).remove(0);
         host.ipc_batch(&index,fresh.evaluation,"analysis/finish",json!({"evaluation":fresh.evaluation.to_string(),"contributions":{"sites":[],"diagnostics":[]}})).unwrap();
         host.publish(&mut index);
         assert!(host.ipc_publication(fresh.evaluation).is_some());
         host.finish_ipc_work(fresh.evaluation, Ok(()));
-        let _next = host.take_ipc_work(&index, None).remove(0);
+        let _next = host.take_ipc_work(&index, None, &[]).remove(0);
         let instance = host.ipc_providers["test.ipc"].worker.id;
         assert!(host.ipc_providers["test.ipc"].running);
         assert!(host.ipc_publication(old.evaluation).is_none());
@@ -299,7 +343,7 @@ mod tests {
     #[test]
     fn foreign_token_poison_prevents_partial_publication() {
         let (index, mut host) = host();
-        let work = host.take_ipc_work(&index, None).remove(0);
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
         assert!(host.ipc_completion_pending("/ipc/Owner.kt"));
         assert!(host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"declaredMembers","target":"foreign:0"}]})).is_err());
         assert!(!host.ipc_completion_pending("/ipc/Owner.kt"));
@@ -375,7 +419,7 @@ mod tests {
             ktcore::indexer::extract_symbols(&tree, text, "ipc"),
             Tier::Volatile,
         );
-        let work = host.take_ipc_work(&index, None).remove(0);
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
         let result=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({"evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Unopened"}]})).unwrap();
         assert_eq!(result["facts"][0]["state"], "unknown");
         assert!(host.wanted_ipc_sources().contains(file));
@@ -408,7 +452,7 @@ mod tests {
     fn missing_source_namespace_coverage_does_not_request_a_guessed_project_file() {
         let (index,mut host)=host();
         host.store.set_namespace_coverage(Knowledge::Unknown(vec![IncompleteReason::MissingSource]));
-        let work=host.take_ipc_work(&index,None).remove(0);
+        let work=host.take_ipc_work(&index,None,&[]).remove(0);
         let result=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",json!({
             "evaluation":work.evaluation.to_string(),"queries":[{"op":"resolveType","name":"ipc.Absent"}]
         })).unwrap();
@@ -596,6 +640,7 @@ impl AnalysisExtensions {
         &mut self,
         index: &dyn InferenceIndex,
         project: Option<&Arc<ProjectSnapshot>>,
+        open_owners: &[&str],
     ) -> Vec<Work> {
         self.refresh_host_inputs();
         let dead: Vec<_> = self
@@ -634,7 +679,12 @@ impl AnalysisExtensions {
             if !slot.enabled || slot.running {
                 continue;
             }
-            while let Some(owner) = slot.queued.pop_first() {
+            // Open documents have strict priority; closed owners retain their queued order.
+            let mut preferred = open_owners.iter();
+            while let Some(owner) = preferred
+                .find_map(|owner| slot.queued.take(*owner))
+                .or_else(|| slot.queued.pop_first())
+            {
                 let worker = slot.worker.clone();
                 let mut evaluation = Evaluation::new(provider.clone(), owner.clone(), worker.id);
                 let Ok(mut read) = self.store.begin(index, &provider, &owner) else {

@@ -2535,7 +2535,7 @@ mod source_snapshot_tests {
         index.set_file_origin(file,FileOrigin { origin_id:"module".into(),representation:SourceRepresentation::Source,
             project_scope:Some(ProjectScope { module:"module".into(),source_set:"main".into() }) });
         host.replace_sources(&index,vec![(file.into(),text.clone(),tree)]);
-        let work=host.take_ipc_work(&index,None).remove(0);
+        let work=host.take_ipc_work(&index,None,&[]).remove(0);
         work.worker.project_operations.store(SOURCE_INVENTORY|SOURCE_SNAPSHOT,Ordering::Release);
         let id=work.evaluation.to_string();
         let inventory=host.ipc_batch(&index,work.evaluation,"analysis/readFacts",
@@ -3861,7 +3861,7 @@ mod root_file_wire_tests {
         let tree=KotlinParser::new().parse(text);
         index.replace_file(owner,indexer::extract_symbols(&tree,text,"retry"),Tier::Volatile);
         host.replace_sources(&index,vec![(owner.into(),Arc::from(text),tree)]);
-        let work=host.take_ipc_work(&index,None).pop().unwrap();let instance=work.worker.id;
+        let work=host.take_ipc_work(&index,None,&[]).pop().unwrap();let instance=work.worker.id;
         let revision=host.revision();host.fail_ipc_input_read(work.evaluation,"Stale");
         assert!(host.ipc_current(work.evaluation),"failed capture had not attached its stale guard");
         let error=json!({"code":-32801,"message":"Stale"});
@@ -3869,10 +3869,10 @@ mod root_file_wire_tests {
         host.finish_ipc_work(work.evaluation,Err(semantic_response_error(&error,true)));
         assert_eq!(host.revision(),revision,"a failed read must not commit an empty contribution");
         assert!(host.ipc_publication(work.evaluation).is_none());
-        let mut fresh=host.take_ipc_work(&index,None);assert_eq!(fresh.len(),1);
+        let mut fresh=host.take_ipc_work(&index,None,&[]);assert_eq!(fresh.len(),1);
         let fresh=fresh.pop().unwrap();assert_ne!(fresh.evaluation,work.evaluation);
         assert_eq!(fresh.worker.id,instance);assert!(!fresh.worker.failed());
-        assert!(host.take_ipc_work(&index,None).is_empty(),"the existing running gate schedules only one fresh evaluation");
+        assert!(host.take_ipc_work(&index,None,&[]).is_empty(),"the existing running gate schedules only one fresh evaluation");
     }
 
     #[test]
