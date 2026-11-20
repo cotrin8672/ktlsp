@@ -3034,7 +3034,7 @@ fn stage_archive_inputs_with(
         || ws.lock().is_current_generation(generation), &mut accept);
     for key in observed {
         observed_preexisting += usize::from(inputs.contains_key(&key));
-        if let Some(content) = configuration_content(Path::new(&key)) {
+        if let Some(content) = project_input_content(Path::new(&key)) {
             accept(&key, content);
             inputs.insert(key, content);
         }
@@ -3109,7 +3109,15 @@ fn project_input_content(path: &Path) -> Option<[u8; 32]> {
     if path.to_string_lossy().ends_with('/') {
         output_directory_content(path)
     } else if path.is_dir() {
-        None
+        // Selected classpath directories use the bounded class-content digest,
+        // unlike output-directory keys, which record direct child membership.
+        // Keep their domain distinct from files (including an empty file).
+        use sha2::{Digest, Sha256};
+        let content = configuration_content(path)?;
+        let mut hash = Sha256::new();
+        hash.update(b"ktlsp-class-directory\0");
+        hash.update(content);
+        Some(hash.finalize().into())
     } else {
         configuration_content(path)
     }
@@ -3251,7 +3259,7 @@ fn project_archive_contents_with(
         .take_while(|_| current())
         .filter_map(|key| {
             attempted += 1;
-            let content = configuration_content(Path::new(&key))?;
+            let content = project_input_content(Path::new(&key))?;
             fingerprinted(&key, content);
             Some((key, content))
         })
@@ -10555,6 +10563,75 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 matches!(watcher.glob_pattern, GlobPattern::Relative(_)) == relative
             }));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_class_directory_archive_validation_uses_captured_content() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp_class_directory_validation_{}", std::process::id()
+        ));
+        let directory = root.join("classpath");
+        let class = directory.join("fieldfixture/FieldOnly.class");
+        std::fs::create_dir_all(class.parent().unwrap()).unwrap();
+        let original = include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class"
+        );
+        std::fs::write(&class, original).unwrap();
+        let key = crate::paths::file_key(&directory);
+        let model = classpath::ProjectSnapshot::new(classpath::parse_dump(&format!(
+            "PROJECT\t:app\t{}\nSOURCESET\tmain\nSCP\tmain\t{key}\nARTIFACT\tmain\t{key}\tFILE\nEND\t:app\n",
+            root.display()
+        )));
+        assert!(model_archive_origins(&model).contains_key(&key));
+        let captured = project_archive_contents(&root, Some(&model));
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured.get(&key), project_input_content(&directory).as_ref());
+        let validate = |inputs: &HashMap<String, [u8; 32]>| {
+            changed_archive_inputs_while_current(1, inputs, || true, project_input_content)
+                .unwrap()
+        };
+        assert!(validate(&captured).is_empty());
+        assert!(unchanged_file_content(&captured, &key, FileChangeType::CHANGED));
+        assert_eq!(unchanged_file_contents(captured.clone()).await, captured);
+        for kind in [FileChangeType::CREATED, FileChangeType::DELETED] {
+            assert!(!unchanged_file_content(&captured, &key, kind));
+        }
+
+        let mut replacement = original.to_vec();
+        let offset = replacement.windows(5).position(|part| part == b"LABEL").unwrap();
+        replacement[offset..offset + 5].copy_from_slice(b"TITLE");
+        std::fs::write(&class, &replacement).unwrap();
+        assert_eq!(validate(&captured), vec![key.clone()]);
+        assert!(!unchanged_file_content(&captured, &key, FileChangeType::CHANGED));
+        assert!(unchanged_file_contents(captured.clone()).await.is_empty());
+        std::fs::write(&class, original).unwrap();
+        let added = directory.join("Added.class");
+        std::fs::write(&added, original).unwrap();
+        assert_eq!(validate(&captured), vec![key.clone()]);
+        std::fs::remove_file(&added).unwrap();
+        assert!(validate(&captured).is_empty());
+        std::fs::remove_file(&class).unwrap();
+        assert_eq!(validate(&captured), vec![key]);
+
+        // Output-directory keys retain their direct-membership fingerprint.
+        let output_key = format!("{}/", crate::paths::file_key(&directory));
+        let output = Path::new(&output_key);
+        assert_eq!(project_input_content(output), output_directory_content(output));
+        let before = project_input_content(output).unwrap();
+        std::fs::write(directory.join("metadata"), b"metadata").unwrap();
+        assert_ne!(project_input_content(output), Some(before));
+
+        // Even an empty file replaced by an empty directory must invalidate.
+        let file = root.join("selected.jar");
+        std::fs::write(&file, b"").unwrap();
+        let files = HashMap::from([(
+            crate::paths::file_key(&file), project_input_content(&file).unwrap()
+        )]);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert_eq!(validate(&files), vec![crate::paths::file_key(&file)]);
+        assert!(unchanged_file_contents(files).await.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
