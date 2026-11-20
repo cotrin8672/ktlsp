@@ -1574,7 +1574,13 @@ fn call_lambda_parameter_type(
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Option<Type> {
-    let call = lambda.parent()?.parent()?;
+    let parent = lambda.parent()?;
+    let direct_argument = (parent.kind() == "value_argument").then_some(parent);
+    let call = if let Some(argument) = direct_argument {
+        argument.parent()?.parent()?
+    } else {
+        parent.parent()?
+    };
     if call.kind() != "call_expression" {
         return None;
     }
@@ -1582,12 +1588,22 @@ fn call_lambda_parameter_type(
     if callee.kind() == "call_expression" {
         callee = callee.named_child(0)?;
     }
-    // Parameter context uses only the ordinary arguments, avoiding a body -> call -> body cycle.
+    // Skip the lambda being contextualized, avoiding a body -> call -> body cycle.
     let arguments = syntactic_call_arguments(
         call,
         src,
-        synth_arg_types(index, call, src, ctx, depth, child_infer),
+        synth_arg_types_except(index, call, src, ctx, depth, child_infer, Some(lambda)),
     );
+    let direct_position = if let Some(argument) = direct_argument {
+        let values = argument.parent()?;
+        let mut cursor = values.walk();
+        let position = values.named_children(&mut cursor)
+            .filter(|node| node.kind() == "value_argument")
+            .position(|node| node == argument)?;
+        Some(position)
+    } else {
+        None
+    };
     let usage = MemberUse::Call(arguments.clone());
     let (receiver, selection) = match callee.kind() {
         "navigation_expression" => {
@@ -1649,6 +1665,31 @@ fn call_lambda_parameter_type(
     }
     let mut result = None;
     for entry in selection.entries {
+        if let Some(written) = direct_position {
+            // Bind labels/defaults with the existing candidate-specific rules. Only the final
+            // formal has an attested receiver-lambda role; do not guess roles for other slots.
+            if arguments.count.is_none() || arguments.has_spread || entry.sym.has_vararg
+                || entry.sym.arity.map(usize::from) != Some(entry.sym.params.len())
+                || members::bind_arguments_for_lambda_context(index, &receiver, entry, &arguments, ctx)
+                    .is_err()
+            {
+                return Some(Type::Unknown);
+            }
+            let formal = if let Some(label) = arguments.names.as_ref()
+                .and_then(|names| names.get(written)).and_then(Option::as_deref)
+            {
+                entry.sym.kotlin_parameters.as_ref().and_then(|parameters| {
+                    parameters.iter().position(|parameter| parameter.name == label)
+                })
+            } else {
+                Some(written)
+            };
+            if formal != entry.sym.params.len().checked_sub(1)
+                || entry.sym.trailing_lambda_min_arity.is_none()
+            {
+                return Some(Type::Unknown);
+            }
+        }
         if trailing_lambda_receiver_ref(index, entry, ctx).is_some() {
             return None;
         }
@@ -3254,12 +3295,26 @@ fn synth_arg_types(
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Vec<Type> {
+    synth_arg_types_except(index, call, src, ctx, depth, child_infer, None)
+}
+
+fn synth_arg_types_except(
+    index: &dyn InferenceIndex,
+    call: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+    contextual_lambda: Option<Node>,
+) -> Vec<Type> {
     let mut out = Vec::new();
     let Some(va) = child_of_kind(call, "value_arguments") else {
         return call
             .named_child(0)
             .filter(|child| child.kind() == "call_expression" && has_trailing_lambda(call))
-            .map(|inner| synth_arg_types(index, inner, src, ctx, depth, child_infer))
+            .map(|inner| {
+                synth_arg_types_except(index, inner, src, ctx, depth, child_infer, contextual_lambda)
+            })
             .unwrap_or(out);
     };
     let mut cursor = va.walk();
@@ -3272,7 +3327,11 @@ fn synth_arg_types(
             .then(|| arg.named_child(n - 1))
             .flatten()
             .map_or(Type::Unknown, |e| {
-                child_infer.infer_child(index, e, src, ctx, depth + 1)
+                if Some(e) == contextual_lambda {
+                    Type::Unknown
+                } else {
+                    child_infer.infer_child(index, e, src, ctx, depth + 1)
+                }
             });
         out.push(t);
     }
@@ -6654,6 +6713,49 @@ mod tests {
             );
             assert!(string_concatenation_type(mode, &char_type, &scalar).is_none());
             assert!(string_concatenation_type(mode, &char_type, &char_type).is_none());
+        }
+    }
+
+    #[test]
+    fn direct_call_lambda_parameters_bind_the_actual_final_formal() {
+        use crate::types::Type;
+        let declarations = "package callbacks\nclass Left { fun leftMember() {} }\nclass Right { fun rightMember() {} }\nfun combine(block: (Left, Right) -> Unit) {}\nfun <T> generic(value: T, block: (T, Right) -> Unit) {}\nfun before(block: (Left, Right) -> Unit, after: Left) {}\nfun receiver(block: Left.(Left, Right) -> Unit) {}\nfun choose(key: Left, block: (Left, Right) -> Unit) {}\nfun choose(key: Right, block: (Right, Left) -> Unit) {}\n";
+        let body = "{ first, second -> first.leftMember(); second.rightMember() }";
+        let mut parser = crate::parser::KotlinParser::new();
+        for (call, known) in [
+            (format!("combine(block = {body})"), true),
+            (format!("combine({body})"), true),
+            (format!("combine {body}"), true),
+            (format!("generic(block = {body}, value = Left())"), true),
+            (format!("combine(wrong = {body})"), false),
+            (format!("before(block = {body}, after = Left())"), false),
+            (format!("receiver(block = {body})"), false),
+            (format!("choose(key = missing, block = {body})"), false),
+        ] {
+            let source = format!("{declarations}\nfun use() {{ {call} }}\n");
+            let tree = parser.parse(&source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let mut index = Index::new();
+            index.replace_file(
+                "Callbacks.kt",
+                crate::indexer::extract_symbols(&tree, &source, "callbacks"),
+                Tier::Volatile,
+            );
+            let ctx = super::FileCtx::from_tree_in_file(&tree, &source, "Callbacks.kt");
+            for (name, member, expected) in [
+                ("first", "leftMember", "Left"),
+                ("second", "rightMember", "Right"),
+            ] {
+                let start = source.find(&format!("{name}.{member}")).unwrap();
+                let node = tree.root_node()
+                    .descendant_for_byte_range(start, start + name.len()).unwrap();
+                assert_eq!(&source[node.byte_range()], name);
+                assert_eq!(
+                    super::infer(&index, node, &source, &ctx),
+                    if known { Type::class(expected, Some("callbacks".into())) } else { Type::Unknown },
+                    "{name} in {call}"
+                );
+            }
         }
     }
 

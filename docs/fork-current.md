@@ -1,12 +1,25 @@
 # Current fork state
 
+Kotlin completion now infers explicitly named lambda parameters when the lambda
+is passed directly as a named or positional argument to an ordinary final formal.
+The Kotlin 2.3.21 compiler accepts the completed fixture. On `e9b46c3f` Neovim
+returned the expected members for two trailing-lambda probes and empty replies
+for both named-argument probes. The repaired release returns the expected members
+on all four first requests and excludes the other parameter's members in each.
+The focused Rust regression also covers reordering, invalid names and conflicting
+overloads. Evidence: `two-parameter-lambda116-{corrected,fixed}` under the acceptance
+run root. The editor probe uses declarations in one open buffer.
+
 The Windows root-file watch now filters named `Modify(Any)` paths strictly below
 excluded directories. The multi-source-set trace showed Gradle's `fileChanges`
 notification retiring a root-file guard while the project generation and open
 document stayed current. Six focused tests pass, including a delivered native
 Windows notification and the retained invalidation checks for relevant changes.
 Evidence: `filtered-root-modify-any116/test.log` under the acceptance run root.
-The original MC editor matrix is a separate consumer verification.
+On host `e9b46c3f` and MC `ed89ab4`, the consumer reports that the original
+multi-source-set (54 assertions, 10 commands) and Forge (43 assertions, 8 commands)
+editor cases pass with stable inputs and exit code 0. The earlier `.gradle` Stale
+result was not reproduced in these two cases.
 
 Selected binary dependency ABI113 is published at `b04f13bb`, following the Gradle
 operational-watch repair112 at `444deae2`. Six focused regressions pass (three per
