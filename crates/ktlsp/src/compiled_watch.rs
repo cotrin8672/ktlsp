@@ -1786,6 +1786,45 @@ mod filtered_root_watch_tests {
 
     #[cfg(windows)]
     #[test]
+    fn filtered_root_native_named_excluded_modify_any_keeps_the_signal_current() {
+        let base=root_fixture();let root=base.join("project");
+        std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
+        let excluded=root.join("vendor/nested/cache.json");std::fs::write(&excluded,b"before").unwrap();
+        let plan=WatchPlan::filtered_root(&root,&excluded_filter(BTreeSet::from(["vendor".into()]))).unwrap();
+        let shared=Arc::new(RwLock::new(plan.clone()));
+        let invalid=Arc::new(AtomicBool::new(false));
+        let (wake,mut wakes)=mpsc::channel(1);
+        let signal=Arc::new(Signal {invalid:invalid.clone(),closed:AtomicBool::new(false),wake,
+            callback:Mutex::new(None)});
+        let (observed,events)=std::sync::mpsc::channel();
+        let dispatch_signal=signal.clone();
+        let mut watcher=notify::recommended_watcher(move |event:notify::Result<Event>| {
+            let delivered=event.as_ref().cloned().map_err(ToString::to_string);
+            dispatch_signal.event(&shared,event);
+            // Observe delivery after dispatch, rather than waiting for the absence of invalidation.
+            let _=observed.send(delivered);
+        }).unwrap();
+        for directory in &plan.directories {
+            watcher.watch(directory,if plan.recursive.contains(directory) {
+                RecursiveMode::Recursive
+            } else {RecursiveMode::NonRecursive}).unwrap();
+        }
+        std::fs::write(&excluded,b"changed").unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop {
+            let event=events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("native excluded write must be dispatched").expect("native watcher must remain healthy");
+            if event.kind==EventKind::Modify(ModifyKind::Any)
+                && event.paths.iter().any(|path|key(path)==key(&excluded)) {break;}
+        }
+        assert!(!invalid.load(Ordering::Acquire),"named excluded native modification must not retire its signal");
+        assert!(wakes.try_recv().is_err());
+        signal.disarm();drop(watcher);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn filtered_root_replacement_between_plan_and_arm_cannot_mint_a_current_lease() {
         let base=root_fixture();let root=base.join("project");std::fs::create_dir(&root).unwrap();
         let plan=WatchPlan::filtered_root(&root,&Default::default()).unwrap();
