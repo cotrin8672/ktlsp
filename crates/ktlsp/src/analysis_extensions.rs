@@ -327,15 +327,20 @@ impl AnalysisExtensions {
                 &input.tree,
             )
         });
-        let annotation_source=prepared.clone();
-        let annotation_scope=crate::language::source_type_scope(key,&input.tree,&input.text);
+        // The builtin consumes declaration/compiled facts only. IPC registration enables
+        // retention and normalizes every retained input before an external provider can read sites.
+        let annotation_input=self.retain_all_sources.then(|| (
+            prepared.clone(),crate::language::source_type_scope(key,&input.tree,&input.text)));
         let replaced = if refresh {
             self.store.refresh_prepared_source_declarations(index,prepared,coverage,facts)
         } else if retain_namespace {
             self.store.retain_prepared_library_source_declarations(index,prepared,coverage,facts)
         } else {
             self.store.replace_prepared_source_declarations(index,prepared,coverage,facts)
-        }.and_then(|_|self.store.cache_annotation_sites(index,&annotation_source,&annotation_scope));
+        }.and_then(|_|match annotation_input {
+            Some((source,scope))=>self.store.cache_annotation_sites(index,&source,&scope),
+            None=>Ok(()),
+        });
         if let Err(error) = replaced {
             // Accepted source/index disagreement must remove old results, never reuse their spans.
             self.hydrated_sources.remove(key);
@@ -651,6 +656,59 @@ mod compiler_source_tests {
             assert!(matches!(&*observed.lock().unwrap(), Some(Knowledge::Found(AnnotationValue::Enum {ty, name}))
                 if ty.name == "Mode" && name == "NEW"), "{owner}: unchanged owner must observe the dependency update");
         }
+    }
+
+    #[test]
+    fn builtin_skips_annotation_inventory_until_late_provider_registration() {
+        use ktcore::project_model::{FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation};
+        let file = "/compiler-sites/Person.java";
+        let text = include_str!("../../ktcore/tests/fixtures/classfile/sources/pluginfixture/Person.java");
+        let tree = crate::java::JavaParser::new().parse(text);
+        let mut index = Index::new();
+        index.replace_file(file, crate::language::symbol_facts(
+            crate::language::SourceLanguage::Java, &tree, text).symbols, ktcore::index::Tier::Volatile);
+        let scope = ProjectScope {module: "compiler-sites".into(), source_set: "main".into()};
+        index.set_file_origin(file, FileOrigin {
+            origin_id: "compiler-sites".into(), representation: SourceRepresentation::Source,
+            project_scope: Some(scope.clone()),
+        });
+        index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope, ordered_origins: vec!["compiler-sites".into()],
+        }]);
+        let class = Arc::new(ktcore::classfile::decode("compiler-sites", include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class")).unwrap());
+        let mut host = AnalysisExtensions::new(Vec::new());
+        host.accept_project_outputs(&index, vec![(file.into(), Arc::from(text), tree, class)]).unwrap();
+        assert!(!host.retain_all_sources);
+        // Exercise the same semantic invalidation/flush used by a dependency chunk.
+        host.mark_index_changed();
+        host.flush_index_changed(&index);
+        {
+            let mut read = host.store.begin(&index, COMPILED_JAVA_PROVIDER, file).unwrap();
+            assert!(read.declarations().iter().flat_map(|declaration| &declaration.annotations)
+                .any(|annotation| annotation.ty.name == "Getter"),
+                "skipping site inventory must preserve declaration annotations");
+            let inventory = read.annotation_sites();
+            assert!(inventory.sites.is_empty());
+            assert!(!inventory.coverage.is_found(), "an uncomputed inventory cannot claim completeness");
+            let Knowledge::Found(owner) = read.resolve_type("pluginfixture.Person") else {
+                panic!("retained source owner");
+            };
+            assert!(read.compiled_class(&owner).unwrap().is_found(),
+                "the builtin must retain its checked compiled attachment");
+        }
+        host.register_ipc(&index, "late-sites", vec!["not-spawned".into()]).unwrap();
+        let mut read = host.store.begin(&index, "late-sites", file).unwrap();
+        assert_eq!(read.source(), text);
+        let inventory = read.annotation_sites();
+        let site = inventory.sites.iter().find(|site| site.annotation.ty.name == "Getter")
+            .expect("registration must normalize current sites before provider consumption");
+        assert_eq!(&text[site.annotation.range.clone()], "@Getter");
+        let Knowledge::Found(owner) = read.resolve_type("pluginfixture.Person") else {
+            panic!("registered provider sees the same retained owner");
+        };
+        assert_eq!(site.owner.as_ref(), Some(owner.definition()));
+        assert!(read.compiled_class(&owner).unwrap().is_found());
     }
 
     fn input(text: &str, value_namespace: bool) -> SourceInput {

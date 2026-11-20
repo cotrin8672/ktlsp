@@ -6078,3 +6078,29 @@ matching-file, exact-input and delegated-output events remain invalidating.
 The focused filtered-watch suite passes 6/6. The MC trace identified the prior
 failure as `.gradle/9.6.1/fileHashes/fileHashes.lock`; the real CEM/MC matrix was
 not rerun, so this fixes the reproduced host path without claiming full acceptance.
+
+The pre-existing Windows native excluded-directory test was inadvertently removed
+in `81d0b3bd`. It was restored with its original assertions in `bccb943f`
+and passed on Windows in a single focused run.
+
+## 2026-11-21 checkpoint: compiler-only indexing and MixinExtras
+
+The original MixinExtras Neovim entry completed with host `81d0b3bd` and
+MC `199d74d`: 1,085 original assertions, 54 commands, `scopePassed=true` and
+exit 0 (`C:/tmp/mc-e-final-fabric-mixinextras-h123-81d0b3bd-199d74d-after-sugar-tail/`).
+
+A separate Sodium host-only diagnostic run with a private cache reached
+project readiness, but library readiness was incomplete at the existing
+180-second deadline. The source query succeeded in 18.32 seconds. Six install
+results recorded 453 files before the trace stopped. Seven refreshes of the same
+315 retained sources took 1.73 seconds, including 0.49 seconds building
+annotation-site inventories. The recorded work does not explain the remaining
+unobserved interval (`C:/tmp/ktlsp-sodium-index-flush-81d0b3bd-measure1/`).
+
+With only the built-in compiler provider, the host now skips the unconsumed
+annotation-site inventory, retaining declaration annotations and compiled API
+facts. The existing provider registration normalizes retained sources before
+dispatch. The late-registration regression and dependency enum refresh both
+pass, as does the release build. Real Neovim basic passes all nine assertions;
+its existing script force-stops the server. Extension-enabled Sodium does not
+take the new fast path, and an end-to-end startup speedup remains unmeasured.
