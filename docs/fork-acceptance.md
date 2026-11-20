@@ -6057,3 +6057,14 @@ native-sdk21-collector83-1; root-cem-model13-audit83-1/audit.json;
 native-cem-java-floor83-1/receipt.json; cem-native-watch84-1/input-scope.json.
 Latest native roots are closed naturally with EOF/owned0; semantic failure is
 recorded separately from private-home ownership. Goal remains active.
+
+## 2026-11-21 checkpoint: native watch-plan ordering
+
+`WatchPlan` now installs Windows directory inputs before exact-file guards and
+orders them parent-before-child. This removes the construction-order false
+`compiler-native-watch-cap` when a later recursive parent would compact the
+children; the final 512-directory cap and cross-root rejection are unchanged.
+The incoming recursive roots are likewise compacted before `merge` adds an
+unrelated root. Focused `compiled_watch` tests pass (27 passed, 1 ignored).
+The real CEM cap trace was not rerun, so this is a reproduced code-path fix,
+not proof that the CEM acceptance run is complete.

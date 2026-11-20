@@ -66,6 +66,7 @@ impl WatchPlan {
         plan.guard_parents(&request.root, false)?;
         plan.ancestors.insert(project.clone());
         anyhow::ensure!(inputs.len() <= MAX_INPUT_PATHS, "compiler-native-input-cap");
+        let mut read_inputs = Vec::new();
         for input in inputs {
             let input = Path::new(input);
             let input_key = key(input);
@@ -78,8 +79,9 @@ impl WatchPlan {
                 continue;
             }
             // A registered project glob alone does not prove coverage of config/AP input files.
-            plan.add_input(input, directory)?;
+            read_inputs.push((input, directory));
         }
+        plan.add_inputs(read_inputs)?;
         Ok(plan)
     }
 
@@ -87,10 +89,26 @@ impl WatchPlan {
     pub(crate) fn read_inputs(inputs: &[PathBuf]) -> anyhow::Result<Self> {
         anyhow::ensure!(inputs.len() <= MAX_INPUT_PATHS, "compiler-native-input-cap");
         let mut plan = Self::default();
-        for input in inputs {
-            plan.add_input(input, input.is_dir())?;
-        }
+        plan.add_inputs(inputs.iter().map(|input| (input.as_path(), input.is_dir())))?;
         Ok(plan)
+    }
+
+    fn add_inputs<'a>(
+        &mut self,
+        inputs: impl IntoIterator<Item = (&'a Path, bool)>,
+    ) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        let inputs = {
+            let mut inputs: Vec<_> = inputs.into_iter().collect();
+            // Install recursive parents before their children and exact-file guards, so
+            // registrations covered by a later input cannot exhaust the native watch cap.
+            inputs.sort_by_key(|(path, directory)| (!directory, path.components().count()));
+            inputs
+        };
+        for (input, directory) in inputs {
+            self.add_input(input, directory)?;
+        }
+        Ok(())
     }
 
     /// Arm root coverage without enumerating before the lease exists. The caller then
@@ -304,6 +322,20 @@ impl WatchPlan {
         self.memberships.extend(next.memberships);
         self.delegated_sources.extend(next.delegated_sources);
         self.delegated_outputs.extend(next.delegated_outputs);
+        // Compact all incoming recursive roots before installing any of them. An unrelated
+        // root may sort before one that releases existing registrations at the watch cap.
+        self.directories.retain(|directory| {
+            !next
+                .recursive
+                .iter()
+                .any(|root| path_under(&key(directory), &key(root)))
+        });
+        self.recursive.retain(|directory| {
+            !next
+                .recursive
+                .iter()
+                .any(|root| path_under(&key(directory), &key(root)))
+        });
         for directory in &next.recursive {
             self.add_recursive_directory(directory)?;
         }
@@ -1135,6 +1167,69 @@ mod tests {
                 .add_path(input.join("child-512/New.java"))
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_parent_input_compacts_children_before_enforcing_watch_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "ktlsp-watch-parent-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parent = root.join("input");
+        let mut inputs: Vec<_> = (0..=MAX_WATCH_DIRS)
+            .map(|n| parent.join(format!("child-{n}")))
+            .collect();
+        for input in &inputs {
+            std::fs::create_dir_all(input).unwrap();
+        }
+        // Separate recursive child registrations still exceed the unchanged native cap.
+        assert!(WatchPlan::read_inputs(&inputs).is_err());
+        let file = inputs[0].join("Input.java");
+        std::fs::write(&file, b"class Input {}").unwrap();
+        inputs.insert(0, file.clone());
+        inputs.push(parent.clone());
+        let plan = WatchPlan::read_inputs(&inputs).unwrap();
+        assert_eq!(plan.recursive, BTreeSet::from([parent.clone()]));
+        assert!(plan.directories.len() <= MAX_WATCH_DIRS);
+        assert!(plan.exact.contains(&key(&file)));
+        assert!(plan.covers_read(&key(&file), false));
+        assert!(plan.includes_directory_watch(&parent.join("child-512")));
+        let request = crate::compile::observed_test_request(&root);
+        let paths: Vec<_> = inputs
+            .iter()
+            .map(|path| crate::paths::file_key(path))
+            .collect();
+        let built = WatchPlan::build(&request, &paths).unwrap();
+        assert!(built.directories.len() <= MAX_WATCH_DIRS);
+        assert_eq!(built.recursive, plan.recursive);
+        assert_eq!(built.exact, plan.exact);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_compacts_later_recursive_root_before_adding_unrelated_root_at_cap() {
+        let root = std::env::temp_dir().join("ktlsp-watch-merge-order");
+        let parent = root.join("z-parent");
+        let mut plan = WatchPlan::default();
+        for n in 0..MAX_WATCH_DIRS {
+            plan.add_directory(&parent.join(format!("child-{n}")))
+                .unwrap();
+        }
+        let unrelated = root.join("a-unrelated");
+        let mut next = WatchPlan::default();
+        next.add_recursive_directory(&unrelated).unwrap();
+        next.add_recursive_directory(&parent).unwrap();
+        plan.merge(next).unwrap();
+        assert_eq!(
+            plan.directories,
+            BTreeSet::from([unrelated.clone(), parent.clone()])
+        );
+        assert_eq!(plan.recursive, BTreeSet::from([unrelated, parent]));
     }
 
     #[tokio::test]
