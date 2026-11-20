@@ -263,6 +263,12 @@ fn extract_declarations(
     let mut result = Vec::new();
     for entry in &entries {
         let symbol = &entry.sym;
+        // Recovery nodes can have a missing identifier (for example an unfinished
+        // Java handler snippet). They are not declarations; admitting one would
+        // reject the whole source snapshot and discard its other valid facts.
+        if symbol.start_byte == symbol.end_byte {
+            continue;
+        }
         let Some(node) = declaration_node(tree, symbol, java) else {
             continue;
         };

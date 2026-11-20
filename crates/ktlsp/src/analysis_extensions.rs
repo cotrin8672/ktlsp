@@ -484,6 +484,43 @@ mod compiler_source_tests {
     use super::*;
 
     #[test]
+    fn unfinished_java_handler_keeps_accepted_source_snapshot() {
+        struct Probe;
+        impl AnalysisProvider for Probe {
+            fn id(&self) -> &str { "inventory-probe" }
+            fn analyze(&self, _: &mut ktcore::extensions::ReadSession<'_>)
+                -> Result<(), ktcore::extensions::ContractError> { Ok(()) }
+        }
+        let file = "/source-inventory/ExampleMixin.java";
+        let text = "package com.example.mixin;\n\
+            public abstract class HandlerSnippetMixin {\n\
+                @Inject(method = \"draw(Ljava/lang/String;FF)V\", at = @At(\"HEAD\"))\n\
+                private void (String arg0, float arg1, float arg2, CallbackInfo ci) {\n\
+                    // TODO\n\
+                }\n\
+            }\n";
+        let mut workspace = crate::workspace::Workspace::with_analysis_providers(vec![Arc::new(Probe)]);
+        workspace.open(file, text.replace("void (", "void onDraw("));
+        workspace.change(file, text.into());
+        let (index, extensions) = workspace.extension_test_inputs();
+        let mut read = extensions.store.begin(index, "inventory-probe", file).unwrap();
+        assert_eq!(read.source(), text);
+        assert!(read.source_inventory_candidates().any(|candidate| candidate == file));
+        let facts = read.declarations();
+        assert_eq!(facts.len(), 1, "only the named class is a declaration");
+        assert!(facts[0].kind.is_type_like());
+        assert_eq!(&text[facts[0].name_range.clone()], "HandlerSnippetMixin");
+        let Knowledge::Found(owner) = read.resolve_type("com.example.mixin.HandlerSnippetMixin") else {
+            panic!("the positive class declaration must remain available");
+        };
+        let (members, coverage) = read.declared_members(&owner).unwrap();
+        assert!(members.is_empty());
+        assert!(!coverage.is_found(), "an unfinished handler cannot close member coverage");
+        assert!(matches!(read.resolve_type("com.example.mixin.Missing"), Knowledge::Unknown(_)),
+            "preserving a snapshot cannot prove a missing type absent");
+    }
+
+    #[test]
     fn valid_class_declarations_survive_an_unfinished_sibling_function() {
         let file = "/compiler-api/Model.kt";
         let source = include_str!("../../ktcore/tests/fixtures/classfile/serialization/Model.kt");
