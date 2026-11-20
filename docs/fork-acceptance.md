@@ -6068,3 +6068,13 @@ The incoming recursive roots are likewise compacted before `merge` adds an
 unrelated root. Focused `compiled_watch` tests pass (27 passed, 1 ignored).
 The real CEM cap trace was not rerun, so this is a reproduced code-path fix,
 not proof that the CEM acceptance run is complete.
+
+## 2026-11-21 checkpoint: filtered root watch matching
+
+The root-file inventory now passes its validated basename/extension filter into
+the native watch plan. A non-matching regular-file Modify/Data/Metadata/CloseWrite
+event is ignored only when the file still exists; directory, rename, rescan,
+matching-file, exact-input and delegated-output events remain invalidating.
+The focused filtered-watch suite passes 6/6. The MC trace identified the prior
+failure as `.gradle/9.6.1/fileHashes/fileHashes.lock`; the real CEM/MC matrix was
+not rerun, so this fixes the reproduced host path without claiming full acceptance.

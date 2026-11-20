@@ -30,7 +30,7 @@ impl Filter {
             extensions:self.extensions.iter().map(|name|name.to_lowercase()).collect(),
             excluded_directories:self.excluded_directories.iter().map(|name|name.to_lowercase()).collect()}
     }
-    fn includes(&self,relative:&Path,excluded:&BTreeSet<String>)->bool {
+    pub(crate) fn includes(&self,relative:&Path,excluded:&BTreeSet<String>)->bool {
         if relative.parent().is_some_and(|parents|parents.components().any(|part|
             excluded.contains(&part.as_os_str().to_string_lossy().to_lowercase()))) {return false;}
         let name=relative.file_name().and_then(|name|name.to_str());
@@ -86,7 +86,7 @@ fn prepare_with_limits(plan:CapturePlan,wake:Arc<dyn Fn()+Send+Sync>,visited_lim
         if plan.epoch.load(Ordering::Acquire) {return Err("Stale".into());}
         plan.filter.validate()?;
         let effective=plan.filter.effective();let excluded=&effective.excluded_directories;
-        let coverage=crate::compiled_watch::WatchPlan::filtered_root(&plan.root,excluded).map_err(|error|error.to_string())?;
+        let coverage=crate::compiled_watch::WatchPlan::filtered_root(&plan.root,&effective).map_err(|error|error.to_string())?;
         let lease=crate::compiled_watch::HostInputLease::new(coverage,wake.clone()).map_err(|error|error.to_string())?;
         let guard:Arc<dyn HostInputGuard>=Arc::new(Guard {lease,epoch:plan.epoch.clone()});
         let mut catalog=Catalog {revision:NEXT_ROOT.fetch_add(1,Ordering::Relaxed),root:plan.root.clone(),uri:uri(&plan.root)?,
