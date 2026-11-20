@@ -1002,6 +1002,11 @@ fn binary_owner_source<R: Read + io::Seek>(
         return Ok(None);
     }
     let own_name = owner_name.rsplit('.').next().unwrap();
+    if class.access_flags & 0x2000 != 0 {
+        // Nested declarations stay unavailable; InnerClasses may describe referenced enum types.
+        return Ok(java_nominal_annotation_stub(class, own_name)
+            .map(|(source, unavailable)| (source, BinaryOwnerMembers::from([(owner_name.to_owned(), unavailable)]))));
+    }
     let Some((mut source, unavailable)) =
         java_declaration_stub_scoped(class, false, Some(own_name), enclosing, source_file, false)
     else {
@@ -1277,6 +1282,47 @@ fn java_declaration_stub_named(
     Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>,
 )> {
     java_declaration_stub_scoped(class, selected_sdk, source_name, &[], None, false)
+}
+
+/// Preserve a checked top-level Java annotation identity without modeling its element surface.
+fn java_nominal_annotation_stub(
+    class: &ktcore::classfile::ClassFileFacts,
+    name: &str,
+) -> Option<(String, Vec<(String, ktcore::symbol::SymbolKind, Option<u8>)>)> {
+    let (package, binary_name) = class.identity.internal_name.rsplit_once('/')
+        .unwrap_or(("", &class.identity.internal_name));
+    if class.access_flags != 0x2601 // public, interface, abstract, annotation
+        || binary_name != name || !is_java_identifier(name)
+        || class.super_name.as_deref() != Some("java/lang/Object")
+        || class.interfaces.len() != 1
+        || class.interfaces[0].as_ref() != "java/lang/annotation/Annotation"
+        || class.signature.is_some() || !class.fields.is_empty()
+        || class.inner_classes.iter().any(|row| row.inner.as_ref() == class.identity.internal_name.as_str())
+        || class.source_file.as_deref() != Some(format!("{name}.java").as_str())
+        || class.attribute_names.iter().any(|attribute| !matches!(attribute.as_ref(),
+            "SourceFile" | "InnerClasses" | "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations"))
+        || class.annotations.iter().any(|annotation|
+            annotation.annotation.descriptor.starts_with("Lkotlin/"))
+    {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    let mut unavailable = Vec::new();
+    for method in &class.methods {
+        if method.access_flags != 0x0401 || !is_java_identifier(&method.name)
+            || !method.descriptor.starts_with("()") || method.descriptor.as_ref() == "()V"
+            || !names.insert(method.name.as_ref())
+        {
+            return None;
+        }
+        unavailable.push((method.name.to_string(), ktcore::symbol::SymbolKind::Function, None));
+    }
+    let mut source = "// Binary annotation identity; element declarations are unavailable.\n".to_string();
+    if !package.is_empty() {
+        source.push_str(&format!("package {};\n\n", package.replace('/', ".")));
+    }
+    source.push_str(&format!("public @interface {name} {{\n}}\n"));
+    Some((source, unavailable))
 }
 
 fn java_declaration_stub_scoped(
@@ -1939,6 +1985,39 @@ pub(crate) fn is_java_identifier(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nominal_annotation_stub_keeps_kind_and_omitted_elements_conservative() {
+        let mut class = ktcore::classfile::decode("fixture", include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/mixin087/Mixin.class"
+        )).unwrap();
+        let (source, unavailable) = super::java_nominal_annotation_stub(&class, "Mixin").unwrap();
+        assert!(source.contains("public @interface Mixin"));
+        assert_eq!(unavailable.len(), class.methods.len());
+        assert!(unavailable.iter().all(|(_, kind, arity)|
+            *kind == ktcore::symbol::SymbolKind::Function && arity.is_none()));
+        assert!(!source.contains("value("));
+        // As with Mixin At.Shift, InnerClasses metadata grants no nested source declarations.
+        class.attribute_names.push("InnerClasses".into());
+        class.inner_classes.push(ktcore::classfile::InnerClassFacts {
+            inner: "org/spongepowered/asm/mixin/Mixin$Shift".into(),
+            outer: Some(class.identity.internal_name.clone().into()), name: Some("Shift".into()),
+            access_flags: 0x4019,
+        });
+        let (source, _) = super::java_nominal_annotation_stub(&class, "Mixin").unwrap();
+        assert!(!source.contains("Shift"));
+        assert!(super::java_nominal_annotation_stub(&class, "Decoy").is_none());
+        for invalid in 0..4 {
+            let mut changed = class.clone();
+            match invalid {
+                0 => changed.access_flags &= !0x2000,
+                1 => changed.source_file = Some("Other.java".into()),
+                2 => changed.interfaces.clear(),
+                _ => changed.inner_classes[0].inner = changed.identity.internal_name.clone().into(),
+            }
+            assert!(super::java_nominal_annotation_stub(&changed, "Mixin").is_none(), "{invalid}");
+        }
+    }
+
     use super::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;

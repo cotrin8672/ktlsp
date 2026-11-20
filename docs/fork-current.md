@@ -1,5 +1,15 @@
 # Current fork state
 
+The Loom consumer's actual wire recording had `UnsupportedType` for imported
+`Mixin`, `Inject`, and `At` even though the selected Maven JAR was present. The
+binary preview fell back to a name-only class, which the Maven stub filter dropped.
+Checked top-level Java annotation identities now survive as `@interface` stubs.
+Omitted elements retain unavailable-member facts, and authored source and member
+coverage remain Unknown. Seven targeted tests pass, including selected Maven
+TypeRef hydration, name/identity decoys, and local/Maven binary caches. Evidence:
+`loom-maven-annotation117` under the acceptance run root. The original Loom editor
+case is pending on the new host.
+
 Kotlin completion now infers explicitly named lambda parameters when the lambda
 is passed directly as a named or positional argument to an ordinary final formal.
 The Kotlin 2.3.21 compiler accepts the completed fixture. On `e9b46c3f` Neovim
@@ -19,7 +29,8 @@ Evidence: `filtered-root-modify-any116/test.log` under the acceptance run root.
 On host `e9b46c3f` and MC `ed89ab4`, the consumer reports that the original
 multi-source-set (54 assertions, 10 commands) and Forge (43 assertions, 8 commands)
 editor cases pass with stable inputs and exit code 0. The earlier `.gradle` Stale
-result was not reproduced in these two cases.
+result was not reproduced in these two cases. The consumer also reports 13 original
+assertions passing in the dedicated AW/AT case on that host.
 
 Selected binary dependency ABI113 is published at `b04f13bb`, following the Gradle
 operational-watch repair112 at `444deae2`. Six focused regressions pass (three per

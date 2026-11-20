@@ -988,6 +988,60 @@ mod tests {
     }
 
     #[test]
+    fn selected_maven_annotation_type_refs_hydrate_without_source_authority() {
+        const MIXIN: &[u8] = include_bytes!("../../../ktcore/tests/fixtures/classfile/mixin087/Mixin.class");
+        let fixture = Fixture::new();
+        fs::remove_file(&fixture.sources).unwrap();
+        Fixture::zip(&fixture.binary, &[
+            ("org/spongepowered/asm/mixin/Mixin.class", MIXIN),
+            ("decoy/Mixin.class", MIXIN),
+            ("fake/NameOnly.class", b"not a class file"),
+        ]);
+        let coord = crate::coords::Coordinate::parse("org.spongepowered:mixin:0.8.7").unwrap();
+        let selected = [(fixture.binary.clone(), crate::classpath::file_origin_id(&fixture.binary))];
+        for warm in [false, true] {
+            let mut ws = Workspace::with_analysis_providers(vec![Arc::new(Probe)]);
+            let batches = crate::deps::resolve_module_binary_stubs(
+                &coord, &selected, &fixture.extract, &mut KotlinParser::new(), &mut JavaParser::new(),
+            ).unwrap();
+            assert_eq!(batches.len(), 1, "only the exact decoded annotation survives: warm={warm}");
+            let annotation = batches[0].symbols.iter().find(|symbol| symbol.name == "Mixin").unwrap();
+            assert!(annotation.is_annotation);
+            let unavailable = annotation.unavailable_members.as_ref().unwrap();
+            assert!(unavailable.iter().any(|(name, _, arity)| name == "value" && arity.is_none()));
+            assert_eq!(batches[0].origin.as_ref().unwrap().origin_id, crate::classpath::maven_origin_id(&coord));
+            for batch in batches { assert!(ws.index_dependency_batch(batch)); }
+            ws.bump_index_revision();
+            let file = "MavenMixin.java";
+            ws.open(file, "import org.spongepowered.asm.mixin.Mixin;\n@Mixin class MavenMixin {}".into());
+            let (index, host) = ws.extension_test_inputs();
+            let mut read = host.store.begin(index, "library-probe", file).unwrap();
+            let reference = read.annotation_sites().sites[0].annotation.ty.clone();
+            assert!(matches!(read.resolve_type_ref(&reference), Knowledge::Unknown(_)));
+            let pending = read.finish();
+            host.store.commit(pending).unwrap();
+            let requests = ws.begin_extension_source_batch();
+            assert_eq!(requests.len(), 1);
+            let prepared = prepare_sources(requests);
+            assert_eq!(prepared.len(), 1);
+            ws.finish_extension_source_batch(prepared);
+            let (index, host) = ws.extension_test_inputs();
+            let mut read = host.store.begin(index, "library-probe", file).unwrap();
+            let Knowledge::Found(ty) = read.resolve_type_ref(&reference) else {
+                panic!("selected Maven annotation TypeRef must resolve: warm={warm}");
+            };
+            assert_eq!(ty.qualified_name(), "org.spongepowered.asm.mixin.Mixin");
+            assert!(matches!(read.declared_members(&ty).unwrap().1, Knowledge::Unknown(ref reasons)
+                if reasons.contains(&IncompleteReason::UnsupportedSource)));
+            assert!(matches!(read.type_source_location(&ty).unwrap(), Knowledge::Unknown(ref reasons)
+                if reasons.contains(&IncompleteReason::UnsupportedSource)));
+            drop(read);
+            assert_eq!(host.store.source_declarations(&ty.definition().file), Some([].as_slice()));
+            assert!(!host.inputs.contains_key(&ty.definition().file));
+        }
+    }
+
+    #[test]
     fn binary_annotation_refs_hydrate_exact_identity_without_authored_source_facts() {
         const MIXIN: &[u8] = include_bytes!("../../../ktcore/tests/fixtures/classfile/mixin087/Mixin.class");
         const INJECT: &[u8] = include_bytes!("../../../ktcore/tests/fixtures/classfile/mixin087/Inject.class");
