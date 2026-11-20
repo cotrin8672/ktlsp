@@ -145,7 +145,6 @@ pub struct Backend {
     /// Whether the client advertised `window.workDoneProgress` in `initialize`. Gates server-initiated
     /// progress (the indexing spinner); when false we fall back to log messages.
     progress_supported: Arc<Mutex<bool>>,
-    diagnostic_scope: Mutex<DiagnosticScope>,
     formatter: Mutex<Option<FormatterConfig>>,
     refresh: Arc<Mutex<RefreshState>>,
     watches: Arc<Mutex<WatchState>>,
@@ -172,7 +171,6 @@ impl Backend {
             snippets_supported: Mutex::new(false),
             doc_versions: Arc::new(Mutex::new(HashMap::new())),
             progress_supported: Arc::new(Mutex::new(false)),
-            diagnostic_scope: Mutex::new(DiagnosticScope::OpenFilesOnly),
             formatter: Mutex::new(None),
             refresh: Arc::new(Mutex::new(RefreshState::default())),
             watches: Arc::new(Mutex::new(WatchState::default())),
@@ -2524,7 +2522,7 @@ async fn index_workspace(
             }
             return;
         }
-        publish_diagnostics(&ws, &client, &versions, &key).await;
+        publish_diagnostics(&ws, &client, &versions, &key, DiagnosticDelivery::Push).await;
     }
     if !ws.lock().is_current_generation(generation) {
         if let Some(p) = ongoing {
@@ -2532,6 +2530,7 @@ async fn index_workspace(
         }
         return;
     }
+    schedule_extension_sources(&ws, &client, &versions);
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {
         p.finish_with_message(format!(
@@ -3797,7 +3796,9 @@ impl LanguageServer for Backend {
                         .is_some_and(|client| client.name == "Neovim"));
         }
 
-        *self.diagnostic_scope.lock() = diagnostic_scope_from(&params.initialization_options);
+        self.ws.lock().set_include_closed_diagnostics(
+            diagnostic_scope_from(&params.initialization_options) == DiagnosticScope::Workspace,
+        );
         configure_analysis_providers(&mut self.ws.lock(), &params.initialization_options);
         let formatter = formatter_from(&params.initialization_options);
         *self.formatter.lock() = formatter.clone();
@@ -3967,7 +3968,7 @@ impl LanguageServer for Backend {
                 self.jdk_source_seeds.lock().remove(&key);
             }
             self.schedule_diagnostics(key.clone());
-            publish_diagnostics(&self.ws, &self.client, &self.doc_versions, &key).await;
+            publish_diagnostics(&self.ws, &self.client, &self.doc_versions, &key, DiagnosticDelivery::Close).await;
         }
     }
 
@@ -4118,6 +4119,7 @@ impl LanguageServer for Backend {
                 .collect::<Vec<_>>()
         };
         let changed = self.ws.lock().take_extension_diagnostic_changes();
+        let diagnostics_changed = !changed.is_empty();
         for key in changed {
             self.schedule_one_diagnostic(key);
         }
@@ -4135,20 +4137,25 @@ impl LanguageServer for Backend {
             // a Gradle model refresh. Retain the latest source epoch after cancelling its worker.
             self.schedule_kotlin_diagnostics();
         }
+        if diagnostics_changed {
+            schedule_extension_sources(&self.ws, &self.client, &self.doc_versions);
+        }
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        let options = Some(params.settings);
+        self.ws.lock().set_include_closed_diagnostics(
+            diagnostic_scope_from(&options) == DiagnosticScope::Workspace,
+        );
         self.ws.lock().invalidate_observed_compile();
         self.ws.lock().invalidate_kotlin_diagnostics();
         self.schedule_kotlin_diagnostics();
-        let options = Some(params.settings);
         configure_analysis_providers(&mut self.ws.lock(), &options);
         schedule_extension_sources(&self.ws, &self.client, &self.doc_versions);
         let changed = self.ws.lock().take_extension_diagnostic_changes();
         for key in changed {
             self.schedule_one_diagnostic(key);
         }
-        *self.diagnostic_scope.lock() = diagnostic_scope_from(&options);
         if let Some(formatter) = formatter_from(&options) {
             *self.formatter.lock() = Some(formatter);
         }
@@ -4203,12 +4210,12 @@ impl LanguageServer for Backend {
         &self,
         _params: WorkspaceDiagnosticParams,
     ) -> Result<WorkspaceDiagnosticReportResult> {
-        let scope = *self.diagnostic_scope.lock();
         let keys = {
             let ws = self.ws.lock();
-            match scope {
-                DiagnosticScope::OpenFilesOnly => ws.open_doc_keys(),
-                DiagnosticScope::Workspace => ws.project_doc_keys(),
+            if ws.include_closed_diagnostics() {
+                ws.project_doc_keys()
+            } else {
+                ws.open_doc_keys()
             }
         };
         let mut items = Vec::new();
@@ -5988,6 +5995,13 @@ fn severity_to_lsp(severity: Severity) -> DiagnosticSeverity {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DiagnosticDelivery {
+    Pull,
+    Push,
+    Close,
+}
+
 /// Publish the current fast diagnostics for `key`. Computes under the workspace lock and drops it
 /// before the publish `.await`.
 async fn publish_diagnostics(
@@ -5995,12 +6009,15 @@ async fn publish_diagnostics(
     client: &Client,
     versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     key: &str,
+    delivery: DiagnosticDelivery,
 ) {
     let uri = match key_to_uri(key) {
         Some(u) => u,
         None => return,
     };
-    let (items, _, version) = lsp_diagnostics_with_result(ws, versions, key);
+    let Some((items, _, version)) = lsp_diagnostics_for_delivery(ws, versions, key, delivery) else {
+        return;
+    };
     client.publish_diagnostics(uri, items, version).await;
     schedule_extension_sources(ws, client, versions);
 }
@@ -6029,6 +6046,7 @@ fn schedule_extension_sources(
             for key in changed {
                 schedule_owned_diagnostic(&workspace, &client, &versions, key);
             }
+            schedule_ipc_extensions(&workspace, &client, &versions);
             requests = workspace.lock().begin_extension_source_batch();
             if requests.is_empty() {
                 break;
@@ -6089,8 +6107,27 @@ fn lsp_diagnostics_with_result(
     versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     key: &str,
 ) -> (Vec<Diagnostic>, Option<String>, Option<i32>) {
+    lsp_diagnostics_for_delivery(ws, versions, key, DiagnosticDelivery::Pull)
+        .expect("explicit diagnostic pulls are unconditional")
+}
+
+fn lsp_diagnostics_for_delivery(
+    ws: &Arc<Mutex<Workspace>>,
+    versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
+    key: &str,
+    delivery: DiagnosticDelivery,
+) -> Option<(Vec<Diagnostic>, Option<String>, Option<i32>)> {
     let (text, diagnostics, result_id, version) = {
         let mut ws = ws.lock();
+        // Recheck after debounce under the same lock as computation: the document or scope
+        // may have changed since scheduling. Closing an open-only document clears its push.
+        if !ws.allows_push_diagnostics(key) {
+            match delivery {
+                DiagnosticDelivery::Push => return None,
+                DiagnosticDelivery::Close => return Some((Vec::new(), None, None)),
+                DiagnosticDelivery::Pull => {}
+            }
+        }
         let version = versions
             .lock()
             .get(key)
@@ -6115,7 +6152,7 @@ fn lsp_diagnostics_with_result(
         }
         None => Vec::new(),
     };
-    (items, result_id, version)
+    Some((items, result_id, version))
 }
 
 /// Convert a core `Def` (file key + byte range) into an LSP `Location`, reading the target file's
@@ -11737,6 +11774,81 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
         );
     }
 
+    #[tokio::test]
+    async fn spontaneous_diagnostics_filter_closed_extension_owners_and_recheck_delivery() {
+        struct Provider;
+        impl crate::analysis_extensions::AnalysisProvider for Provider {
+            fn id(&self) -> &str { "push-scope-test" }
+            fn analyze(&self, read: &mut ktcore::extensions::ReadSession<'_>)
+                -> std::result::Result<(), ktcore::extensions::ContractError> {
+                read.diagnostic(crate::diagnostics::Diagnostic {
+                    start_byte: 0, end_byte: 1, severity: crate::diagnostics::Severity::Hint,
+                    code: None, message: "extension-owner-diagnostic".into(),
+                })
+            }
+        }
+        let root = std::env::temp_dir().join(format!("ktlsp-push-scope-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let sources = [("Closed.java", "class Closed {}"), ("Open.java", "class Open {}"),
+            ("Open.kt", "class KotlinOpen")];
+        for (name, text) in sources { std::fs::write(root.join(name), text).unwrap(); }
+        let keys: Vec<_> = sources.iter().map(|(name, _)| crate::paths::file_key(&root.join(name))).collect();
+        let (service, socket) = tower_lsp_server::LspService::new(|client|
+            Backend::with_analysis_providers(client, vec![Arc::new(Provider)]));
+        drop(socket);
+        let backend = service.inner();
+        let changed = {
+            let mut ws = backend.ws.lock();
+            assert_eq!(ws.scan(&root), 3);
+            assert!(!ws.include_closed_diagnostics());
+            for (key, (_, text)) in keys.iter().skip(1).zip(sources.iter().skip(1)) {
+                ws.open(key.clone(), (*text).into());
+            }
+            ws.take_extension_diagnostic_changes()
+        };
+        assert!(changed.contains(&keys[0]), "the real closed provider owner participates in change fanout");
+        for key in changed { backend.schedule_one_diagnostic(key); }
+        assert!(!backend.doc_versions.lock().contains_key(&keys[0]), "closed owners create no debounce task");
+        for key in &keys[1..] {
+            assert!(backend.doc_versions.lock().contains_key(key));
+            let (items, _, _) = lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, key,
+                DiagnosticDelivery::Push).unwrap();
+            assert!(items.iter().any(|item| item.message == "extension-owner-diagnostic"));
+        }
+        let resource = crate::paths::file_key(&root.join("config.json"));
+        backend.ws.lock().record_owned_document(&resource, Some("{}".into()), 1, Some("json".into()));
+        backend.schedule_one_diagnostic(resource.clone());
+        assert!(backend.doc_versions.lock().contains_key(&resource), "open resource overlays remain admitted");
+
+        // A queued open document may close before its debounce expires. Delivery rechecks
+        // admission and clears the prior push without computing its retained closed facts.
+        backend.ws.lock().close(&keys[1]);
+        assert!(lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, &keys[1],
+            DiagnosticDelivery::Push).is_none());
+        let cleared = lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, &keys[1],
+            DiagnosticDelivery::Close).unwrap();
+        assert!(cleared.0.is_empty());
+        let pulled = lsp_diagnostics_with_result(&backend.ws, &backend.doc_versions, &keys[1]);
+        assert!(pulled.0.iter().any(|item| item.message == "extension-owner-diagnostic"),
+            "explicit closed-document pulls still see published provider facts");
+        backend.ws.lock().close_owned_document(&resource);
+        assert!(lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, &resource,
+            DiagnosticDelivery::Push).is_none());
+
+        backend.ws.lock().set_include_closed_diagnostics(true);
+        backend.schedule_one_diagnostic(keys[0].clone());
+        assert!(backend.doc_versions.lock().contains_key(&keys[0]));
+        assert!(lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, &keys[0],
+            DiagnosticDelivery::Push).unwrap().0.iter().any(|item| item.message == "extension-owner-diagnostic"));
+        assert!(!lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, &keys[1],
+            DiagnosticDelivery::Close).unwrap().0.is_empty(), "workspace scope retains closed-file diagnostics");
+        backend.ws.lock().set_include_closed_diagnostics(false);
+        assert!(lsp_diagnostics_for_delivery(&backend.ws, &backend.doc_versions, &keys[0],
+            DiagnosticDelivery::Push).is_none(), "delivery also rechecks a queued scope change");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn kotlin_import_lookup_matches_import_and_usage_identifiers() {
         let text = "package app\nimport android.graphics.Bitmap\nfun use(value: Bitmap) = value\n";
@@ -11992,6 +12104,9 @@ fn schedule_owned_diagnostic(
     versions: &Arc<Mutex<HashMap<String, DiagnosticRevision>>>,
     key: String,
 ) {
+    if !ws.lock().allows_push_diagnostics(&key) {
+        return;
+    }
     let version = {
         let mut versions = versions.lock();
         let revision = versions.entry(key.clone()).or_default();
@@ -12006,7 +12121,7 @@ fn schedule_owned_diagnostic(
         if versions.lock().get(&key).copied() != Some(version) {
             return;
         }
-        publish_diagnostics(&ws, &client, &versions, &key).await;
+        publish_diagnostics(&ws, &client, &versions, &key, DiagnosticDelivery::Push).await;
     });
 }
 
@@ -12248,6 +12363,7 @@ impl Backend {
                     for key in changed {
                         schedule_owned_diagnostic(&ws, &client, &versions, key);
                     }
+                    schedule_extension_sources(&ws, &client, &versions);
                 }
                 // Never close/join notify under Workspace's mutex or in the notify callback.
                 if let Some(slot) = weak_slot.upgrade() {
@@ -12263,6 +12379,7 @@ impl Backend {
         for key in changed {
             self.schedule_one_diagnostic(key);
         }
+        schedule_extension_sources(&self.ws, &self.client, &self.doc_versions);
         match result {
             Ok(result) => result,
             Err(error) => {
@@ -12612,6 +12729,7 @@ fn schedule_selected_kotlin_diagnostics(
                             keys.sort(); keys.dedup(); keys
                         };
                         for key in keys { schedule_owned_diagnostic(&ws, &event_client, &event_versions, key); }
+                        schedule_extension_sources(&ws, &event_client, &event_versions);
                         schedule_selected_kotlin_diagnostics(&ws, &event_client, &event_versions, &state,
                             &event_workers, &event_watches, &event_root);
                     });
@@ -12645,8 +12763,9 @@ fn schedule_selected_kotlin_diagnostics(
             match result {
                 Ok(keys) => {
                     for key in keys {
-                        publish_diagnostics(&ws, &client, &versions, &key).await;
+                        publish_diagnostics(&ws, &client, &versions, &key, DiagnosticDelivery::Push).await;
                     }
+                    schedule_extension_sources(&ws, &client, &versions);
                 }
                 Err(error) => {
                     request

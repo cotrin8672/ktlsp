@@ -6112,3 +6112,22 @@ Existing snapshot checks, running evaluations, and suspension stay in force.
 The 16 focused IPC tests pass, including a rejected open owner followed by a
 valid open owner and the original closed-owner order. The Sodium Neovim outcome
 with the new ordering still requires the original consumer run.
+
+The original Sodium entry with `0883a396` and MC `199d74d` did not observe
+an exact GuiMixin acceptance or dispatch an original command. A dependency
+install spent 41.21 seconds waiting for the workspace mutex. A focused replay
+with acquired/released tracing then found 231 diagnostic computations after one
+document open. They held the mutex for 64.59 seconds in total. The longest
+diagnostic held it for 40.44 seconds while dependency installation waited
+41.31 seconds (`C:/tmp/sodium-open-diagnostic/run/`).
+
+Automatic diagnostic pushes now honor the existing open-only scope. The host
+retains explicit pulls, the opt-in workspace scope, close-time clearing and the
+extension worker wake. The focused regression and 16 existing checks passed.
+The release candidate's focused Sodium replay sent one GuiMixin diagnostic
+notification and zero for other files. The longest observed dependency lock
+wait was 51.32 ms across 93 install results. This is a separate startup sample.
+The host exited cleanly, but the exact GuiMixin revision was still not accepted
+within the editor observation window. Its evaluations reached IPC and were
+rejected as the semantic index or model advanced. The original Sodium workflow
+remains open (`C:/tmp/sodium-open-postfix/run/`).

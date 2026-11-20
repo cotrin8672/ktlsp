@@ -121,6 +121,7 @@ pub struct Workspace {
     _index_drop_marker: WorkspaceDropMarker,
     /// Open buffers, keyed by canonical identity. Take precedence over disk.
     open_docs: HashMap<String, DocState>,
+    include_closed_diagnostics: bool,
     owned_documents: HashMap<String, OwnedDocumentSnapshot>,
     raw_command_sources: BTreeSet<String>,
     resource_catalogs:BTreeMap<ktcore::project_model::ProjectScope,Arc<crate::resource_inputs::ResourceCatalog>>,
@@ -195,6 +196,7 @@ impl Workspace {
             index: Index::new(),
             _index_drop_marker: WorkspaceDropMarker("workspace.index.dropped"),
             open_docs: HashMap::new(),
+            include_closed_diagnostics: false,
             owned_documents: HashMap::new(),
             raw_command_sources: BTreeSet::new(),
             resource_catalogs:BTreeMap::new(),resource_overlay_epoch:Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -263,6 +265,20 @@ impl Workspace {
 
     pub fn open_doc_keys(&self) -> Vec<String> {
         self.open_docs.keys().cloned().collect()
+    }
+
+    pub(crate) fn set_include_closed_diagnostics(&mut self, include: bool) {
+        self.include_closed_diagnostics = include;
+    }
+
+    pub(crate) fn include_closed_diagnostics(&self) -> bool {
+        self.include_closed_diagnostics
+    }
+
+    pub(crate) fn allows_push_diagnostics(&self, key: &str) -> bool {
+        self.include_closed_diagnostics
+            || self.open_docs.contains_key(key)
+            || self.owned_documents.contains_key(key)
     }
 
     pub fn analysis_generation(&self) -> u64 {
