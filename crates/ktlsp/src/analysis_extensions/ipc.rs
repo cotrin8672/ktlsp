@@ -123,6 +123,44 @@ mod tests {
     }
 
     #[test]
+    fn rejected_queued_owner_does_not_block_later_work_in_the_same_take() {
+        let (index, mut host) = host();
+        host.store.remove_source("/ipc/Owner.kt");
+        assert!(host.store.begin(&index, "test.ipc", "/ipc/Owner.kt").is_err());
+
+        let work = host.take_ipc_work(&index, None);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].params["owner"], "/ipc/Target.kt");
+        assert!(host.ipc_providers["test.ipc"].queued.is_empty());
+        assert!(host.ipc_providers["test.ipc"].running);
+        assert!(host.ipc_providers["test.ipc"].enabled);
+        assert_eq!(host.ipc_evaluations.len(), 1);
+        assert!(host.take_ipc_work(&index, None).is_empty());
+    }
+
+    #[test]
+    fn rejected_source_snapshots_drain_the_queue_without_dispatching() {
+        let (index, mut host) = host();
+        host.store
+            .configure_provider("test.ipc", true, Arc::from("{"));
+        let mut read = host
+            .store
+            .begin(&index, "test.ipc", "/ipc/Owner.kt")
+            .unwrap();
+        let mut evaluation = Evaluation::new("test.ipc".into(), "/ipc/Owner.kt".into(), 0);
+        assert!(evaluation.source(&mut read).is_err());
+        drop(read);
+
+        assert!(host.take_ipc_work(&index, None).is_empty());
+        assert!(host.ipc_providers["test.ipc"].queued.is_empty());
+        assert!(!host.ipc_providers["test.ipc"].running);
+        assert!(host.ipc_providers["test.ipc"].enabled);
+        assert!(host.ipc_evaluations.is_empty());
+        assert!(host.store.source_declarations("/ipc/Owner.kt").is_some());
+        assert!(host.store.source_declarations("/ipc/Target.kt").is_some());
+    }
+
+    #[test]
     fn stale_evaluation_is_not_pending_until_fresh_work_is_queued() {
         let (index, mut host) = host();
         let work = host.take_ipc_work(&index, None).remove(0);
@@ -596,33 +634,33 @@ impl AnalysisExtensions {
             if !slot.enabled || slot.running {
                 continue;
             }
-            let Some(owner) = slot.queued.pop_first() else {
-                continue;
-            };
-            let worker = slot.worker.clone();
-            let mut evaluation = Evaluation::new(provider.clone(), owner.clone(), worker.id);
-            let Ok(mut read) = self.store.begin(index, &provider, &owner) else {
-                continue;
-            };
-            // begin's model read guards this snapshot through resume and commit.
-            evaluation.project = project.cloned();
-            let params = evaluation.source(&mut read);
-            evaluation.pending = Some(read.finish());
-            match params {
-                Ok(params) => {
-                    slot.running = true;
-                    work.push(Work {
-                        command: None,
-                        evaluation: evaluation.id,
-                        provider,
-                        worker,
-                        params,
-                    });
-                    self.ipc_evaluations.insert(evaluation.id, evaluation);
-                }
-                Err(error) => {
-                    let _ = self.store.fail(evaluation.pending.take().unwrap());
-                    tracing::warn!(provider, owner, error, "extension snapshot rejected");
+            while let Some(owner) = slot.queued.pop_first() {
+                let worker = slot.worker.clone();
+                let mut evaluation = Evaluation::new(provider.clone(), owner.clone(), worker.id);
+                let Ok(mut read) = self.store.begin(index, &provider, &owner) else {
+                    continue;
+                };
+                // begin's model read guards this snapshot through resume and commit.
+                evaluation.project = project.cloned();
+                let params = evaluation.source(&mut read);
+                evaluation.pending = Some(read.finish());
+                match params {
+                    Ok(params) => {
+                        slot.running = true;
+                        work.push(Work {
+                            command: None,
+                            evaluation: evaluation.id,
+                            provider,
+                            worker,
+                            params,
+                        });
+                        self.ipc_evaluations.insert(evaluation.id, evaluation);
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = self.store.fail(evaluation.pending.take().unwrap());
+                        tracing::warn!(provider, owner, error, "extension snapshot rejected");
+                    }
                 }
             }
         }
