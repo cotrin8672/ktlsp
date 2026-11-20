@@ -1280,7 +1280,9 @@ The host arms a native root/ancestor lease before walking the filtered domain,
 prunes excluded subtrees, and merges current arbitrary-language buffers including
 new unsaved files. Disk changes, additions, deletions, renames and overlays retire
 observed reads through the existing checked evaluation/source/model/provider
-lifetimes. Ambiguous native events may conservatively retire excluded churn.
+lifetimes. A Windows `Modify(Any)` notification for a named path below an excluded
+directory is filtered like a content change. Rescans, renames, and changes naming
+the root or an explicitly watched input still invalidate the read.
 Symlinks, unreadable paths, unsupported watch coverage and bounds never establish
 a complete empty domain. Current native recursive coverage is implemented on
 Windows; unsupported platforms return Unknown.

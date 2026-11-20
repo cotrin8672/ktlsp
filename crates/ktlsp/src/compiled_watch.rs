@@ -346,7 +346,7 @@ impl WatchPlan {
         let filterable = matches!(event.kind,
             EventKind::Create(CreateKind::File|CreateKind::Folder)
                 | EventKind::Remove(RemoveKind::File|RemoveKind::Folder)
-                | EventKind::Modify(ModifyKind::Data(_)|ModifyKind::Metadata(_))
+                | EventKind::Modify(ModifyKind::Any|ModifyKind::Data(_)|ModifyKind::Metadata(_))
                 | EventKind::Access(_));
         event.paths.iter().any(|path| {
             let parent = path.parent().map(key);
@@ -1507,26 +1507,40 @@ mod filtered_root_watch_tests {
         let root=std::env::temp_dir().join("ktlsp-filtered-root-plan-only");let plan=plan(&root);
         let excluded=root.join("vendor/nested/config.json");
         for kind in [EventKind::Create(CreateKind::File),EventKind::Remove(RemoveKind::File),
-            EventKind::Modify(ModifyKind::Data(DataChange::Content)),EventKind::Create(CreateKind::Folder)] {
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),EventKind::Modify(ModifyKind::Any),
+            EventKind::Create(CreateKind::Folder)] {
             assert!(!plan.affected(&Event::new(kind).add_path(excluded.clone())),"{kind:?}");
         }
         for kind in [EventKind::Any,EventKind::Other,EventKind::Create(CreateKind::Any),
-            EventKind::Remove(RemoveKind::Any),EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::Any),
             EventKind::Modify(ModifyKind::Other),EventKind::Modify(ModifyKind::Name(RenameMode::From)),
             EventKind::Modify(ModifyKind::Name(RenameMode::To)),EventKind::Modify(ModifyKind::Name(RenameMode::Both))] {
             assert!(plan.affected(&Event::new(kind).add_path(excluded.clone())),"{kind:?}");
         }
-        assert!(plan.affected(&Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
-            .add_path(excluded.clone()).set_flag(notify::event::Flag::Rescan)));
+        for kind in [EventKind::Modify(ModifyKind::Data(DataChange::Content)),EventKind::Modify(ModifyKind::Any)] {
+            assert!(plan.affected(&Event::new(kind)
+                .add_path(excluded.clone()).set_flag(notify::event::Flag::Rescan)));
+        }
         assert!(plan.affected(&Event::new(EventKind::Other)));
+        assert!(plan.affected(&Event::new(EventKind::Modify(ModifyKind::Any))));
         for path in [root.clone(),root.join("vendor"),root.parent().unwrap().to_path_buf()] {
-            assert!(plan.affected(&Event::new(EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))).add_path(path)));
+            for kind in [EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),EventKind::Modify(ModifyKind::Any)] {
+                assert!(plan.affected(&Event::new(kind).add_path(path.clone())));
+            }
         }
         for path in [root.join("src/config.json"),root.join("build/config.json"),root.join(".gradle/config.json"),root.join("other/vendor-copy/config.json")] {
-            assert!(plan.affected(&Event::new(EventKind::Create(CreateKind::File)).add_path(path)));
+            for kind in [EventKind::Create(CreateKind::File),EventKind::Modify(ModifyKind::Any)] {
+                assert!(plan.affected(&Event::new(kind).add_path(path.clone())));
+            }
         }
-        assert!(plan.affected(&Event::new(EventKind::Create(CreateKind::File))
-            .add_path(excluded.clone()).add_path(root.join("included.json"))));
+        for kind in [EventKind::Create(CreateKind::File),EventKind::Modify(ModifyKind::Any)] {
+            assert!(plan.affected(&Event::new(kind)
+                .add_path(excluded.clone()).add_path(root.join("included.json"))));
+        }
+        let mut exact=plan.clone();exact.exact.insert(key(&excluded));
+        assert!(exact.affected(&Event::new(EventKind::Modify(ModifyKind::Any)).add_path(excluded.clone())));
+        let mut read_tree=plan.clone();read_tree.trees.insert(key(&root.join("vendor/nested")));
+        assert!(read_tree.affected(&Event::new(EventKind::Modify(ModifyKind::Any)).add_path(excluded.clone())));
         assert!(plan.covers_read(&key(&root.join("included.json")),false));
         assert!(!plan.covers_read(&key(&excluded),false));
         assert!(!plan.covers_read(&key(&root),true),"filtered coverage is not an unfiltered directory read proof");
@@ -1604,17 +1618,40 @@ mod filtered_root_watch_tests {
 
     #[cfg(windows)]
     #[test]
-    fn filtered_root_native_ambiguous_excluded_write_still_retires_the_lease() {
+    fn filtered_root_native_named_excluded_modify_any_keeps_the_signal_current() {
         let base=root_fixture();let root=base.join("project");
         std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
         let excluded=root.join("vendor/nested/cache.json");std::fs::write(&excluded,b"before").unwrap();
         let plan=WatchPlan::filtered_root(&root,&BTreeSet::from(["vendor".into()])).unwrap();
+        let shared=Arc::new(RwLock::new(plan.clone()));
+        let invalid=Arc::new(AtomicBool::new(false));
+        let (wake,mut wakes)=mpsc::channel(1);
+        let signal=Arc::new(Signal {invalid:invalid.clone(),closed:AtomicBool::new(false),wake,
+            callback:Mutex::new(None)});
         let (observed,events)=std::sync::mpsc::channel();
-        let lease=HostInputLease::new(plan,Arc::new(move || {let _=observed.send(());})).unwrap();
-        // The vendored Windows backend emits Modify(Any), not a proven data-only notification.
+        let dispatch_signal=signal.clone();
+        let mut watcher=notify::recommended_watcher(move |event:notify::Result<Event>| {
+            let delivered=event.as_ref().cloned().map_err(ToString::to_string);
+            dispatch_signal.event(&shared,event);
+            // Observe delivery after dispatch, rather than waiting for the absence of invalidation.
+            let _=observed.send(delivered);
+        }).unwrap();
+        for directory in &plan.directories {
+            watcher.watch(directory,if plan.recursive.contains(directory) {
+                RecursiveMode::Recursive
+            } else {RecursiveMode::NonRecursive}).unwrap();
+        }
         std::fs::write(&excluded,b"changed").unwrap();
-        events.recv_timeout(std::time::Duration::from_secs(5)).expect("ambiguous native events must stay conservative");
-        assert!(!lease.is_current());lease.watch.as_ref().unwrap().close();drop(lease);
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop {
+            let event=events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("native excluded write must be dispatched").expect("native watcher must remain healthy");
+            if event.kind==EventKind::Modify(ModifyKind::Any)
+                && event.paths.iter().any(|path|key(path)==key(&excluded)) {break;}
+        }
+        assert!(!invalid.load(Ordering::Acquire),"named excluded native modification must not retire its signal");
+        assert!(wakes.try_recv().is_err());
+        signal.disarm();drop(watcher);
         std::fs::remove_dir_all(base).unwrap();
     }
 

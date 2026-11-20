@@ -1,5 +1,13 @@
 # Current fork state
 
+The Windows root-file watch now filters named `Modify(Any)` paths strictly below
+excluded directories. The multi-source-set trace showed Gradle's `fileChanges`
+notification retiring a root-file guard while the project generation and open
+document stayed current. Six focused tests pass, including a delivered native
+Windows notification and the retained invalidation checks for relevant changes.
+Evidence: `filtered-root-modify-any116/test.log` under the acceptance run root.
+The original MC editor matrix is a separate consumer verification.
+
 Selected binary dependency ABI113 is published at `b04f13bb`, following the Gradle
 operational-watch repair112 at `444deae2`. Six focused regressions pass (three per
 repair); one shared release build has SHA-256
