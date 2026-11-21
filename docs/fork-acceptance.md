@@ -6143,3 +6143,12 @@ corrections passed individually against one rebuilt test executable, preserving
 exact masks, negative type controls and the deferred-ACK watch assertions.
 The original workspace run retains its nonzero result
 (`C:/tmp/ktlsp-final-94883119-workspace/`).
+
+With the same `94883119` host and MC `199d74d`, a separate Sodium run waited
+for both existing readiness notifications before opening GuiMixin. The trace
+records 41,204 binary preview files in 104.58 seconds, both readiness flags,
+the exact GuiMixin revision accepted at evaluation 250, and a clean host exit.
+The first command (`mcdev.info`, evaluation 318) reached the companion, which
+hit its IPC continuation limit while reading root snapshots. The companion
+owns that follow-up. The project-only startup case and the original Sodium
+workflow are still open (`C:/tmp/sodium-indexed-94883119-199d74d/`).
