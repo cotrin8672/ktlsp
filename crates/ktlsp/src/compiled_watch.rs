@@ -393,7 +393,7 @@ impl WatchPlan {
                 | EventKind::Modify(notify::event::ModifyKind::Name(_))
         );
         let filterable = matches!(event.kind,
-            EventKind::Create(CreateKind::File|CreateKind::Folder)
+            EventKind::Create(CreateKind::Any|CreateKind::File|CreateKind::Folder)
                 | EventKind::Remove(RemoveKind::Any|RemoveKind::File|RemoveKind::Folder)
                 | EventKind::Modify(ModifyKind::Any|ModifyKind::Data(_)|ModifyKind::Metadata(_))
                 | EventKind::Access(_));
@@ -1623,13 +1623,13 @@ mod filtered_root_watch_tests {
     fn filtered_root_events_keep_ambiguity_boundaries_and_read_roles_conservative() {
         let root=std::env::temp_dir().join("ktlsp-filtered-root-plan-only");let plan=plan(&root);
         let excluded=root.join("vendor/nested/config.json");
-        for kind in [EventKind::Create(CreateKind::File),EventKind::Remove(RemoveKind::Any),
+        for kind in [EventKind::Create(CreateKind::Any),EventKind::Create(CreateKind::File),EventKind::Remove(RemoveKind::Any),
             EventKind::Remove(RemoveKind::File),
             EventKind::Modify(ModifyKind::Data(DataChange::Content)),EventKind::Modify(ModifyKind::Any),
             EventKind::Create(CreateKind::Folder)] {
             assert!(!plan.affected(&Event::new(kind).add_path(excluded.clone())),"{kind:?}");
         }
-        for kind in [EventKind::Any,EventKind::Other,EventKind::Create(CreateKind::Any),
+        for kind in [EventKind::Any,EventKind::Other,
             EventKind::Modify(ModifyKind::Other),EventKind::Modify(ModifyKind::Name(RenameMode::From)),
             EventKind::Modify(ModifyKind::Name(RenameMode::To)),EventKind::Modify(ModifyKind::Name(RenameMode::Both))] {
             assert!(plan.affected(&Event::new(kind).add_path(excluded.clone())),"{kind:?}");
