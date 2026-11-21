@@ -23,6 +23,8 @@ const MAX_BATCH: usize = 256;
 const MAX_HANDLES: usize = 16_384;
 const MAX_STREAM_CONTINUATIONS: usize = 256;
 pub(crate) const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const ROOT_SNAPSHOT_INITIAL_BYTES: usize = 96 * 1024;
+const ROOT_SNAPSHOT_CONTINUATION_BYTES: usize = 384 * 1024;
 const EVALUATION_LIMIT: Duration = Duration::from_secs(30);
 static NEXT_EVALUATION: AtomicU64 = AtomicU64::new(1);
 const PROJECT_FACTS: &str = "project-class-facts-v1";
@@ -1655,7 +1657,9 @@ impl Evaluation {
         };
         if start>body.text.len() || !body.text.is_char_boundary(start) {return Err("invalid root-file text cursor".into());}
         let root=self.root_descriptor(&catalog);let entry=&catalog.entries[index];
-        let mut end=(start+96*1024).min(body.text.len());
+        // Keep first reads batchable; continuations spend their own stream quota.
+        let page_bytes=if after.is_some() {ROOT_SNAPSHOT_CONTINUATION_BYTES} else {ROOT_SNAPSHOT_INITIAL_BYTES};
+        let mut end=(start+page_bytes).min(body.text.len());
         while !body.text.is_char_boundary(end) {end-=1;}
         let mut value;
         loop {
@@ -3897,6 +3901,51 @@ mod root_file_wire_tests {
     }
 
     #[test]
+    fn root_snapshot_keeps_initial_reads_batchable_and_widens_ascii_continuations() {
+        use ktcore::index::Index;
+        let index=Index::new();let mut store=ExtensionStore::default();
+        let owner="/root-pages/Owner.kt";store.configure_provider("root-pages",true,Arc::from("{}"));
+        store.replace_source(&index,owner,Arc::from(""),Knowledge::Found(()),Vec::new()).unwrap();
+        let mut read=store.begin_read(&index,"root-pages",owner).unwrap();
+        let mut evaluation=Evaluation::new("root-pages".into(),owner.into(),1);
+        evaluation.project_operations=ROOT_FILE_INVENTORY|ROOT_FILE_SNAPSHOT;
+        let root=std::env::temp_dir().join("root-snapshot-pages");let path=root.join("large.tiny");
+        let catalog=Arc::new(crate::root_files::Catalog {revision:43,root:root.clone(),uri:crate::root_files::uri(&root).unwrap(),
+            filter:Default::default(),entries:vec![crate::root_files::Entry {uri:crate::root_files::uri(&path).unwrap(),path,
+                relative:"large.tiny".into(),document:None}],complete:true,problems:Default::default(),guard:Arc::new(Flag(AtomicBool::new(false)))});
+        evaluation.root_catalogs.insert(Default::default(),Ok(catalog));
+        let id=evaluation.id.to_string();let query=|queries:Value|json!({"evaluation":id,"queries":queries});
+        let inventory=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileInventory","filter":{}}]))).unwrap();
+        let file=inventory["facts"][0]["files"][0]["file"].as_str().unwrap();
+        let text="a".repeat(1024*1024);
+        evaluation.root_results.insert(file.into(),Ok(Arc::new(crate::root_files::Body {text:Arc::from(text.as_str()),
+            sha256:"wire-only".into(),revision:1,document_version:None})));
+        let initial=evaluation.batch(&mut read,"analysis/readFacts",query(json!((0..4).map(|_|json!({"op":"rootFileSnapshot","file":file})).collect::<Vec<_>>()))).unwrap();
+        assert!(serde_json::to_vec(&initial).unwrap().len()<MAX_FRAME/2);
+        for fact in initial["facts"].as_array().unwrap() {
+            assert_eq!(fact["value"]["text"].as_str().unwrap().len(),ROOT_SNAPSHOT_INITIAL_BYTES);
+            assert_eq!(fact["value"]["offset"],0);
+        }
+        let mut assembled=initial["facts"][0]["value"]["text"].as_str().unwrap().to_owned();
+        let mut after=initial["facts"][0]["value"]["next"].clone();let mut continuations=0;
+        while !after.is_null() {
+            let result=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileSnapshot","file":file,"after":after}]))).unwrap();
+            let value=&result["facts"][0]["value"];let chunk=value["text"].as_str().unwrap();
+            assert_eq!(value["offset"],assembled.len());
+            assert_eq!(chunk.len(),ROOT_SNAPSHOT_CONTINUATION_BYTES.min(text.len()-assembled.len()));
+            assert!(serde_json::to_vec(&result).unwrap().len()<MAX_FRAME/2);
+            assembled.push_str(chunk);after=value["next"].clone();continuations+=1;
+            evaluation.account_stream_reply(&json!({"jsonrpc":"2.0","id":"wire","result":result})).unwrap();
+        }
+        assert_eq!(assembled,text);assert_eq!(continuations,3);
+        assert_eq!(evaluation.batches,2,"continuations retain the separate stream quota");
+        assert_eq!(evaluation.stream_continuations,continuations);
+        evaluation.stream_bytes=MAX_STREAM_BYTES-1;
+        evaluation.reply_is_stream=true;
+        assert!(evaluation.account_stream_reply(&json!({"jsonrpc":"2.0","id":"wire","result":{}})).is_err());
+    }
+
+    #[test]
     fn issued_root_files_page_stream_and_retire_without_resource_authority() {
         use ktcore::index::Index;
         use sha2::{Digest,Sha256};
@@ -3931,13 +3980,16 @@ mod root_file_wire_tests {
         assert!(evaluation.root_catalog_for_file(first["root"]["identity"].as_str().unwrap()).is_err());
         assert!(evaluation.root_catalog_for_file("/root-wire/config.json").is_err());
         let foreign=Evaluation::new("root-wire".into(),owner.into(),2);assert!(foreign.root_catalog_for_file(file).is_err());
-        let text=format!("{}{}","\0".repeat(100_000),"😃".repeat(10_000));let hash=format!("{:x}",Sha256::digest(text.as_bytes()));
+        let text=format!("{}{}","\0".repeat(1_000_000),"x😃".repeat(10_000));let hash=format!("{:x}",Sha256::digest(text.as_bytes()));
         evaluation.root_results.insert(file.into(),Ok(Arc::new(crate::root_files::Body {text:Arc::from(text.as_str()),sha256:hash.clone(),revision:9,document_version:Some(7)})));
         let mut after=Value::Null;let mut assembled=String::new();let mut pages=0;
         loop {
             let result=evaluation.batch(&mut read,"analysis/readFacts",query(json!([{"op":"rootFileSnapshot","file":file,"after":after}]))).unwrap();
             assert!(serde_json::to_vec(&result).unwrap().len()<MAX_FRAME/2);
             let value=&result["facts"][0]["value"];assert_eq!(value["offset"],json!(assembled.len()));
+            assert!(serde_json::to_vec(value).unwrap().len()<=MAX_FRAME/2-1024,"escaped JSON still fits the individual page budget");
+            if pages==0 {assert!(value["text"].as_str().unwrap().len()<ROOT_SNAPSHOT_INITIAL_BYTES);}
+            else if assembled.len()<900_000 {assert!(value["text"].as_str().unwrap().len()<ROOT_SNAPSHOT_CONTINUATION_BYTES);}
             assert_eq!(value["identity"]["sha256"],hash);assert_eq!(value["identity"]["revision"],"9");assert_eq!(value["documentVersion"],7);
             assembled.push_str(value["text"].as_str().unwrap());pages+=1;after=value["next"].clone();
             if after.is_null() {break;}
