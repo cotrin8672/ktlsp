@@ -680,7 +680,7 @@ impl DependencyResult {
     const INSTALL_CHUNK_FILES: usize = 256;
     const INSTALL_CHUNK_SYMBOLS: usize = 8192;
     const OPEN_SOURCE_HANDOFF: Duration = Duration::from_millis(20);
-    const OPEN_ROOT_STREAM_HANDOFF: Duration = Duration::from_secs(2);
+    const OPEN_COMMAND_HANDOFF: Duration = Duration::from_secs(2);
 
     fn install_batches(
         &mut self,
@@ -711,18 +711,18 @@ impl DependencyResult {
             {
                 break;
             }
-            // Let a cached command root stream finish before the next dependency chunk. It can
-            // release the workspace lock while the bounded wait runs; ordinary source reads
-            // retain the shorter fair handoff below.
-            let stream = guard.claim_open_root_stream_handoff();
-            let handoff = stream.as_ref().map(|(evaluation, _)| *evaluation)
+            // Let an open command that read semantic facts or a cached root stream finish before
+            // the next dependency chunk. The bounded wait holds no workspace lock; source reads
+            // retain the shorter fair handoff below. Both command paths share one claim.
+            let command = guard.claim_open_command_handoff();
+            let handoff = command.as_ref().map(|(evaluation, _)| *evaluation)
                 .or_else(|| guard.claim_open_source_handoff());
             if let Some(evaluation) = handoff {
                 parking_lot::MutexGuard::unlock_fair(guard);
                 let handoff_start = install_start.map(|_| Instant::now());
-                let phase = if let Some((_, completed)) = stream {
-                    let _ = completed.recv_timeout(Self::OPEN_ROOT_STREAM_HANDOFF);
-                    "deps.open_root_stream_handoff"
+                let phase = if let Some((_, completed)) = command {
+                    let _ = completed.recv_timeout(Self::OPEN_COMMAND_HANDOFF);
+                    "deps.open_command_handoff"
                 } else {
                     std::thread::sleep(Self::OPEN_SOURCE_HANDOFF);
                     "deps.open_source_handoff"

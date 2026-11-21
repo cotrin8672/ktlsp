@@ -952,9 +952,9 @@ impl Workspace {
         self.analysis_extensions.note_cached_root_stream(evaluation, active);
     }
 
-    pub(crate) fn claim_open_root_stream_handoff(&mut self) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
+    pub(crate) fn claim_open_command_handoff(&mut self) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
         let open_docs = &self.open_docs;
-        self.analysis_extensions.claim_open_root_stream_handoff(|owner| open_docs.contains_key(owner))
+        self.analysis_extensions.claim_open_command_handoff(|owner| open_docs.contains_key(owner))
     }
 
     pub(crate) fn claim_open_source_handoff(&mut self) -> Option<u64> {

@@ -495,15 +495,63 @@ mod tests {
             .unwrap();
         let work = host.begin_ipc_command(&index, None, "test.ipc", owner, "fixture.echo".into(), vec![], json!({}))
             .unwrap();
-        assert!(host.claim_open_root_stream_handoff(|_| true).is_none());
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
         host.note_cached_root_stream(work.evaluation, true);
-        assert!(host.claim_open_root_stream_handoff(|_| false).is_none());
-        let (evaluation, completed) = host.claim_open_root_stream_handoff(|key| key == owner).unwrap();
+        assert!(host.claim_open_command_handoff(|_| false).is_none());
+        let (evaluation, completed) = host.claim_open_command_handoff(|key| key == owner).unwrap();
         assert_eq!(evaluation, work.evaluation);
-        assert!(host.claim_open_root_stream_handoff(|_| true).is_none());
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
         assert_eq!(completed.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
         host.finish_ipc_command(work.evaluation, Ok(Value::Null)).unwrap();
         assert_eq!(completed.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn semantic_command_handoff_requires_current_open_read_and_is_shared_with_root_stream() {
+        let (index, mut host) = host();
+        let owner = "/ipc/Owner.kt";
+        host.register_ipc_commands(&index, "test.ipc", vec!["fixture-child".into()], vec!["fixture.echo".into()])
+            .unwrap();
+        let work = host.begin_ipc_command(&index, None, "test.ipc", owner, "fixture.echo".into(), vec![], json!({}))
+            .unwrap();
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
+        host.ipc_batch(&index, work.evaluation, "analysis/readFacts", json!({
+            "evaluation": work.evaluation.to_string(),
+            "queries": [{"op":"resolveType","name":"ipc.Target"}]
+        })).unwrap();
+        assert!(host.claim_open_command_handoff(|_| false).is_none());
+        let (evaluation, completed) = host.claim_open_command_handoff(|key| key == owner).unwrap();
+        assert_eq!(evaluation, work.evaluation);
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
+        host.note_cached_root_stream(work.evaluation, true);
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
+        assert_eq!(completed.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        host.finish_ipc_command(work.evaluation, Ok(Value::Null)).unwrap();
+        assert_eq!(completed.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn semantic_command_handoff_rejects_noncommand_stale_and_failed_evaluations() {
+        let (index, mut host) = host();
+        let work = host.take_ipc_work(&index, None, &[]).remove(0);
+        let query = |evaluation: u64| json!({
+            "evaluation": evaluation.to_string(),
+            "queries": [{"op":"resolveType","name":"ipc.Target"}]
+        });
+        host.ipc_batch(&index, work.evaluation, "analysis/readFacts", query(work.evaluation)).unwrap();
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
+        host.finish_ipc_work(work.evaluation, Err("Stale".into()));
+
+        host.register_ipc_commands(&index, "test.ipc", vec!["fixture-child".into()], vec!["fixture.echo".into()])
+            .unwrap();
+        let work = host.begin_ipc_command(&index, None, "test.ipc", "/ipc/Owner.kt", "fixture.echo".into(), vec![], json!({}))
+            .unwrap();
+        host.ipc_batch(&index, work.evaluation, "analysis/readFacts", query(work.evaluation)).unwrap();
+        host.ipc_evaluations.get_mut(&work.evaluation).unwrap().failure = Some("failed".into());
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
+        host.ipc_evaluations.get_mut(&work.evaluation).unwrap().failure = None;
+        host.mark_index_changed();
+        assert!(host.claim_open_command_handoff(|_| true).is_none());
     }
 
     #[test]
@@ -863,21 +911,21 @@ impl AnalysisExtensions {
         }
     }
 
-    pub(crate) fn claim_open_root_stream_handoff(
+    pub(crate) fn claim_open_command_handoff(
         &mut self, is_open: impl Fn(&str) -> bool,
     ) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
         let evaluation = self.ipc_evaluations.values_mut().find(|evaluation| {
             evaluation.command
-                && evaluation.cached_root_stream_active
-                && evaluation.root_stream_handoff.is_none()
+                && evaluation.command_handoff.is_none()
                 && evaluation.failure.is_none()
                 && is_open(&evaluation.owner)
                 && evaluation.pending.as_ref().is_some_and(|pending| {
-                    self.store.validate_pending(pending).is_ok()
+                    (evaluation.cached_root_stream_active || pending.observes_semantic_index())
+                        && self.store.validate_pending(pending).is_ok()
                 })
         })?;
         let (completed, receiver) = std::sync::mpsc::channel();
-        evaluation.root_stream_handoff = Some(completed);
+        evaluation.command_handoff = Some(completed);
         Some((evaluation.id, receiver))
     }
 
