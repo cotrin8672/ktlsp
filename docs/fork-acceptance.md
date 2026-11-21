@@ -6175,3 +6175,14 @@ The release pin for the next single MC Sodium run is
 (SHA256 `B2D100B6F063BE41FD4FD4C750806381454985C27B58C0F7078099A5E9398B59`).
 The run must distinguish host transport success from MC continuation handling;
 it is not a whole-project readiness or IDEA-parity certificate.
+
+The follow-up release `2d9cf0096395b6904b85dd895cd42d23aa83c2e1` fixes the
+standard Java type-hover gap exposed by that run. Java `type_identifier` nodes
+now reuse the existing language navigation path, while ordinary identifiers,
+compiled-call handling and extension-specific semantics are unchanged. The
+real Neovim Sodium indexed-startup run returned a non-error hover containing
+`Gui` at `@Mixin(Gui.class)` and passed the original hover assertions (60/61/67)
+with clean exit 0 (`C:/tmp/sodium-wire-2d9cf009-e280fc7/editor-proof.json`).
+The remaining completion failure is 1,653 consumer-side `sourceFacts` reads and
+belongs to the mc-dev companion's bounded source-selection policy, not this
+host transport fix.
