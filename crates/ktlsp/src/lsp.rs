@@ -680,6 +680,7 @@ impl DependencyResult {
     const INSTALL_CHUNK_FILES: usize = 256;
     const INSTALL_CHUNK_SYMBOLS: usize = 8192;
     const OPEN_SOURCE_HANDOFF: Duration = Duration::from_millis(20);
+    const OPEN_ROOT_STREAM_HANDOFF: Duration = Duration::from_secs(2);
 
     fn install_batches(
         &mut self,
@@ -710,14 +711,24 @@ impl DependencyResult {
             {
                 break;
             }
-            // The provider may be between its fact reply and final commit. One chance per
-            // open source evaluation gives the child time to respond without borrowing the index.
-            if let Some(evaluation) = guard.claim_open_source_handoff() {
+            // Let a cached command root stream finish before the next dependency chunk. It can
+            // release the workspace lock while the bounded wait runs; ordinary source reads
+            // retain the shorter fair handoff below.
+            let stream = guard.claim_open_root_stream_handoff();
+            let handoff = stream.as_ref().map(|(evaluation, _)| *evaluation)
+                .or_else(|| guard.claim_open_source_handoff());
+            if let Some(evaluation) = handoff {
                 parking_lot::MutexGuard::unlock_fair(guard);
                 let handoff_start = install_start.map(|_| Instant::now());
-                std::thread::sleep(Self::OPEN_SOURCE_HANDOFF);
+                let phase = if let Some((_, completed)) = stream {
+                    let _ = completed.recv_timeout(Self::OPEN_ROOT_STREAM_HANDOFF);
+                    "deps.open_root_stream_handoff"
+                } else {
+                    std::thread::sleep(Self::OPEN_SOURCE_HANDOFF);
+                    "deps.open_source_handoff"
+                };
                 if let Some(start) = handoff_start {
-                    crate::trace::span("deps.open_source_handoff","deps",start,serde_json::json!({"evaluation":evaluation}));
+                    crate::trace::span(phase,"deps",start,serde_json::json!({"evaluation":evaluation}));
                 }
                 handoffs += 1;
                 let lock_start = install_start.map(|_| Instant::now());

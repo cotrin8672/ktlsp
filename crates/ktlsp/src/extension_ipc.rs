@@ -319,6 +319,8 @@ pub(crate) struct Evaluation {
     pub failure: Option<String>,
     pub committed_revision: Option<u64>,
     pub dependency_handoff_offered: bool,
+    pub cached_root_stream_active: bool,
+    pub root_stream_handoff: Option<std::sync::mpsc::Sender<()>>,
     pub project: Option<Arc<crate::classpath::ProjectSnapshot>>,
     pub project_operations: u32,
     pub command: bool,
@@ -363,6 +365,8 @@ impl Evaluation {
             failure: None,
             committed_revision: None,
             dependency_handoff_offered: false,
+            cached_root_stream_active: false,
+            root_stream_handoff: None,
             project: None,
             project_operations: 0,
             command: false,
@@ -2986,8 +2990,12 @@ impl Worker {
                                     }
                                 };
                                 stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
+                                let more=result.as_ref().is_ok_and(|result|result["facts"][0]["value"]["next"].is_string());
                                 let reply=fact_reply(request_id,result);
                                 workspace.account_ipc_stream_reply(work.evaluation,&reply)?;
+                                if work.command.is_some() {
+                                    workspace.note_cached_root_stream(work.evaluation, more);
+                                }
                                 Some(reply)
                             }
                         };
@@ -3008,6 +3016,9 @@ impl Worker {
                         let (roots,root_reads,reads,class,jvm,provenance)={
                             let mut workspace=workspace.lock();
                             stage="prepay-input";
+                            if work.command.is_some() {
+                                workspace.note_cached_root_stream(work.evaluation, false);
+                            }
                             let stream = workspace.prepay_ipc_input_read(work.evaluation, method, &message["params"])?;
                             account_reply = stream || work.command.is_some();
                             stage="plan-root-captures";

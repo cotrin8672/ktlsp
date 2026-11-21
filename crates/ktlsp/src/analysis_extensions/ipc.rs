@@ -488,6 +488,25 @@ mod tests {
     }
 
     #[test]
+    fn cached_root_handoff_is_open_command_only_once_and_released_on_finish() {
+        let (index, mut host) = host();
+        let owner = "/ipc/Owner.kt";
+        host.register_ipc_commands(&index, "test.ipc", vec!["fixture-child".into()], vec!["fixture.echo".into()])
+            .unwrap();
+        let work = host.begin_ipc_command(&index, None, "test.ipc", owner, "fixture.echo".into(), vec![], json!({}))
+            .unwrap();
+        assert!(host.claim_open_root_stream_handoff(|_| true).is_none());
+        host.note_cached_root_stream(work.evaluation, true);
+        assert!(host.claim_open_root_stream_handoff(|_| false).is_none());
+        let (evaluation, completed) = host.claim_open_root_stream_handoff(|key| key == owner).unwrap();
+        assert_eq!(evaluation, work.evaluation);
+        assert!(host.claim_open_root_stream_handoff(|_| true).is_none());
+        assert_eq!(completed.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        host.finish_ipc_command(work.evaluation, Ok(Value::Null)).unwrap();
+        assert_eq!(completed.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
     fn explicit_commands_keep_read_lifetimes_without_publishing_contributions() {
         let (index,mut host)=host();
         host.register_ipc_commands(&index,"test.ipc",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
@@ -836,6 +855,30 @@ impl AnalysisExtensions {
         })?;
         evaluation.dependency_handoff_offered = true;
         Some(evaluation.id)
+    }
+
+    pub(crate) fn note_cached_root_stream(&mut self, id: u64, active: bool) {
+        if let Some(evaluation) = self.ipc_evaluations.get_mut(&id) {
+            evaluation.cached_root_stream_active = active;
+        }
+    }
+
+    pub(crate) fn claim_open_root_stream_handoff(
+        &mut self, is_open: impl Fn(&str) -> bool,
+    ) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
+        let evaluation = self.ipc_evaluations.values_mut().find(|evaluation| {
+            evaluation.command
+                && evaluation.cached_root_stream_active
+                && evaluation.root_stream_handoff.is_none()
+                && evaluation.failure.is_none()
+                && is_open(&evaluation.owner)
+                && evaluation.pending.as_ref().is_some_and(|pending| {
+                    self.store.validate_pending(pending).is_ok()
+                })
+        })?;
+        let (completed, receiver) = std::sync::mpsc::channel();
+        evaluation.root_stream_handoff = Some(completed);
+        Some((evaluation.id, receiver))
     }
 
     pub(crate) fn ipc_completion_pending(&self, owner: &str) -> bool {

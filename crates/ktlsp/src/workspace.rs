@@ -948,6 +948,15 @@ impl Workspace {
         let _=self.analysis_extensions.finish_ipc_command(evaluation,Err("Cancelled".into()));
     }
 
+    pub(crate) fn note_cached_root_stream(&mut self, evaluation: u64, active: bool) {
+        self.analysis_extensions.note_cached_root_stream(evaluation, active);
+    }
+
+    pub(crate) fn claim_open_root_stream_handoff(&mut self) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
+        let open_docs = &self.open_docs;
+        self.analysis_extensions.claim_open_root_stream_handoff(|owner| open_docs.contains_key(owner))
+    }
+
     pub(crate) fn claim_open_source_handoff(&mut self) -> Option<u64> {
         let open_docs = &self.open_docs;
         self.analysis_extensions.claim_open_source_handoff(|owner| open_docs.contains_key(owner))
