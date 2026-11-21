@@ -6551,3 +6551,19 @@ The fix was rebuilt as a release binary with SHA-256
 capability advertisement, local goto, and cross-file goto; its harness reports
 ALL PASS with the usual signal-15 client shutdown footer. Receipt:
 `C:/tmp/ktlsp-import-action-release-basic`.
+
+The same release binary then ran the complete `java` editor scenario, including
+the new applied-import actions, with **437 checks and zero failures**, clean
+shutdown, and harness status 0. Receipt: `C:/tmp/ktlsp-ux-import-actions-release-java`.
+
+## 2026-11-21 checkpoint: binary-only Java generic signatures
+
+The same release was exercised against the existing source-free Java JAR fixture
+without adding a decompiler. Java/Kotlin generic `get`, static-chain and `ITEM`
+completion/definition cases, plus a Java non-static inner-owner chain, passed
+**15/15 semantic checks**, zero mismatches or unmeasured requests, and clean
+shutdown. The existing classfile `Signature` reader and declaration-stub
+projection supplied the erasure, bounds and owner facts needed by these cases.
+Method-body decompilation remains intentionally outside ktlsp's responsibility;
+the existing IntelliJ/decompiler path can provide that UI when available.
+Evidence: `C:/tmp/ktlsp-binary-generic-audit-20261121/{receipt.json,harness/artifacts/corpus-results.json,summary.txt}`.
