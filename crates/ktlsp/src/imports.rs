@@ -149,15 +149,23 @@ pub fn import_insert_offset(src: &str, line: u32) -> usize {
 }
 
 pub fn line_delete_range(src: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
-    let start = src[..start_byte.min(src.len())]
+    let start_byte = start_byte.min(src.len());
+    let end_byte = end_byte.min(src.len());
+    let start = src[..start_byte]
         .rfind('\n')
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    let end = match src[end_byte.min(src.len())..].find('\n') {
-        Some(rel) => end_byte.min(src.len()) + rel + 1,
+    let end = match src[end_byte..].find('\n') {
+        Some(rel) => end_byte + rel + 1,
         None => src.len(),
     };
-    (start, end)
+    // Java permits package/import/type declarations on one line. Comments on either
+    // side are also independent source: expand to the line only when it is empty.
+    if src[start..start_byte].trim().is_empty() && src[end_byte..end].trim().is_empty() {
+        (start, end)
+    } else {
+        (start_byte, end_byte)
+    }
 }
 
 pub fn remove_import_edit(file: &str, src: &str, import: &ImportLine) -> TextEdit {
@@ -198,7 +206,10 @@ pub fn organize_imports_edit_with_style(
         .collect::<Vec<_>>();
     lines.sort();
     lines.dedup();
-    let new_text = format!("{}\n", lines.join("\n"));
+    let mut new_text = lines.join("\n");
+    if src[start_byte..end_byte].ends_with('\n') {
+        new_text.push('\n');
+    }
     if src[start_byte..end_byte] == new_text {
         return None;
     }

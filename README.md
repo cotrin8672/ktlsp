@@ -376,6 +376,8 @@ shutdown controls without starting a server or compiler.
 
 `java` covers incomplete member completion, inherited members, Java receivers of Kotlin types,
 and an unsaved Kotlin declaration edit observed from an unsaved Java buffer on the same client.
+It applies unused-import and organize-import WorkspaceEdits to complete buffers, preserving
+same-line package/type declarations and trailing comments (`java-import-action-snapshots.json`).
 It checks imported superclass identity despite same-name types, exact inherited-member definitions,
 valid and invalid call diagnostics, and first responses after unsaved superclass import changes.
 It also checks same-name Java fields/methods, callable Kotlin properties, nullable function results,

@@ -484,6 +484,61 @@ do
   end
 end
 
+-- Apply import actions, rather than accepting a returned edit that may erase nearby code.
+do
+  local snapshots = {}
+  for index, case in ipairs({
+    { title = "Remove unused import `List`", only = "quickfix",
+      before = { "package app; import java.util.List; class KtlspImportProbe {}" },
+      expected = { "package app;  class KtlspImportProbe {}" } },
+    { title = "Remove all unused imports", only = "source.fixAll.ktlsp",
+      before = { "package app; import java.util.List; import java.util.Set; class KtlspImportProbe {}" },
+      expected = { "package app;   class KtlspImportProbe {}" } },
+    { title = "Organize imports", only = "source.organizeImports",
+      before = { "package app; import z.Z; import a.A; class KtlspImportProbe {}" },
+      expected = { "package app; import a.A;", "import z.Z; class KtlspImportProbe {}" } },
+    { title = "Remove unused import `List`", only = "quickfix",
+      before = { "import java.util.List; // keep this comment", "class KtlspImportProbe {}" },
+      expected = { " // keep this comment", "class KtlspImportProbe {}" } },
+  }) do
+    local buffer = vim.fn.bufadd(project .. "/app/KtlspImportProbe" .. index .. ".java")
+    vim.fn.bufload(buffer)
+    vim.bo[buffer].filetype = "java"
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, case.before)
+    vim.lsp.buf_attach_client(buffer, id)
+    require("vim.lsp._changetracking").flush(client)
+    local document = { uri = vim.uri_from_bufnr(buffer) }
+    request_rpc("textDocument/documentSymbol", { textDocument = document }, buffer)
+    local column = assert(case.before[1]:find("import ", 1, true)) - 1
+    local response, row = request_rpc("textDocument/codeAction", {
+      textDocument = document,
+      range = { start = { line = 0, character = column }, ["end"] = { line = 0, character = column } },
+      context = { diagnostics = {}, only = { case.only } },
+    }, buffer)
+    local action
+    for _, candidate in ipairs(type(response and response.result) == "table" and response.result or {}) do
+      if candidate.title == case.title and type(candidate.edit) == "table" then action = candidate; break end
+    end
+    check(case.title .. " returns native edit (import preservation " .. index .. ")",
+      action ~= nil, vim.inspect(response), row)
+    local applied, message = false, "action unavailable"
+    if action then
+      applied, message = pcall(vim.lsp.util.apply_workspace_edit, action.edit, client.offset_encoding)
+      applied = applied and message ~= false
+    end
+    local after = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+    check(case.title .. " preserves complete source (import preservation " .. index .. ")",
+      applied and vim.deep_equal(after, case.expected), vim.inspect(after), row)
+    snapshots[#snapshots + 1] = { title = case.title, before = case.before, expected = case.expected,
+      after = after, applied = applied, request = row }
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_delete(buffer, { force = true })
+  end
+  if arg[3] then
+    vim.fn.writefile({ vim.json.encode(snapshots) }, arg[3] .. "/java-import-action-snapshots.json")
+  end
+end
+
 -- Extract a whole Java return expression in a new unsaved file, through native edits.
 do
   local path = project .. "/app/KtlspExtractLocalProbe.java"

@@ -6502,3 +6502,45 @@ smoke (initialization, capability advertisement, local goto, and cross-file
 goto) with harness status 0. The five-repository corpus above intentionally
 remains pinned to `7213f777`; the transport-only change was validated by its
 focused suite and this smoke rather than by repeating the corpus.
+
+## 2026-11-21 checkpoint: current KAPT/KSP generated-source read
+
+An isolated Gradle 7.4.2/JDK 17 fixture ran its real KSP and KAPT tasks before
+the editor session. The generated Kotlin, KSP Java, and KAPT Java files were
+then consumed by the current release `76981C51A2F75FC5D520B468A7B88B94FEA109479816AD33A447DEFED0188116`
+without the LSP invoking a generation task. Java and Kotlin consumers each
+completed completion, version exclusion, and exact generated-source definition
+for all three generated APIs: **18/18 semantic checks**, zero mismatches or
+unmeasured requests, and clean LSP exit 0. Generated source hashes and mtimes
+were unchanged before and after the editor queries. The trace records Gradle
+model/compiler input discovery but no KSP/KAPT generation task; a full process
+tree audit, disabled-plugin phase, and same-client regeneration are separate
+cases. Evidence: `C:/tmp/ktlsp-processor-current-artifacts/{corpus-results.json,trace.jsonl}`.
+
+## 2026-11-21 checkpoint: IntelliJ LSP recheck boundary
+
+The official `JetBrains/intellij-lsp.nvim` was cloned only under
+`C:/tmp/intellij-lsp.nvim-20261121` and the already-installed IntelliJ server
+bundle was used without changing the user's Neovim configuration. Its official
+Java E2E could not produce a current comparison because the installed bundle
+was expired and refused to start (exit code 7; its log says to download a new
+build); an initial plugin callback also exposed a temporary-plugin
+`strdisplaywidth` fast-event error. No ktlsp result
+was relabeled from this failed oracle attempt. Historical IDEA observations
+remain valid only for their recorded fixture/release conditions: the focused
+31-cycle CEM comparison and the processor-plugin comparison documented above
+are not a current whole-CEM parity claim. A new current IDEA comparison needs a
+licensed/active server bundle and a fresh paired fixture run.
+
+## 2026-11-21 checkpoint: import code-action safety
+
+The Java editor probe reproduced a real data-loss bug: when a package/import/type
+declaration shared one line, unused-import and organize-import edits expanded to
+the whole line and removed adjacent code. `line_delete_range` now uses the full
+line only when both sides of the syntax node are whitespace; inline code and
+comments receive the AST range, and organize-import preserves the original line
+ending. The focused code-action target passes **13/13** tests. The real Neovim
+`java` harness applied and inspected four additional WorkspaceEdits (single
+quickfix, fix-all, organize, and trailing-comment cases), with 437 checks,
+zero failures, and clean shutdown. Evidence:
+`C:/tmp/ktlsp-ux-import-actions-20261121/artifacts/{summary.txt,java-results.json,java-import-action-snapshots.json}`.

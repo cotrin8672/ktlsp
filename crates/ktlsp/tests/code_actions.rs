@@ -153,6 +153,54 @@ fn java_remove_unused_import_action_deletes_the_import_line() {
 }
 
 #[test]
+fn remove_unused_import_preserves_other_code_and_comments_on_the_line() {
+    for (key, source, expected) in [
+        (
+            "mem:///Main.java",
+            "package app; import java.util.List; class Main {}\n",
+            "package app;  class Main {}\n",
+        ),
+        (
+            "mem:///Main.java",
+            "import java.util.List; // keep this comment\r\nclass Main {}\r\n",
+            " // keep this comment\r\nclass Main {}\r\n",
+        ),
+        (
+            "mem:///Main.kt",
+            "import a.b.List // keep this comment\nfun main() {}\n",
+            " // keep this comment\nfun main() {}\n",
+        ),
+    ] {
+        let mut ws = Workspace::new();
+        ws.open(key, source.to_string());
+        let offset = source.find("List").unwrap();
+        let actions = ws.code_actions(key, offset, offset, offset);
+        let action = actions
+            .iter()
+            .find(|action| action.title == "Remove unused import `List`")
+            .unwrap_or_else(|| panic!("missing remove action: {actions:?}"));
+        assert_eq!(apply_to_text(key, source, &action.edits).unwrap(), expected);
+    }
+}
+
+#[test]
+fn java_remove_all_inline_unused_imports_preserves_the_package_and_class() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Main.java";
+    let source = "package app; import java.util.List; import java.util.Set; class Main {}\n";
+    ws.open(key, source.to_string());
+    let actions = ws.code_actions(key, 0, source.len(), 0);
+    let action = actions
+        .iter()
+        .find(|action| action.title == "Remove all unused imports")
+        .unwrap_or_else(|| panic!("missing remove-all action: {actions:?}"));
+    assert_eq!(
+        apply_to_text(key, source, &action.edits).unwrap(),
+        "package app;   class Main {}\n"
+    );
+}
+
+#[test]
 fn java_remove_all_unused_imports_action_deletes_every_unused_import() {
     let mut ws = Workspace::new();
     let key = "mem:///Main.java".to_string();
@@ -191,6 +239,23 @@ fn java_organize_imports_action_sorts_import_block() {
     assert_eq!(
         edited,
         "package app;\nimport a.A;\nimport z.Z;\nclass Main {}\n"
+    );
+}
+
+#[test]
+fn java_organize_inline_imports_preserves_the_package_and_class() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Main.java";
+    let source = "package app; import z.Z; import a.A; class Main {}\n";
+    ws.open(key, source.to_string());
+    let actions = ws.code_actions(key, 0, source.len(), 0);
+    let action = actions
+        .iter()
+        .find(|action| action.title == "Organize imports")
+        .unwrap_or_else(|| panic!("missing organize action: {actions:?}"));
+    assert_eq!(
+        apply_to_text(key, source, &action.edits).unwrap(),
+        "package app; import a.A;\nimport z.Z; class Main {}\n"
     );
 }
 
