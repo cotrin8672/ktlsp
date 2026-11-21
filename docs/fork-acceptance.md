@@ -6398,6 +6398,24 @@ This is current-head evidence for the Kotlin-to-Java hover/definition path and
 the no-diagnostic warm state. It is not a cold-start latency certificate, a
 whole-CEM 38-case run, or proof of Mixin behavior.
 
+## 2026-11-21 checkpoint: CEM ordinary and incomplete production groups
+
+The current release `76981C51A2F75FC5D520B468A7B88B94FEA109479816AD33A447DEFED0188116`
+was run against the real CEM working tree without writing its files. The
+Mixin-excluded ordinary production group passed 12/12: three Kotlin callers
+covered overloaded factory selection, smart-cast member resolution, delegated
+interface navigation, exact definition, hover, and signature help. The same
+root's incomplete group passed 13/13: partial member, dangling dot, broken peer,
+and unknown-receiver cases preserved useful known-member results and exclusions,
+delivered/restored unsaved buffers, and shut down cleanly.
+
+Both runs indexed 115--116 project files and 33,131 library files with zero
+failed dependencies, 97 missing sources, zero semantic mismatches, and zero
+unmeasured requests. Receipts are under `C:/tmp/cem-ordinary-769` and
+`C:/tmp/cem-incomplete-769`. This closes the current ordinary/incomplete CEM
+editing slice; the broader 38-case historical CEM matrix, cold-start latency,
+IDEA comparison, and Mixin behavior remain separate requirements.
+
 ## 2026-11-21 checkpoint: extension foundation audit
 
 The extension foundation was re-audited at `3efd6ac0` without code changes.
