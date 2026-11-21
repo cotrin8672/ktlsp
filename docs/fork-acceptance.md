@@ -6257,3 +6257,32 @@ send: `analysis/finish` workspace-lock wait median 414.7 ms and idle
 validation median 411.8 ms, with no commits. This narrows the next safe work
 to bounded handoff/receive ordering; it does not justify skipping dependency
 flushes or weakening generation validation.
+
+## 2026-11-21 checkpoint: bounded source handoff after dependency facts
+
+The bounded handoff and receive-ordering fix is now pushed as `c1baeec3` on
+`codex/java-kotlin-analysis`. It keeps source-only evaluation work outside
+the workspace lock while preserving current-generation, pending-input,
+stream-quota, cancellation, and final-commit guards. A current open source
+evaluation may receive one 20 ms fair-lock handoff at a dependency chunk
+boundary; command evaluations, closed documents, stale evaluations, and
+repeat handoffs are excluded. Non-stream fact replies skip the stream-
+accounting lock (which is a no-op for them); streamed replies retain byte and
+continuation accounting.
+
+The focused IPC tests pass, the full `ktlsp` library suite passes with
+`802 passed, 17 ignored`, and the release binary is
+`target/release/ktlsp.exe` (SHA256
+`711D18B0C3CA61A1FE0CAD4DAA159B80D0154BBC51CFB3A2D2BB21139085F9D3`,
+25,624,064 bytes). With the corresponding MC companion pin, the first
+Sodium source-acceptance gate reached the exact GuiMixin revision at about
+11.9 seconds and committed all six bounded handoffs; the later `mcdev.info`
+root-snapshot command still did not complete.
+
+The observed `Remove(Any)` under `build/reports/problems/problems-report.html`
+is recorded as an unresolved over-invalidation. The event does not prove that
+the removed path was a regular file, so suppressing it in an excluded subtree
+could hide directory deletion. No watch-policy change was shipped. The cached
+root-continuation optimization remains a separate, uncommitted candidate until
+its direct guard/accounting regression and a clean performance comparison are
+available.
