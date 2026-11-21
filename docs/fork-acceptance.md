@@ -6578,3 +6578,28 @@ partial-member, dangling-dot, broken-peer and unknown-receiver checks, including
 buffer restoration and unchanged disk sources. Both sessions exited cleanly and
 the working tree remained unchanged. Receipts:
 `C:/tmp/cem-ordinary-current-9d46` and `C:/tmp/cem-incomplete-current-9d46`.
+
+## 2026-11-21 checkpoint: same-client KAPT/KSP regeneration on current release
+
+The dedicated processor-reload probe was rerun on the current release with the
+fixture's real Gradle KSP and KAPT tasks under JDK 17. The first attempt under
+JDK 21 failed before ktlsp at `kaptGenerateStubsKotlin` with the Kotlin
+1.8.21/JDK module-access error; it is retained as an environment failure, not
+an LSP result. The JDK 17 run completed all external build phases: generation
+v1, generation v2, compiler-disabled removal, and v1 restoration. The same
+Neovim client observed native watch events and accepted model refreshes for
+generations 2, 3 and 4. Java and Kotlin completion, exact definition to KSP
+Kotlin/KSP Java/KAPT Java sources, unsaved-source completion, disabled-plugin
+missing-symbol diagnostics, restored source hashes, and clean shutdown all
+passed. The probe accepts current cache `model_version=16` in addition to the
+older 14; this is a test-observer compatibility fix, not a product change.
+Evidence:
+`C:/tmp/ktlsp-processor-reload-current-9d46-schema16/artifacts/processor-reload.json`
+and `trace-events.jsonl`.
+
+The phase-1 immediate diagnostic pull remains a measured gap: three Java pulls
+were empty and the Kotlin pull timed out immediately after refresh, while the
+same trace later records verified compiler diagnostics (Java 3, Kotlin 6) and
+a Java pull with three items. This is asynchronous diagnostic readiness, not a
+completion or generated-source visibility failure, and is not counted as a
+pass for the immediate-pull assertions.

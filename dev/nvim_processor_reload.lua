@@ -36,6 +36,10 @@ local generated = {
   { name = 'KspJava', receiver = 'java', path = 'app/build/generated/ksp/main/java/generated/KspJava.java' },
   { name = 'KaptJava', receiver = 'kapt', path = 'app/build/generated/source/kapt/main/generated/KaptJava.java' },
 }
+-- The selected-task fields used below are stable across the current cache schema
+-- transition from 14 to 16. Keep the probe explicit instead of accepting an
+-- arbitrary future schema and accidentally certifying a changed model shape.
+local supported_model_versions = { [14] = true, [16] = true }
 local runner = artifacts .. '/processor-build.ps1'
 vim.fn.writefile(vim.split([=[param([string]$Project, [string]$Log)
 $argsText = '/d /c call ' + [char]34 + (Join-Path $Project 'gradlew.bat') + [char]34 + ' :app:clean :app:classes --offline --no-daemon --console=plain --max-workers=2 > ' + [char]34 + $Log + [char]34 + ' 2>&1'
@@ -281,7 +285,7 @@ local function run()
           end
         end
         if decoded and type(model) == 'table' and stamp(vim.uv.fs_stat(path)) == file_stamp
-          and model.model_version == 14 and type(model.mtimes) == 'table'
+          and supported_model_versions[model.model_version] and type(model.mtimes) == 'table'
           and actual_mtime == expected_mtime then
           for _, module in ipairs(model.modules or {}) do
             if module.module == ':app' and probe.path_key(module.project_dir) == probe.path_key(root .. '/app') then
