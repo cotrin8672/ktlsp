@@ -6211,3 +6211,19 @@ cold result.
 This closes the current-head CEM Kotlin-to-Java hover/definition slice after
 the model is ready. It is not a fresh 38/38 whole-CEM run, a cold-start budget
 certificate, or an IDEA-parity claim; those remain separate acceptance items.
+
+## 2026-11-21 checkpoint: extension contract audit
+
+The current extension boundary was audited without adding a new API or
+framework-specific implementation. `AnalysisProvider`/`ExtensionStore` accept
+negotiated providers, publish accepted `ContributionSet` values through the
+shared `Index::replace_contributions` path, and expose the same facts to
+completion, diagnostics, definition, references, and rename. Source, model,
+configuration, index, host-input and negative-read invalidation paths retain
+their guards and requeue obsolete results.
+
+The focused contract checks pass: `ktcore` extensions 65, `ktlsp` extension
+host 12, IPC extension tests 16, and optional-operation negotiation 1 (94
+total). No product change was justified. This proves the current semantic
+extension contract and invalidation behavior, not arbitrary new type-system
+rules or complete framework parity; those remain extension-specific work.
