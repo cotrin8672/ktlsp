@@ -6287,6 +6287,26 @@ root-continuation optimization remains a separate, uncommitted candidate until
 its direct guard/accounting regression and a clean performance comparison are
 available.
 
+## 2026-11-21 checkpoint: excluded descendant ambiguous removal
+
+The repeated Sodium invalidation was finally classified as the first
+`resource_filter` inventory, whose `build` subtree is wholly excluded. The
+notification was `Remove(Any)` for a descendant of that excluded directory;
+it was not a mapping-file change. Commit `03f320af` therefore adds only
+`Remove(Any)` to the already-filterable event kinds and suppresses it when
+`excluded_descendant` is true. The excluded directory itself, non-excluded
+paths, explicit inputs, mixed events, renames, and rescan flags remain
+conservative. The broader observed-regular-file lease candidate was not
+adopted.
+
+The focused filtered-root suite passes 7/7, `cargo check -p ktlsp --lib`
+passes, and the release pin for one MC verification is
+`target/release/ktlsp.exe` SHA256
+`EC6BF51627AA04F75872205915C6B4CE23F996890FF41210760E47290F88482D`
+(25,628,672 bytes). The external run is still pending; no whole-Sodium pass
+is claimed until the exact HTML deletion trace and the later `mcdev.info`
+command are both observed.
+
 ## 2026-11-21 checkpoint: cached root continuation fast path
 
 The cached continuation candidate is now pushed as `dddbb09f`, on top of
