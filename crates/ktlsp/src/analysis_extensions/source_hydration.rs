@@ -1455,19 +1455,35 @@ pub(crate) struct PreparedSource {
 
 /// No network lookup: the dependency resolver has already selected this exact source archive.
 pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSource> {
-    let mut archives: Vec<(&Arc<LibrarySource>, Vec<&Path>)> = Vec::new();
+    let mut archives: Vec<(&Arc<LibrarySource>, Vec<&Path>, Option<Arc<crate::compiled_watch::HostInputLease>>)> = Vec::new();
     for request in &requests {
         if request.stamp.origin.representation != SourceRepresentation::Stub { continue; }
-        if let Some((_,files)) = archives.iter_mut().find(|(source,_)|source.as_ref()==request.source.as_ref()) {
+        // Arm before the initial digest. Only a model-selected physical archive can use
+        // the cheap per-entry lease checks; callers without that proof retain stat checks.
+        let lease = (|| {
+            let physical=request.model.as_ref()?.dependency_binary_origin(&request.stamp.origin,&request.source)?;
+            let archive=request.source.selected_archive()?;
+            if crate::classpath::file_origin_id(archive)!=physical {return None;}
+            request.binary_leases.current(request,&physical)
+        })();
+        if let Some((_,files,shared)) = archives.iter_mut().find(|(source,_,_)|source.as_ref()==request.source.as_ref()) {
             files.push(Path::new(&request.file));
+            if shared.is_none() { *shared=lease; }
         } else {
-            archives.push((&request.source,vec![Path::new(&request.file)]));
+            archives.push((&request.source,vec![Path::new(&request.file)],lease));
         }
     }
     // Separate resolver calls may allocate equal inputs; share only within this batch.
     let mut binary_types = Vec::new();
-    for (source,files) in archives {
-        if source.content_is_current() { binary_types.push((Arc::clone(source),source.binary_types(&files))); }
+    for (source,files,lease) in archives {
+        if source.content_is_current() {
+            let verified=match &lease {
+                Some(lease)=>source.binary_types_with_lease(&files,lease),
+                None=>source.binary_types(&files),
+            };
+            // Retain the lease through preparation and reuse it for exact binary ABI reads.
+            binary_types.push((Arc::clone(source),verified,lease));
+        }
     }
     requests
         .into_iter()
@@ -1476,7 +1492,8 @@ pub(crate) fn prepare_sources(requests: Vec<SourceRequest>) -> Vec<PreparedSourc
             // A name-only preview is not proof that the selected archive declares this type.
             if request.stamp.origin.representation == SourceRepresentation::Stub
                 && (!request.source.content_is_current()
-                    || !binary_types.iter().any(|(source,files)|source.as_ref()==request.source.as_ref() && files.contains(path)))
+                    || !binary_types.iter().any(|(source,files,lease)|source.as_ref()==request.source.as_ref()
+                        && lease.as_ref().is_none_or(|lease|lease.is_current()) && files.contains(path)))
             {
                 return None;
             }

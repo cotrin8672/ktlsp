@@ -39,6 +39,7 @@ use crate::parser::KotlinParser;
 use crate::project_model::{FileOrigin, SourceRepresentation};
 use crate::source_encoding::{JavaSourceEncoding, SourceTextPolicy};
 use crate::symbol::IndexedSymbol;
+use ktcore::extensions::HostInputGuard;
 
 /// One file's worth of indexed symbols, keyed by its stable on-disk path (the goto target is
 /// materialized lazily from its source jar when necessary).
@@ -100,22 +101,35 @@ impl LibrarySource {
     }
 
     pub(crate) fn binary_types(&self, files: &[&Path]) -> BTreeSet<PathBuf> {
+        self.binary_types_current(files, || self.is_current())
+    }
+
+    /// The caller arms this lease for this source's provenance inputs before checking its digest.
+    /// Keep stat/policy checks at both boundaries; the native lease checks every archive entry.
+    pub(crate) fn binary_types_with_lease(
+        &self, files: &[&Path], lease: &crate::compiled_watch::HostInputLease,
+    ) -> BTreeSet<PathBuf> {
+        self.binary_types_current(files, || lease.is_current())
+    }
+
+    fn binary_types_current(&self, files: &[&Path], current: impl Fn() -> bool) -> BTreeSet<PathBuf> {
         let mut verified = BTreeSet::new();
         let Some(path) = &self.jar else { return verified; };
-        if !self.is_current() { return verified; }
+        if !current() || !self.is_current() { return verified; }
         if path.is_dir() {
             for file in files {
+                if !current() { verified.clear(); return verified; }
                 let Some(relative)=file.strip_prefix(&self.dest).ok() else {continue;};
                 let name=relative.with_extension("class").to_string_lossy().replace('\\',"/");
                 if jar::read_class_file(path,&name,&self.origin_id).is_ok_and(|class|class.is_some_and(|class|
                     class.identity.internal_name==name.trim_end_matches(".class"))) {verified.insert(file.to_path_buf());}
             }
-            if !self.is_current() || !self.content_is_current() {verified.clear();}
+            if !current() || !self.is_current() || !self.content_is_current() {verified.clear();}
             return verified;
         }
         let Ok(file) = fs::File::open(path) else { return verified; };
         let Ok(mut archive) = zip::ZipArchive::new(file) else { return verified; };
-        let Ok(selected) = jar::selected_class_entries(&mut archive,"",None,||self.is_current())
+        let Ok(selected) = jar::selected_class_entries(&mut archive,"",None,&current)
             else { return verified; };
         for file in files {
             let Some(name) = file.strip_prefix(&self.dest).ok()
@@ -124,13 +138,13 @@ impl LibrarySource {
             let name = name.replace('\\', "/");
             if !crate::runtime_bytes::valid_internal_name(&name) { continue; }
             let Some(entry) = selected.iter().find(|entry|entry.internal_name==name) else { continue; };
-            let Ok(bytes) = jar::read_selected_class_bytes(&mut archive,entry,||self.is_current()) else { continue; };
+            let Ok(bytes) = jar::read_selected_class_bytes(&mut archive,entry,&current) else { continue; };
             if ktcore::classfile::decode(&self.origin_id, &bytes)
                 .is_ok_and(|class| class.identity.internal_name == name) {
                 verified.insert(file.to_path_buf());
             }
         }
-        if !self.is_current() { verified.clear(); }
+        if !current() || !self.is_current() { verified.clear(); }
         verified
     }
 
@@ -3101,6 +3115,48 @@ mod tests {
     use std::io::Write;
 
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn leased_binary_type_selection_bounds_policy_checks_and_rejects_invalidation() {
+        let root = std::env::temp_dir().join(format!("ktlsp-leased-binary-selection-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("api.jar");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        archive.start_file("fieldfixture/FieldOnly.class", SimpleFileOptions::default()).unwrap();
+        archive.write_all(include_bytes!("../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class")).unwrap();
+        for index in 0..64 {
+            archive.start_file(format!("resources/{index}.txt"), SimpleFileOptions::default()).unwrap();
+            archive.write_all(b"unrelated resource").unwrap();
+        }
+        archive.finish().unwrap();
+        let source = LibrarySource {
+            dest: root.join("extracted"), jar: Some(path.clone()), fingerprint: jar_fingerprint(&path),
+            binary_content: file_content_digest(&path), origin_id: crate::classpath::file_origin_id(&path),
+            policy: Ok(SourceTextPolicy::default()),
+        };
+        let target = source.dest.join("fieldfixture/FieldOnly.java");
+        let files = [target.as_path()];
+        let plan = crate::compiled_watch::WatchPlan::read_inputs(&source.provenance_inputs()).unwrap();
+        let lease = crate::compiled_watch::HostInputLease::new(plan, std::sync::Arc::new(|| {})).unwrap();
+        assert!(source.content_is_current());
+        let before = LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get);
+        let original = source.binary_types(&files);
+        assert!(LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get) - before > 128);
+        let before = LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get);
+        assert_eq!(source.binary_types_with_lease(&files, &lease), original);
+        assert_eq!(original, BTreeSet::from([target.clone()]));
+        assert_eq!(LIBRARY_CURRENT_CHECKS.with(std::cell::Cell::get) - before, 2,
+            "the selected input is checked at both boundaries, not once per archive entry");
+        assert!(source.content_is_current());
+        let calls = std::cell::Cell::new(0);
+        assert!(source.binary_types_current(&files, || {
+            calls.set(calls.get() + 1);
+            lease.is_current() && calls.get() < 20
+        }).is_empty(), "a lease invalidated during archive selection cannot prove any class");
+        assert!(calls.get() >= 20);
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn coord(s: &str) -> Coordinate {
         Coordinate::parse(s).unwrap()
