@@ -6544,3 +6544,10 @@ ending. The focused code-action target passes **13/13** tests. The real Neovim
 quickfix, fix-all, organize, and trailing-comment cases), with 437 checks,
 zero failures, and clean shutdown. Evidence:
 `C:/tmp/ktlsp-ux-import-actions-20261121/artifacts/{summary.txt,java-results.json,java-import-action-snapshots.json}`.
+
+The fix was rebuilt as a release binary with SHA-256
+`9D46FC9CFF2CBFAAB952A14DAF37846C3B00D9A5E289E3D0AB14FEF2499DEF3F`
+(25,736,704 bytes). The release `basic` editor smoke passed initialization,
+capability advertisement, local goto, and cross-file goto; its harness reports
+ALL PASS with the usual signal-15 client shutdown footer. Receipt:
+`C:/tmp/ktlsp-import-action-release-basic`.
