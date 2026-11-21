@@ -2938,16 +2938,11 @@ impl Worker {
             loop {
                 stage="receive";
                 let message = transport.receive(deadline, &self.stopped, work.command.is_none(), || {
-                    let current = || {
-                        let start=Instant::now();
-                        let current=workspace.lock().ipc_evaluation_current(work.evaluation);
-                        if work.command.is_none() && start.elapsed() >= Duration::from_millis(10) {
-                            crate::trace::span("extension.ipc.source_idle_validation","extension",start,json!({
-                                "evaluation":work.evaluation,"current":current
-                            }));
-                        }
-                        current
-                    };
+                    // Idle invalidation notices are opportunistic. The next input read and
+                    // final response still validate under the ordinary blocking workspace lock.
+                    let current = || workspace.try_lock().is_none_or(|workspace| {
+                        workspace.ipc_evaluation_current(work.evaluation)
+                    });
                     if !cancelled && (cancellation.load(Ordering::Acquire) || !current()) {
                         cancelled = true;
                         transport.send(
@@ -2964,6 +2959,50 @@ impl Worker {
                         continue;
                     };
                     let batch_start=Instant::now();
+                    // A guarded continuation reads a page of an already captured file. The
+                    // remaining planners cannot introduce I/O for this single operation.
+                    if method == "analysis/readFacts"
+                        && matches!(message["params"]["queries"].as_array().map(Vec::as_slice),
+                            Some([query]) if query["op"] == "rootFileSnapshot" && query["after"].is_string())
+                    {
+                        stage="cached-root-continuation";
+                        let cached={
+                            let mut workspace=workspace.lock();
+                            if workspace.has_ipc_source_demand(work.evaluation) {
+                                None
+                            } else {
+                                let result=workspace.prepay_ipc_input_read(work.evaluation,method,&message["params"])
+                                    .and_then(|_| workspace.begin_ipc_root_reads(work.evaluation,method,&message["params"]));
+                                let result=match result {
+                                    Ok(reads) if reads.is_empty() =>
+                                        workspace.ipc_batch(work.evaluation,method,message["params"].clone()),
+                                    Ok(_) => {
+                                        workspace.fail_ipc_input_read(work.evaluation,"unexpected I/O for root continuation");
+                                        return Err("unexpected I/O for root continuation".into());
+                                    }
+                                    Err(error) => {
+                                        workspace.fail_ipc_input_read(work.evaluation,&error);
+                                        Err(error)
+                                    }
+                                };
+                                stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
+                                let reply=fact_reply(request_id,result);
+                                workspace.account_ipc_stream_reply(work.evaluation,&reply)?;
+                                Some(reply)
+                            }
+                        };
+                        if let Some(reply)=cached {
+                            crate::trace::span("extension.ipc.read_facts","extension",batch_start,json!({
+                                "evaluation":work.evaluation,"instance":self.id,"command":work.command.is_some(),
+                                "stage":stage,"ops":["rootFileSnapshot"],"query_count":1,
+                                "ok":reply.get("error").is_none(),
+                                "error":reply["error"]["message"].as_str().map(bounded_trace_text)
+                            }));
+                            after_batch();
+                            transport.send(reply)?;
+                            continue;
+                        }
+                    }
                     let mut account_reply = true;
                     let prepared_inputs=(||->Result<(),String> {
                         let (roots,root_reads,reads,class,jvm,provenance)={
@@ -3065,12 +3104,7 @@ impl Worker {
                     }
                     stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
                     after_batch();
-                    let response = match result {
-                        Ok(value) => json!({"jsonrpc":"2.0","id":request_id,"result":value}),
-                        Err(error) => {
-                            json!({"jsonrpc":"2.0","id":request_id,"error":{"code":if error=="Stale" {-32801} else {-32602},"message":error}})
-                        }
-                    };
+                    let response = fact_reply(request_id,result);
                     stage="account-reply";
                     let reply_start=Instant::now();
                     if account_reply {
@@ -3145,6 +3179,15 @@ struct Transport {
     sender: Option<mpsc::SyncSender<Value>>,
     receiver: mpsc::Receiver<Result<Value, String>>,
     initialized: bool,
+}
+
+fn fact_reply(request_id: &Value, result: Result<Value, String>) -> Value {
+    match result {
+        Ok(value) => json!({"jsonrpc":"2.0","id":request_id,"result":value}),
+        Err(error) => json!({"jsonrpc":"2.0","id":request_id,"error":{
+            "code":if error=="Stale" {-32801} else {-32602},"message":error
+        }}),
+    }
 }
 
 impl Transport {

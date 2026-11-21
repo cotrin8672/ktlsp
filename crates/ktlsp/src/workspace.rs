@@ -1141,6 +1141,11 @@ impl Workspace {
         self.analysis_extensions.finish_ipc_class_read(&self.index,prepared)
     }
 
+    pub(crate) fn has_ipc_source_demand(&self, evaluation: u64) -> bool {
+        self.analysis_extensions.ipc_requested_sources(evaluation)
+            .is_some_and(|requested| !requested.is_empty())
+    }
+
     pub(crate) fn begin_ipc_requested_source_capture(&mut self, evaluation: u64) -> Option<IpcSourceCapture> {
         if self.project_refresh_pending || !self.ipc_evaluation_current(evaluation) { return None; }
         let requested=self.analysis_extensions.ipc_requested_sources(evaluation)?.clone();
