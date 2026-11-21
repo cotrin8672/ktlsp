@@ -2272,6 +2272,74 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_java_dependency_type_hover_does_not_require_prior_navigation() {
+        use crate::project_model::{FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation};
+
+        let target = "/dependency/create/DrillBlock.java";
+        let target_source =
+            "package create; /** Dependency target docs. */ public class DrillBlock {}";
+        let source = "package app\nimport create.DrillBlock\nclass EnchantableDrillBlock : DrillBlock()\n";
+        for representation in [SourceRepresentation::Source, SourceRepresentation::Stub] {
+            let mut ws = Workspace::new();
+            let caller = "/project/Use.kt";
+            ws.open(caller, source.into());
+            let tree = crate::java::JavaParser::new().parse(target_source);
+            ws.index_dependency_file(target, crate::java::extract_symbols(&tree, target_source));
+            let scope = ProjectScope {
+                module: "app".into(),
+                source_set: "main".into(),
+            };
+            ws.index.set_file_origin(
+                caller,
+                FileOrigin {
+                    origin_id: "app".into(),
+                    representation: SourceRepresentation::Source,
+                    project_scope: Some(scope.clone()),
+                },
+            );
+            ws.index.set_file_origin(
+                target,
+                FileOrigin {
+                    origin_id: "create".into(),
+                    representation,
+                    project_scope: None,
+                },
+            );
+            ws.index.replace_scope_visibilities(vec![ScopeVisibility {
+                scope: scope.clone(),
+                ordered_origins: vec!["app".into(), "create".into()],
+            }]);
+
+            // Ask hover before navigation and while global dependency coverage is incomplete.
+            let offset = source.rfind("DrillBlock()").unwrap() + 1;
+            let query = ws
+                .resolved_symbol_query(caller, offset)
+                .expect("Kotlin type query");
+            let hover = query
+                .hover_markdown()
+                .expect("selected Java dependency hover");
+            assert!(hover.contains("class DrillBlock"), "{hover}");
+            assert!(hover.contains("create"), "{hover}");
+            assert_eq!(query.reference().status_label(), "ok");
+            assert_eq!(query.targets.len(), 1);
+            assert_eq!(query.targets[0].file, target);
+            assert_eq!(query.targets, ws.goto_definition(caller, offset));
+
+            // The same indexed dependency cannot supply a hover outside the caller's scope.
+            ws.index.replace_scope_visibilities(vec![ScopeVisibility {
+                scope,
+                ordered_origins: vec!["app".into()],
+            }]);
+            let hidden = ws
+                .resolved_symbol_query(caller, offset)
+                .expect("Kotlin type query");
+            assert!(hidden.hover_markdown().is_none());
+            assert!(hidden.targets.is_empty());
+            assert_eq!(hidden.reference().status_label(), "unknown");
+        }
+    }
+
+    #[test]
     fn java_type_hover_uses_the_same_target_as_navigation() {
         for (target_file, target_source) in [
             (
