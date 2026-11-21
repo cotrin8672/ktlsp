@@ -6684,3 +6684,13 @@ Unknown guard was weakened. Evidence:
 The `mcdev.info` startup envelope remains an intentionally separate
 `INCOMPLETE_PROJECT_CONTEXT` result; the completion/hover/edit path is now
 accepted for this additional real project.
+
+The MC-side reissue product commit is `4B6D0A0CF0E668182E30799C8027E0E63DCA5A77`
+on `codex/ktlsp-rust` (record HEAD `F1018C67BEA72A7A5D9BBBE777916D9FABD7A591`).
+The companion binary used for the run is
+`f90EEE54307AD59C0DB3EC8A617BD92D37D68923`,
+`mcdev-companion.exe` SHA-256
+`83828A53611AEC78AA12EBADA241686DF7D53F645689182834ECBFC1A462AED7`
+(18,407,936 bytes). The two focused MC files cover same-client
+Incomplete-to-ready reissue and endpoint-less provider-command readiness; no
+new host API or timeout was introduced.
