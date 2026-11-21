@@ -6415,6 +6415,30 @@ was justified by the current Mixin evidence. A separate non-Mixin external
 provider acceptance and documentation cleanup remain open before claiming the
 extension boundary is broadly portable.
 
+## 2026-11-21 checkpoint: non-Mixin external provider acceptance
+
+The existing external-extension fixture was Mixin/Shadow-only, so a second
+semantic provider convention was added without changing ktlsp production code
+or the extension API. `KTLSP_IPC_MODE=member-links` uses an annotation-free
+`ForwardLink.java` owner with a `forward$` member prefix, reads the authored
+declaration member and target facts, and submits the same
+`analysis/require`/site contract as the normal provider.
+
+The real Neovim run passed 26/26 semantic checks with zero unmeasured requests:
+completion and exact definition, ordinary completion while the child is
+paused, unsaved edit acceptance and stale cancellation, descriptor-bearing
+shared completion, definition, references, diagnostics, crash withdrawal,
+explicit restart, applied whole-buffer rename, provider disable/restore, and
+clean shutdown. Indexing completed with 2 project files, 14,790 library files,
+zero missing sources, and zero failed dependencies. Receipt:
+`C:/tmp/ktlsp-runs/external-member-links-20261121-accept1/editor2/artifacts/extension-ipc-proof.json`.
+Child unit tests also pass 2/2 and Lua syntax validation passes.
+
+This proves the existing member/site contribution contract is reusable by a
+non-Mixin consumer; it does not imply a generic API for arbitrary synthetic
+declarations or expression-type inference. The fixture is intentionally a
+test-only consumer convention, not a production forwarding framework.
+
 ## 2026-11-21 checkpoint: current five-repository corpus acceptance
 
 The current release pin `7213f777` was exercised against five independent

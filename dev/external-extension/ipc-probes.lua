@@ -254,6 +254,10 @@ return function(env)
   local probe = dofile(env.repo .. '/dev/nvim_lsp_probe.lua')
   local client, check = env.client, env.check
   local linked = vim.env.KTLSP_IPC_MODE == 'linked'
+  local member_links = vim.env.KTLSP_IPC_MODE == 'member-links'
+  local member_prefix = member_links and 'forward$' or 'shadow$'
+  local member_name = member_prefix .. 'twice'
+  local member_anchor = 'public abstract int ' .. member_name
   local host_inputs = vim.env.KTLSP_IPC_MODE == 'host-inputs'
   local catalog = vim.env.KTLSP_IPC_MODE == 'jvm-catalog'
   local locations = vim.env.KTLSP_IPC_MODE == 'source-locations'
@@ -263,7 +267,7 @@ return function(env)
   local facts = vim.env.KTLSP_IPC_MODE == 'project-facts' or source_facts or catalog or locations
   local barrier = assert(vim.env.KTLSP_IPC_BARRIER, 'missing child barrier directory')
   local paths, buffers, originals = {}, {}, {}
-  local proof = { mode = source_v2 and 'source-facts-v2' or locations and 'source-locations' or source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
+  local proof = { mode = member_links and 'member-links' or source_v2 and 'source-facts-v2' or locations and 'source-locations' or source_facts and 'source-snapshots' or facts and 'project-facts' or (linked and 'linked' or 'ipc'), ordering = {}, requests = {}, snapshots = {} }
   local provider = linked and 'fixture.external-shadow' or 'fixture.ipc-shadow'
   local fresh_diagnostic = false
   local previous_diagnostics = client.handlers['textDocument/publishDiagnostics'] or vim.lsp.handlers['textDocument/publishDiagnostics']
@@ -554,7 +558,7 @@ return function(env)
     env.sources[path] = env.sources[path] or { buf = buf, disk = originals[key], sha256 = vim.fn.sha256(table.concat(originals[key], '\n')) }
     vim.lsp.buf_attach_client(buf, client.id)
   end
-  for key, file in pairs({ target = 'fixture/Target.java', mixin = 'fixture/CaseMixin.java', use = 'fixture/IpcUse.java' }) do
+  for key, file in pairs({ target = 'fixture/Target.java', mixin = member_links and 'fixture/ForwardLink.java' or 'fixture/CaseMixin.java', use = 'fixture/IpcUse.java' }) do
     local path = vim.fs.abspath(env.project .. ((facts or source_v2 or annotation_sites) and '/modules/editing/src/main/java/' or '/') .. file)
     paths[key],originals[key] = path,vim.fn.readfile(path)
     if not (locations and key=='target') then attach(key) end
@@ -620,7 +624,7 @@ return function(env)
     return response and response.result
   end
   local function settings(enabled)
-    local value = { enabled = enabled, configuration = linked and { mixinPackage = 'fixture' } or { target = 'fixture.Target' } }
+    local value = { enabled = enabled, configuration = linked and { mixinPackage = 'fixture' } or { target = 'fixture.Target', memberPrefix = member_prefix } }
     if not linked then
       value.command = { assert(vim.env.KTLSP_IPC_CHILD), '--barrier', barrier }
       if facts then value.command[#value.command + 1] = '--project-facts' end
@@ -635,7 +639,7 @@ return function(env)
   end
   local function exact(name)
     local _, target_range = probe.find(lines('target'), 'public int twice', 'twice')
-    request(name, 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/definition', nil,
+    request(name, 'mixin', member_anchor, member_name, 'textDocument/definition', nil,
       function(result) return probe.exact_definition(result, paths.target, { target_range }) end)
   end
   if inputs then inputs.setup() end
@@ -887,11 +891,11 @@ return function(env)
     record('two-project-fact-operations-and-fresh-contribution-verified')
   end
   if catalog then save(); return end
-  request('fresh extension completion has shared descriptor and exact editable range', 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/completion', { context = { triggerKind = 1 } },
+  request('fresh extension completion has shared descriptor and exact editable range', 'mixin', member_anchor, member_name, 'textDocument/completion', { context = { triggerKind = 1 } },
     function(result)
       for _, item in ipairs(result and (result.items or result) or {}) do
-        if item.label == 'shadow$twice' and item.detail == 'fixture.Target (I)I' then
-          local _, range = probe.find(lines('mixin'), 'public abstract int shadow$twice', 'twice')
+        if item.label == member_name and item.detail == 'fixture.Target (I)I' then
+          local _, range = probe.find(lines('mixin'), member_anchor, 'twice')
           return item.textEdit and item.textEdit.newText == 'twice' and vim.deep_equal(item.textEdit.range, range)
         end
       end
@@ -905,7 +909,7 @@ return function(env)
       return found[probe.path_key(paths.mixin)] and found[probe.path_key(paths.use)]
     end)
   if not linked then
-    request('fresh child diagnostic uses normal LSP path', 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/diagnostic', nil,
+    request('fresh child diagnostic uses normal LSP path', 'mixin', member_anchor, member_name, 'textDocument/diagnostic', nil,
       function(result) for _, diagnostic in ipairs(result and result.items or {}) do if diagnostic.message == 'ipc-fixture:bound' then return true end end return false end)
     vim.fn.writefile({ 'crash' }, barrier .. '/crash')
     local exited = vim.wait(15000, function()
@@ -917,7 +921,7 @@ return function(env)
     end, 10)
     check('idle child crash retracts its published contribution', exited)
     assert(exited, 'idle child crash did not reach the host')
-    request('crashed child target binding is withdrawn', 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/definition', nil,
+    request('crashed child target binding is withdrawn', 'mixin', member_anchor, member_name, 'textDocument/definition', nil,
       function(result)
         for _, location in ipairs(probe.locations(result)) do
           if probe.path_key(vim.uri_to_fname(location.uri or location.targetUri)) == probe.path_key(paths.target) then return false end
@@ -926,7 +930,7 @@ return function(env)
       end)
     request('normal completion continues after child crash', 'use', 'return target.twice(2)', 'tw', 'textDocument/completion', nil,
       function(result) for _, item in ipairs(result and (result.items or result) or {}) do if item.label:match('^twice') then return true end end return false end)
-    request('crashed child diagnostic is withdrawn', 'mixin', 'public abstract int shadow$twice', 'shadow$twice', 'textDocument/diagnostic', nil,
+    request('crashed child diagnostic is withdrawn', 'mixin', member_anchor, member_name, 'textDocument/diagnostic', nil,
       function(result) for _, diagnostic in ipairs(result and result.items or {}) do if diagnostic.message == 'ipc-fixture:bound' then return false end end return true end)
     record('crash-withdrawal-and-normal-completion')
     vim.fn.delete(barrier .. '/crash'); fresh_diagnostic = false; settings(true)
@@ -947,7 +951,7 @@ return function(env)
   end
   record('rename-applied-and-inspected')
   settings(false); deliver()
-  request('disabled extension withdraws the target relation', 'mixin', 'public abstract int shadow$doubled', 'shadow$doubled', 'textDocument/definition', nil,
+  request('disabled extension withdraws the target relation', 'mixin', 'public abstract int ' .. member_prefix .. 'doubled', member_prefix .. 'doubled', 'textDocument/definition', nil,
     function(result)
       for _, location in ipairs(probe.locations(result)) do if probe.path_key(vim.uri_to_fname(location.uri or location.targetUri)) == probe.path_key(paths.target) then return false end end
       return true

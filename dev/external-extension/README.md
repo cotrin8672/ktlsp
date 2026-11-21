@@ -1,12 +1,32 @@
 # External provider integration fixture
 
+`KTLSP_IPC_MODE=member-links` runs the existing `ipc-probes.lua` semantic lifecycle
+against the annotation-free `fixture/ForwardLink.java`. The separate child uses
+`memberPrefix = "forward$"` and a configured target, reads the exact authored
+`declarationMember`, and submits the same `analysis/require`/site contract. It has
+no Minecraft names or annotations in this scenario. This is an intentionally
+small consumer convention, not a production forwarding framework.
+
+Use a disposable project containing only `project/fixture/{Target,ForwardLink}.java`
+and `IpcUse.java` (copied into `fixture/`), the stock host, and the independently
+built `ipc-child`. Set a fresh external `KTLSP_IPC_BARRIER`,
+`KTLSP_CORPUS_EXTRA_PROBES` to `dev/external-extension/ipc-probes.lua`, and select
+`member-links-manifest.json` with the existing `corpus` harness scenario. Its
+one ordinary completion/definition baseline precedes the existing cancellation,
+fresh shared completion/diagnostic/navigation/references, crash withdrawal,
+applied whole-buffer rename, and provider-disable checks. The resulting
+`extension-ipc-proof.json` records `mode = "member-links"`. The recorded
+editor run passed 26/26 semantic checks with zero unmeasured requests, zero
+dependency failures, and clean shutdown; its receipt is under
+`C:/tmp/ktlsp-runs/external-member-links-20261121-accept1/editor2/artifacts`.
+
 This independent Cargo workspace composes ktlsp's public
 `Backend::with_analysis_providers` API with a test-only provider. It proves the
 registration boundary available to a separately maintained Rust project. The
 stock ktlsp executable is unchanged. This is executable composition, not runtime
 loading of a DLL or a second LSP connection.
 
-The provider reads host-normalized `SourceAnnotation` and `DeclaredMemberFacts`,
+The default Shadow provider reads host-normalized `SourceAnnotation` and `DeclaredMemberFacts`,
 resolves the annotation type and `@Mixin(Target.class)` target through the shared
 index, and binds `@Shadow(prefix = "shadow$")` using the exact authored JVM
 signature and dispatch. It supplies no target identities, invented signatures,

@@ -558,10 +558,18 @@ fn analyze(
     let declarations = params["declarations"]
         .as_array()
         .ok_or("missing declarations")?;
+    // A test consumer's naming policy is independent of the host's semantic
+    // contract. The member-links scenario deliberately uses no Mixin syntax.
+    let prefix = params["configuration"]["memberPrefix"]
+        .as_str()
+        .unwrap_or("shadow$");
+    if prefix.is_empty() {
+        return Err("member prefix must not be empty".into());
+    }
     let Some(shadow) = declarations.iter().find(|declaration| {
         declaration["name"]
             .as_str()
-            .is_some_and(|name| name.contains("shadow$"))
+            .is_some_and(|name| name.trim_matches('`').starts_with(prefix))
     }) else {
         return Ok(json!({"sites":[],"diagnostics":[]}));
     };
@@ -657,7 +665,7 @@ fn analyze(
         output,
         next,
         "analysis/require",
-        json!({"evaluation":evaluation,"requirements":[{"target":target,"authored":shadow["id"],"names":{"kind":"exact","values":[name.strip_prefix("shadow$").ok_or("prefix")?]},"kind":member["kind"],"signature":member["signature"],"dispatch":member["dispatch"],"nameLink":{"kind":"prefixed","prefix":"shadow$"}}]}),
+        json!({"evaluation":evaluation,"requirements":[{"target":target,"authored":shadow["id"],"names":{"kind":"exact","values":[name.strip_prefix(prefix).ok_or("prefix")?]},"kind":member["kind"],"signature":member["signature"],"dispatch":member["dispatch"],"nameLink":{"kind":"prefixed","prefix":prefix}}]}),
     )?;
     let range = shadow["range"].clone();
     let start = range["start"].as_u64().ok_or("range")?;
@@ -666,8 +674,74 @@ fn analyze(
     let requirement = &resolution["requirements"][0];
     let bound = requirement["binding"]["state"] == "found";
     Ok(
-        json!({"sites":[{"requirement":requirement["id"],"fullRange":range,"editableName":{"start":start+7+u64::from(escaped),"end":end-u64::from(escaped)},"renameSubject":"target"}],"diagnostics":[{"range":range,"severity":"hint","message":if bound {"ipc-fixture:bound"}else{"ipc-fixture:unknown"}}]}),
+        json!({"sites":[{"requirement":requirement["id"],"fullRange":range,"editableName":{"start":start+prefix.len() as u64+u64::from(escaped),"end":end-u64::from(escaped)},"renameSubject":"target"}],"diagnostics":[{"range":range,"severity":"hint","message":if bound {"ipc-fixture:bound"}else{"ipc-fixture:unknown"}}]}),
     )
+}
+
+#[cfg(test)]
+mod member_link_tests {
+    use super::*;
+
+    fn analyze_link(name: &str, prefix: &str) -> (Value, Vec<Value>) {
+        let mut replies = Vec::new();
+        for (id, result) in [
+            (1, json!({"facts":[
+                {"state":"found","value":{"id":"host-target"}},
+                {"state":"found","value":{"kind":"method",
+                    "signature":{"state":"found","value":{"descriptor":"(I)I"}},
+                    "dispatch":{"state":"found","value":"instance"}}}
+            ]})),
+            (2, json!({"requirements":[{"id":"host-requirement",
+                "binding":{"state":"found","value":"host-member"}}]})),
+        ] {
+            write_frame(&mut replies, &json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+        }
+        let mut input = std::io::Cursor::new(replies);
+        let mut output = Vec::new();
+        let result = analyze(&mut input, &mut output, &mut 0, &json!({
+            "evaluation":"current-evaluation",
+            "configuration":{"target":"fixture.Target","memberPrefix":prefix},
+            "declarations":[{"id":"host-declaration","name":name,
+                "range":{"start":100,"end":100+name.len()},"annotations":[]}]
+        }), &None, false, false, false, false, false).unwrap();
+        let mut output = std::io::Cursor::new(output);
+        let mut requests = Vec::new();
+        while let Some(request) = read_frame(&mut output).unwrap() {
+            requests.push(request);
+        }
+        (result, requests)
+    }
+
+    #[test]
+    fn annotation_free_member_links_reuse_only_host_member_facts() {
+        let (result, requests) = analyze_link("forward$twice", "forward$");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["method"], "analysis/readFacts");
+        assert_eq!(requests[0]["params"]["queries"], json!([
+            {"op":"resolveType","name":"fixture.Target"},
+            {"op":"declarationMember","declaration":"host-declaration"}
+        ]));
+        assert_eq!(requests[1]["method"], "analysis/require");
+        let requirement = &requests[1]["params"]["requirements"][0];
+        assert_eq!(requirement["authored"], "host-declaration");
+        assert_eq!(requirement["target"]["value"]["id"], "host-target");
+        assert_eq!(requirement["names"], json!({"kind":"exact","values":["twice"]}));
+        assert_eq!(requirement["signature"], json!({"state":"found","value":{"descriptor":"(I)I"}}));
+        assert_eq!(requirement["nameLink"], json!({"kind":"prefixed","prefix":"forward$"}));
+        assert_eq!(result["sites"][0], json!({"requirement":"host-requirement",
+            "fullRange":{"start":100,"end":113},
+            "editableName":{"start":108,"end":113},"renameSubject":"target"}));
+        assert_eq!(result["diagnostics"][0]["message"], "ipc-fixture:bound");
+    }
+
+    #[test]
+    fn member_link_prefix_is_anchored_and_backticks_preserve_editable_bytes() {
+        let (ignored, requests) = analyze_link("notforward$twice", "forward$");
+        assert!(requests.is_empty());
+        assert_eq!(ignored, json!({"sites":[],"diagnostics":[]}));
+        let (escaped, _) = analyze_link("`forward$twice`", "forward$");
+        assert_eq!(escaped["sites"][0]["editableName"], json!({"start":109,"end":114}));
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

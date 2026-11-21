@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "project_id": "semantic-member-links-child",
+  "scope": "Annotation-free external consumer links normalized declarations through the existing shared member contract.",
+  "probes": [{
+    "id": "member-links-local-baseline",
+    "source": "fixture/IpcUse.java",
+    "anchor": "return target.twice(2)",
+    "token": "twice",
+    "completion_prefix": "tw",
+    "target_file": "fixture/Target.java",
+    "target_anchor": "public int twice",
+    "target_token": "twice"
+  }]
+}
