@@ -6227,3 +6227,24 @@ host 12, IPC extension tests 16, and optional-operation negotiation 1 (94
 total). No product change was justified. This proves the current semantic
 extension contract and invalidation behavior, not arbitrary new type-system
 rules or complete framework parity; those remain extension-specific work.
+
+## 2026-11-21 checkpoint: independent Wire project boundary
+
+One fresh real repository was exercised without modifying its sources:
+Square Wire `9a3bce4a`, module `wire-tests/jvm-java-kotlin`. The first release
+Neovim run initialized successfully and advertised hover, definition,
+references, and completion, but its 38-module Gradle model was still being
+prepared at the 300-second boundary. A single warm run reused the disk model;
+project and library readiness completed (`433` project files, `59,392`
+library files, `155` missing sources) and exited cleanly.
+
+The Kotlin probe imports Wire-generated `MessageWithOptions`, but the module's
+`build/generated/source/wire` contains no generated Java source or class, so
+the empty hover/definition is an unavailable generated-input case, not a
+confirmed ktlsp semantic failure. The Java probe uses a real `okio.Buffer` and
+valid `write` cursor; the selected `okio-jvm:3.18.2` binary is present, but its
+source-free Kotlin class is intentionally not admitted by the conservative
+Java binary-stub policy, yielding `Unknown(unknown-receiver-type)`. The same
+probe succeeds when the official sources JAR is supplied. No unsafe Metadata
+stub relaxation was made; this remains a documented source-demand/decompiler
+boundary rather than a passing completion claim.
