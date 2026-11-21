@@ -6481,6 +6481,12 @@ artifacts:
 This is 85/85 semantic checks across the five repositories. Evidence is under
 `C:/tmp/ktlsp-current-corpus/{moshi-normal,moshi-incomplete,okhttp-normal2,okhttp-incomplete,retrofit-normal,retrofit-incomplete,spring-normal,spring-incomplete,gradle-normal2,gradle-incomplete}`. The runs prove current release behavior for warm indexing, dependency hydration, unsaved edits, incomplete syntax, cross-language definition, and clean shutdown. They do not prove cold-start latency budgets, complete CEM coverage, code-action/inlay-hint breadth, compiler-plugin/KSP generated-source coverage, or IDEA parity.
 
+The post-`7213f777` changes do not touch `ktcore` or the shared completion,
+definition, diagnostics, project, or classpath paths; they are limited to
+extension transport, import actions, probes, and acceptance documentation.
+The current CEM, Java editor, binary-generic, and processor-reload runs cover
+those changed paths without duplicating all ten corpus runs.
+
 ## 2026-11-21 checkpoint: bounded transport mutex wait
 
 Commit `55f53116` ports the isolated Lithium transport candidate into the
