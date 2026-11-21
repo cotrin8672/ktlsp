@@ -6381,3 +6381,36 @@ Receipt: `C:/tmp/sodium-original-7213f777-803d1fa/editor-proof.json`
 This closes the original Sodium acceptance slice; it does not by itself claim
 all five independent repositories, cold-start budgets, or complete IDEA
 parity.
+
+## 2026-11-21 checkpoint: current CEM release semantic probe
+
+The current release pin `7213f777` was exercised again against the real
+`C:/Users/gummy/IdeaProjects/CreateEnchantableMachinery` Kotlin buffer
+`EnchantableDrillBlock.kt`, reusing the completed project cache. The generic
+project health probe reported zero diagnostics and the expected completion,
+definition, references, and implementation capabilities. A targeted semantic
+probe then requested hover before goto on the `DrillBlock` superclass and
+resolved its definition to the Java `DrillBlock.java` source in the extracted
+Create dependency. All checks passed with clean harness status 0; artifacts are
+under `C:/tmp/cem-semantic-7213c`.
+
+This is current-head evidence for the Kotlin-to-Java hover/definition path and
+the no-diagnostic warm state. It is not a cold-start latency certificate, a
+whole-CEM 38-case run, or proof of Mixin behavior.
+
+## 2026-11-21 checkpoint: extension foundation audit
+
+The extension foundation was re-audited at `3efd6ac0` without code changes.
+Both embedded Rust providers and the explicit stdio JSON-RPC child boundary
+are present. Negotiated host facts flow through `MemberRequirement`,
+`bind_site`, and `ContributionSet` into the shared completion, diagnostics,
+definition, references, and rename paths, with source/model/configuration/
+semantic-index invalidation and stale requeue guards. Focused contract checks
+remain 94 passing (65 ktcore extension, 12 extension-host, 16 IPC, and 1
+negotiation check).
+
+The contract is deliberately member/site-centered rather than a generic hook
+for arbitrary inferred types or synthetic declarations; no such broader API
+was justified by the current Mixin evidence. A separate non-Mixin external
+provider acceptance and documentation cleanup remain open before claiming the
+extension boundary is broadly portable.
