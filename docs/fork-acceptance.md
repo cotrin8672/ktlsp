@@ -6286,3 +6286,23 @@ could hide directory deletion. No watch-policy change was shipped. The cached
 root-continuation optimization remains a separate, uncommitted candidate until
 its direct guard/accounting regression and a clean performance comparison are
 available.
+
+## 2026-11-21 checkpoint: cached root continuation fast path
+
+The cached continuation candidate is now pushed as `dddbb09f`, on top of
+`c1baeec3`. It recognizes only a single `rootFileSnapshot` query with an
+`after` cursor and uses the fast path only when root-read planning proves that
+no file I/O or source demand is pending. Any non-cached read, source demand,
+stale evaluation, invalid cursor, stream-budget failure, or final-generation
+change goes through the existing guarded path. The receive idle check is
+opportunistic (`try_lock`); input and finish validation remain blocking and
+authoritative.
+
+The release pin used for the external check is SHA256
+`ACE9593E1C90080CE367F59F254BD8D5A06AAF05A8DADE8985BFBFCF10FA7696`
+(25,628,672 bytes). Focused extension IPC (4), root wire (5), full `ktlsp`
+library (802 passed, 17 ignored), and release build pass. In the single MC
+comparison, 47 root snapshots included 29 cached continuations and the
+continuation-limit failure disappeared. `mcdev.info` still did not finish
+because a separate `META-INF` build-output refresh interrupted the run, so
+this is a transport improvement, not whole-Sodium acceptance.
