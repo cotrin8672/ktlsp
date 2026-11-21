@@ -6186,3 +6186,28 @@ with clean exit 0 (`C:/tmp/sodium-wire-2d9cf009-e280fc7/editor-proof.json`).
 The remaining completion failure is 1,653 consumer-side `sourceFacts` reads and
 belongs to the mc-dev companion's bounded source-selection policy, not this
 host transport fix.
+
+## 2026-11-21 checkpoint: current CEM warm cross-language hover
+
+A direct current-head release probe against
+`C:/Users/gummy/IdeaProjects/CreateEnchantableMachinery` used the real Kotlin
+`EnchantableDrillBlock.kt` buffer and a Java `DrillBlock` dependency. The first
+cold attempt kept the server alive for the scripted 120-second hover window,
+but the first model generation had not published its source/model store yet:
+the trace later records generation 1 model loading for about 244.56 seconds,
+followed by generation 2 source installation and a successful definition
+request. The early hover was therefore `Unknown(query-scope-incomplete)`
+during readiness, not a false diagnostic or a post-index semantic mismatch.
+
+Reusing the same cache in `C:/tmp/cem-head-2d9cf009` with a fresh editor state
+completed in about seven seconds. Capabilities, zero diagnostics, hover before
+any goto request, and definition to `DrillBlock.java` all passed, with clean
+exit (`trace-warm.jsonl`). A focused Rust regression also passes for a Kotlin
+subtype constructor resolving a Java dependency in both source and stub
+representations while global coverage is incomplete; the out-of-scope negative
+case remains unknown with no targets. No product change was justified by the
+cold result.
+
+This closes the current-head CEM Kotlin-to-Java hover/definition slice after
+the model is ready. It is not a fresh 38/38 whole-CEM run, a cold-start budget
+certificate, or an IDEA-parity claim; those remain separate acceptance items.
