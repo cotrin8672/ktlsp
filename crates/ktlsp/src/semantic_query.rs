@@ -279,11 +279,26 @@ pub fn resolved_symbol_query(
             }
         }
     }
-    let usage = identifier_at(tree, offset)?;
+    // Java type names (including the target of `Gui.class`) are `type_identifier`,
+    // not Kotlin's `identifier`. Reuse Java navigation's scoped type resolution;
+    // the ordinary identifier and compiled-call paths keep their existing behavior.
+    let java_type_usage = (SourceLanguage::for_key(file) == SourceLanguage::Java)
+        .then(|| language::identifier_at(SourceLanguage::Java, tree, offset))
+        .flatten()
+        .filter(|usage| usage.kind() == "type_identifier");
+    let usage = java_type_usage.or_else(|| identifier_at(tree, offset))?;
     let symbol = Some(node_text(usage, src).to_string()).filter(|s| !s.is_empty());
-    let kind = resolve::use_kind(usage);
+    let kind = if java_type_usage.is_some() {
+        UseKind::Type
+    } else {
+        resolve::use_kind(usage)
+    };
     let ctx = infer::FileCtx::from_tree_in_file(tree, src, file);
-    let targets = resolve::goto_with_ctx(index, file, src, tree, offset, &ctx);
+    let targets = if java_type_usage.is_some() {
+        language::goto_definition(index, SourceLanguage::Java, file, src, tree, offset)
+    } else {
+        resolve::goto_with_ctx(index, file, src, tree, offset, &ctx)
+    };
     let entry = targets.first().and_then(|target| {
         hierarchy::entry_for_name_range(index, &target.file, target.start_byte, target.end_byte)
             .or_else(|| ctx.local_entry(target).cloned())
@@ -2254,6 +2269,60 @@ mod tests {
             query.symbol_summary().map(|s| s.name),
             Some("helper".to_string())
         );
+    }
+
+    #[test]
+    fn java_type_hover_uses_the_same_target_as_navigation() {
+        for (target_file, target_source) in [
+            (
+                "Gui.java",
+                "package screen;\n/** Actual target docs. */\npublic class Gui {}",
+            ),
+            (
+                "Gui.kt",
+                "package screen\n/** Actual target docs. */\nclass Gui",
+            ),
+        ] {
+            let mut ws = Workspace::new();
+            ws.open(target_file, target_source.into());
+            // The same simple name in an unrelated package must not become the hover target.
+            ws.open("OtherGui.java", "package other; public class Gui {}".into());
+            for source in [
+                "import screen.Gui; @Marker(Gui.class) class Use {}",
+                "@Marker(screen.Gui.class) class Use {}",
+                "import screen.Gui; class Use { Gui value; }",
+                "import screen.Gui; class Use { Object value = new Gui(); }",
+            ] {
+                ws.open("Use.java", source.into());
+                let offset = source.rfind("Gui").unwrap() + 1;
+                let definitions = ws.goto_definition("Use.java", offset);
+                assert_eq!(definitions.len(), 1, "{source}");
+                assert_eq!(definitions[0].file, target_file, "{source}");
+                let query = ws
+                    .resolved_symbol_query("Use.java", offset)
+                    .expect("Java type reference must have a semantic query");
+                assert_eq!(query.targets, definitions, "{source}");
+                assert_eq!(query.reference().kind_label(), "type", "{source}");
+                assert_eq!(query.reference().status_label(), "ok", "{source}");
+                let hover = query.hover_markdown().expect("resolved Java type hover");
+                assert!(hover.contains("Gui"), "{source}: {hover}");
+                assert!(hover.contains("screen"), "{source}: {hover}");
+            }
+            for source in [
+                "@Marker(Missing.class) class Use {}",
+                "@Marker(Gui.class) class Use {}",
+            ] {
+                ws.open("Use.java", source.into());
+                let offset = source.find(".class").unwrap() - 1;
+                assert!(ws.goto_definition("Use.java", offset).is_empty(), "{source}");
+                assert!(
+                    ws.resolved_symbol_query("Use.java", offset)
+                        .and_then(|query| query.hover_markdown())
+                        .is_none(),
+                    "{source}"
+                );
+            }
+        }
     }
 
     #[test]
