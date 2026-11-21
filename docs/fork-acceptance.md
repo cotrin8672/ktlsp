@@ -6280,12 +6280,11 @@ Sodium source-acceptance gate reached the exact GuiMixin revision at about
 root-snapshot command still did not complete.
 
 The observed `Remove(Any)` under `build/reports/problems/problems-report.html`
-is recorded as an unresolved over-invalidation. The event does not prove that
-the removed path was a regular file, so suppressing it in an excluded subtree
-could hide directory deletion. No watch-policy change was shipped. The cached
-root-continuation optimization remains a separate, uncommitted candidate until
-its direct guard/accounting regression and a clean performance comparison are
-available.
+was initially recorded as an unresolved over-invalidation. Subsequent trace
+classification showed it came from the wholly excluded `resource_filter`
+subtree, so the narrow watch fix is recorded below. The cached
+root-continuation optimization is likewise recorded below with its separate
+transport result.
 
 ## 2026-11-21 checkpoint: excluded descendant ambiguous removal
 
@@ -6326,3 +6325,22 @@ comparison, 47 root snapshots included 29 cached continuations and the
 continuation-limit failure disappeared. `mcdev.info` still did not finish
 because a separate `META-INF` build-output refresh interrupted the run, so
 this is a transport improvement, not whole-Sodium acceptance.
+
+## 2026-11-21 checkpoint: excluded descendant create/remove stability
+
+The first watch fix stopped the repeated `Remove(Any)` invalidation, but a
+real Windows `Create(Any)` for the same excluded `build` descendant then
+retired the resource root. Commit `3499402d` extends the same strict
+`excluded_descendant` boundary to `Create(Any)`. It does not suppress creation
+of the excluded directory itself, non-excluded paths, explicit inputs,
+renames, rescans, or mixed events. Focused filtered-root tests remain 7/7;
+the release pin used for the single external check is SHA256
+`582C71E59DBEFB890AC9943BBA5BCFACF314ABAEA8AA33B07CC0644FFD9A2BCC`
+(25,628,672 bytes).
+
+That run observed zero compiler watch invalidations, zero watch refreshes, and
+zero root guard failures after both HTML create/remove events. `mcdev.info`
+reached its root inventory and 35 snapshots (17 cached), but the companion's
+existing 25-second RPC limit ended the operation while transferring the root
+stream. This is now a transport-throughput issue; the watch fix itself is
+confirmed on the real Windows path.
