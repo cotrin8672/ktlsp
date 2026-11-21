@@ -6638,3 +6638,32 @@ first project generation is still being installed. The failed command reaches
 dependency hydration, not an incorrect fact or a transport mismatch. A larger
 generic command handoff or retry would be a new scheduler policy and is not
 justified without a bounded completion condition.
+
+## 2026-11-21 checkpoint: Lithium startup handoff and archive hydration
+
+The bounded command handoff was added in `567BEB47`. An open command that has
+already observed semantic facts may use the existing two-second dependency
+handoff once per evaluation; stale, generation and deadline checks remain
+unchanged. Focused IPC handoff tests passed **4/4**. The first Lithium rerun
+showed that the handoff was active but the evaluation still became stale while
+the demanded library source was being prepared.
+
+The follow-up release `EA026CF5` keeps the same consistency contract and reuses
+the existing `HostInputLease` while scanning selected binary archive entries.
+The initial and final archive digest/policy checks, selected origin, symbol
+stamp, ABI and stale checks are unchanged. A 65-entry regression reduced the
+expensive current-input checks from over 128 to **2**, and the focused
+source-hydration/dependency set passed (32 relevant tests, including invalid
+content, epoch, duplicate-variant and IPC source-capture cases). Release
+binary SHA-256 is
+`72A045036BC428BA64055E0EDD82E1A373E660BF090E9A45A21D52EC6FC0DAFF`
+(25,689,600 bytes).
+
+With that release, Lithium project-only startup no longer reproduced the
+semantic-index `Stale`: the first extension command reached host validation in
+about 23 seconds. The remaining failure is in the external mc-dev-lsp
+consumer: the `@Mixin(RemoveBlockGoal.class)` annotation type aliases are both
+reported as `unknown(unsupportedType)` in the same view, so the completion
+result is empty. This is now an extension-side type-resolution gap, not a
+ktlsp invalidation or archive hydration failure. Evidence:
+`C:/tmp/mcdev-promotion-lithium/public-ea026cf5-f90eee5/{editor-proof.json,host.trace.jsonl}`.
