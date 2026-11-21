@@ -6603,3 +6603,23 @@ same trace later records verified compiler diagnostics (Java 3, Kotlin 6) and
 a Java pull with three items. This is asynchronous diagnostic readiness, not a
 completion or generated-source visibility failure, and is not counted as a
 pass for the immediate-pull assertions.
+
+## 2026-11-21 checkpoint: additional real project, Lithium 1.21.1
+
+The previously unseen Lithium 1.21.1 revision was exercised through the real
+Neovim extension workflow. After project and library indexing completed, the
+same `RemoveBlockGoalMixin.java` source SHA produced two authentic
+`mcdev.completion` replies with one useful candidate each, standard Java hover,
+UTF-16 edit application and source restoration, 18 assertions, and a clean
+exit. Evidence:
+`C:/Users/gummy/.codex/worktrees/ktlsp-rust/mc-dev-lsp/build/rust-test-logs/external-mod-promotion/lithium-indexed/editor-proof.json`.
+
+The project-only startup entry remains a separate limitation: while
+`projectInputs` and `sourceFacts` succeeded, repeated index-generation changes
+invalidated the evaluation immediately before `annotationSites`, yielding a
+truthful semantic-index `Stale` response. The document revision and source SHA
+were unchanged, so this is not a transport or edit mismatch. Relaxing the stale
+guard would risk publishing facts from a different index generation; no product
+change is justified by this evidence. The focused indexed result is accepted,
+but the startup limitation remains open rather than being counted as full
+project acceptance.
