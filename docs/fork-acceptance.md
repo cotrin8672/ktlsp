@@ -6629,3 +6629,12 @@ guard would risk publishing facts from a different index generation; no product
 change is justified by this evidence. The focused indexed result is accepted,
 but the startup limitation remains open rather than being counted as full
 project acceptance.
+
+The startup trace contains 11 dependency install batches (individual flushes
+are roughly 0.19--0.22 seconds) and 126 semantic-index invalidations while the
+first project generation is still being installed. The failed command reaches
+`sourceFacts`, then observes the changed index immediately before
+`annotationSites`; this is the expected consistency guard firing during active
+dependency hydration, not an incorrect fact or a transport mismatch. A larger
+generic command handoff or retry would be a new scheduler policy and is not
+justified without a bounded completion condition.
