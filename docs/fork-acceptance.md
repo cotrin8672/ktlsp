@@ -6364,3 +6364,20 @@ no watch invalidation, no child-response error, and clean shutdown. The next
 out to 388 source facts plus five inventories and then hits a semantic-index
 or provider invalidation. This is now an MC completion-policy issue, not an
 info/root-stream transport failure.
+
+## 2026-11-21 checkpoint: Sodium original completion acceptance
+
+The public ktlsp build `7213f777` (release SHA256
+`2ACD812CCC05EDE01EC7B07B11E4B9137B5F16CD4860926421B0658D8BA52A60`)
+combined with MC companion pin `803d1fa` completed the original Sodium entry
+under the unchanged project-only startup conditions. The run accepted the
+exact source revision six times, completed a real `mcdev.info`, completed both
+startup and second `mcdev.completion` requests, returned the standard Java
+hover, applied the `renderCameraOverlays` completion edit, restored the source
+text, and passed all 18 original assertions with clean LSP exit 0.
+
+Receipt: `C:/tmp/sodium-original-7213f777-803d1fa/editor-proof.json`
+(SHA256 `A75AEFEABC7F0A02AB5A9E43D9DC2121FB7F3DE80900A59B971C5E60FFFA10A0`).
+This closes the original Sodium acceptance slice; it does not by itself claim
+all five independent repositories, cold-start budgets, or complete IDEA
+parity.
