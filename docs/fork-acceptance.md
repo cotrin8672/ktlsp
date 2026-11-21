@@ -6248,3 +6248,12 @@ Java binary-stub policy, yielding `Unknown(unknown-receiver-type)`. The same
 probe succeeds when the official sources JAR is supplied. No unsafe Metadata
 stub relaxation was made; this remains a documented source-demand/decompiler
 boundary rather than a passing completion claim.
+
+The follow-up Sodium host candidate `f64fdc1` preserved the same stale guard and
+clean shutdown but still did not reach the original command: exact source
+acceptance was 0/30 and commands were 0. It did, however, reduce the facts
+request-to-send median to 0.529 ms. The remaining measured window is after
+send: `analysis/finish` workspace-lock wait median 414.7 ms and idle
+validation median 411.8 ms, with no commits. This narrows the next safe work
+to bounded handoff/receive ordering; it does not justify skipping dependency
+flushes or weakening generation validation.
