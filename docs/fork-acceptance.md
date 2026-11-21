@@ -6667,3 +6667,20 @@ reported as `unknown(unsupportedType)` in the same view, so the completion
 result is empty. This is now an extension-side type-resolution gap, not a
 ktlsp invalidation or archive hydration failure. Evidence:
 `C:/tmp/mcdev-promotion-lithium/public-ea026cf5-f90eee5/{editor-proof.json,host.trace.jsonl}`.
+
+The external extension then fixed its existing progress-end reissue path: the
+first command is allowed to report the truthful incomplete result while the
+selected Mixin archive is still being installed, and the same document
+revision/SHA is reissued when the existing `LspProgress` end notification makes
+the facts current. With ktlsp `EA026CF5` and the fixed companion (`f90EEE5`,
+MC-side reissue pin `4B6D0A0`), the original Lithium project-only entry passed
+**18/18 assertions**: the initial incomplete result, the later `canUse`
+completion, standard Java hover, two UTF-16 edits with source restoration, and
+clean shutdown. No stale result was accepted and no host API, deadline or
+Unknown guard was weakened. Evidence:
+`C:/Users/gummy/.codex/worktrees/ktlsp-rust/mc-dev-lsp/build/rust-test-logs/external-mod-promotion/lithium-index-end-4b6d0a0/editor-proof.json`
+(SHA-256
+`386D3B12734777DC81863F13F6CB4FA37F4A997C036C7A7A0D74CB94F529D602`).
+The `mcdev.info` startup envelope remains an intentionally separate
+`INCOMPLETE_PROJECT_CONTEXT` result; the completion/hover/edit path is now
+accepted for this additional real project.
