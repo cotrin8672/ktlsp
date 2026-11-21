@@ -2787,7 +2787,7 @@ pub(crate) struct Worker {
     project_operations: AtomicU32,
     commands: std::collections::BTreeSet<String>,
     negotiated_commands: Mutex<std::collections::BTreeSet<String>>,
-    transport: Mutex<Option<Transport>>,
+    transport: parking_lot::Mutex<Option<Transport>>,
 }
 
 impl Worker {
@@ -2803,7 +2803,7 @@ impl Worker {
             project_operations: AtomicU32::new(0),
             commands,
             negotiated_commands: Mutex::new(std::collections::BTreeSet::new()),
-            transport: Mutex::new(None),
+            transport: parking_lot::Mutex::new(None),
         })
     }
     pub fn stop(&self) {
@@ -2820,7 +2820,22 @@ impl Worker {
     }
     pub fn close(&self) {
         self.stop();
-        drop(self.transport.lock().unwrap().take());
+        drop(self.transport.lock().take());
+    }
+    fn lock_command_transport(
+        &self, deadline: Instant, cancellation: &AtomicBool, mut current: impl FnMut() -> bool,
+    ) -> Result<parking_lot::MutexGuard<'_, Option<Transport>>, String> {
+        loop {
+            if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
+            if self.stopped.load(Ordering::Acquire) || !current() { return Err("Stale".into()); }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err("CommandUnavailable".into()); }
+            // Join the transport wait queue instead of racing evaluations that
+            // can reacquire the mutex between successive polling attempts.
+            if let Some(guard) = self.transport.try_lock_for(remaining.min(Duration::from_millis(10))) {
+                return Ok(guard);
+            }
+        }
     }
     pub fn run(
         &self,
@@ -2845,20 +2860,14 @@ impl Worker {
         trace_command_state(work,workspace,dispatch,"start",None);
         let queue_deadline = Instant::now() + EVALUATION_LIMIT;
         let mut transport = if work.command.is_some() {
-            loop {
-                if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
-                if self.stopped.load(Ordering::Acquire) || !workspace.lock().ipc_evaluation_current(work.evaluation) {
+            self.lock_command_transport(queue_deadline, cancellation, ||
+                workspace.lock().ipc_evaluation_current(work.evaluation)
+            ).inspect_err(|error| {
+                if error == "Stale" {
                     trace_command_state(work,workspace,dispatch,"queue",Some("Stale"));
-                    return Err("Stale".into());
                 }
-                match self.transport.try_lock() {
-                    Ok(guard) => break guard,
-                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < queue_deadline => std::thread::sleep(Duration::from_millis(10)),
-                    Err(std::sync::TryLockError::WouldBlock) => return Err("CommandUnavailable".into()),
-                    Err(_) => return Err("extension transport poisoned".into()),
-                }
-            }
-        } else { self.transport.lock().unwrap() };
+            })?
+        } else { self.transport.lock() };
         if self.stopped.load(Ordering::Acquire) {
             return Err("extension stopped".into());
         }
@@ -3176,7 +3185,7 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         // The final registration can be dropped under Workspace access; process cleanup cannot.
-        if let Some(transport) = self.transport.get_mut().unwrap().take() {
+        if let Some(transport) = self.transport.get_mut().take() {
             std::thread::spawn(move || drop(transport));
         }
     }
@@ -3328,6 +3337,58 @@ impl Drop for Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_transport_waits_for_a_busy_background_transport() {
+        let worker = Worker::new(vec!["not-started".into()]);
+        let background = worker.transport.lock();
+        let cancellation = AtomicBool::new(false);
+        let (waiting, observed_wait) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let command = threads.spawn(|| {
+                let mut attempts = 0;
+                worker.lock_command_transport(Instant::now() + Duration::from_secs(2), &cancellation, || {
+                    attempts += 1;
+                    // The second check proves a timed lock attempt ran while the
+                    // background evaluation still held the transport.
+                    if attempts == 2 { waiting.send(()).unwrap(); }
+                    true
+                }).map(drop)
+            });
+            observed_wait.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(background);
+            assert_eq!(command.join().unwrap(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn command_transport_wait_preserves_cancellation_stale_stop_and_deadline() {
+        let worker = Worker::new(vec!["not-started".into()]);
+        let _background = worker.transport.lock();
+        let cancellation = AtomicBool::new(false);
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        assert_eq!(worker.lock_command_transport(deadline(), &cancellation, || {
+            cancellation.store(true, Ordering::Release);
+            true
+        }).err().as_deref(), Some("Cancelled"));
+        cancellation.store(false, Ordering::Release);
+        let mut checks = 0;
+        assert_eq!(worker.lock_command_transport(deadline(), &cancellation, || {
+            checks += 1;
+            checks == 1
+        }).err().as_deref(), Some("Stale"));
+        assert_eq!(checks, 2);
+        assert_eq!(worker.lock_command_transport(deadline(), &cancellation, || {
+            worker.stop();
+            true
+        }).err().as_deref(), Some("Stale"));
+        worker.stopped.store(false, Ordering::Release);
+        assert_eq!(worker.lock_command_transport(Instant::now() + Duration::from_millis(20),
+            &cancellation, || true).err().as_deref(), Some("CommandUnavailable"));
+        drop(_background);
+        assert_eq!(worker.lock_command_transport(Instant::now(), &cancellation, || true)
+            .err().as_deref(), Some("CommandUnavailable"));
+    }
 
     #[test]
     fn optional_project_operations_require_both_capability_and_selected_operations() {
