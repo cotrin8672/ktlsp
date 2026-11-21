@@ -6454,5 +6454,9 @@ stopped/expired rejection; the focused extension IPC suite passes 41/41 and
 
 The Lithium real-editor success used this host candidate together with MC
 commit `f90eee5`, so it is evidence of compatibility, not isolated causal
-proof. A release build and push are still required before treating this fix as
-the public pin.
+proof. The pushed release pin is `76981C51A2F75FC5D520B468A7B88B94FEA109479816AD33A447DEFED0188116`
+(25,735,168 bytes). The release binary also passes the basic real-editor
+smoke (initialization, capability advertisement, local goto, and cross-file
+goto) with harness status 0. The five-repository corpus above intentionally
+remains pinned to `7213f777`; the transport-only change was validated by its
+focused suite and this smoke rather than by repeating the corpus.
