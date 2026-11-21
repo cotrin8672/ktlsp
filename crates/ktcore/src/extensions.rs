@@ -729,6 +729,11 @@ pub struct PendingContributions {
 }
 
 impl PendingContributions {
+    /// Whether a staged result depends on the current semantic index generation.
+    pub fn observes_semantic_index(&self) -> bool {
+        self.reads.semantic_index.is_some()
+    }
+
     /// Source producers requested by staged reads, without publishing their semantic results.
     pub fn requested_source_files(&self) -> &BTreeSet<String> {
         &self.reads.missing_sources

@@ -948,6 +948,11 @@ impl Workspace {
         let _=self.analysis_extensions.finish_ipc_command(evaluation,Err("Cancelled".into()));
     }
 
+    pub(crate) fn claim_open_source_handoff(&mut self) -> Option<u64> {
+        let open_docs = &self.open_docs;
+        self.analysis_extensions.claim_open_source_handoff(|owner| open_docs.contains_key(owner))
+    }
+
     pub(crate) fn take_ipc_work(&mut self) -> Vec<crate::extension_ipc::Work> {
         self.analysis_extensions.refresh_host_inputs();
         if self.analysis_extensions.publish(&mut self.index) {self.bump_index_revision();}
@@ -1095,7 +1100,7 @@ impl Workspace {
         self.resource_catalogs.insert(catalog.scope.clone(),catalog);Ok(())
     }
 
-    pub(crate) fn prepay_ipc_input_read(&mut self,id:u64,method:&str,params:&serde_json::Value)->Result<(),String> {
+    pub(crate) fn prepay_ipc_input_read(&mut self,id:u64,method:&str,params:&serde_json::Value)->Result<bool,String> {
         self.analysis_extensions.prepay_ipc_input_read(id,method,params)
     }
     pub(crate) fn account_ipc_stream_reply(&mut self,id:u64,frame:&serde_json::Value)->Result<(),String> {

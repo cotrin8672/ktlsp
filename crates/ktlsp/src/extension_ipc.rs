@@ -318,6 +318,7 @@ pub(crate) struct Evaluation {
     pub pending: Option<PendingContributions>,
     pub failure: Option<String>,
     pub committed_revision: Option<u64>,
+    pub dependency_handoff_offered: bool,
     pub project: Option<Arc<crate::classpath::ProjectSnapshot>>,
     pub project_operations: u32,
     pub command: bool,
@@ -361,6 +362,7 @@ impl Evaluation {
             pending: None,
             failure: None,
             committed_revision: None,
+            dependency_handoff_offered: false,
             project: None,
             project_operations: 0,
             command: false,
@@ -690,16 +692,16 @@ impl Evaluation {
         self.check_read_charge(params).map(|_|())
     }
 
-    pub(crate) fn prepay_input_read(&mut self, method: &str, params: &Value) -> Result<(), String> {
+    pub(crate) fn prepay_input_read(&mut self, method: &str, params: &Value) -> Result<bool, String> {
         if self.prepaid_input.is_some() { return Err("unfinished extension input read".into()); }
         self.reply_is_stream = false;
-        if method != "analysis/readFacts" { return Ok(()); }
+        if method != "analysis/readFacts" { return Ok(false); }
         let (metadata, continuations) = self.check_read_charge(params)?;
         self.batches += usize::from(metadata);
         self.stream_continuations += continuations;
         self.reply_is_stream = continuations > 0;
         self.prepaid_input = Some(params.clone());
-        Ok(())
+        Ok(self.reply_is_stream)
     }
 
     pub(crate) fn cancel_prepaid_input(&mut self) { self.prepaid_input = None; }
@@ -2870,7 +2872,7 @@ impl Worker {
                 transport.send(initialize_message(&work.provider,&self.commands))?;
                 let response =
                     transport
-                        .receive(Instant::now() + EVALUATION_LIMIT, &self.stopped, || Ok(()))?;
+                        .receive(Instant::now() + EVALUATION_LIMIT, &self.stopped, false, || Ok(()))?;
                 if response["id"] != "initialize"
                     || response["result"]["protocol"]["major"] != PROTOCOL_MAJOR
                     || !response["result"]["capabilities"]
@@ -2935,8 +2937,18 @@ impl Worker {
             let mut stale_input = false;
             loop {
                 stage="receive";
-                let message = transport.receive(deadline, &self.stopped, || {
-                    if !cancelled && (cancellation.load(Ordering::Acquire) || !workspace.lock().ipc_evaluation_current(work.evaluation)) {
+                let message = transport.receive(deadline, &self.stopped, work.command.is_none(), || {
+                    let current = || {
+                        let start=Instant::now();
+                        let current=workspace.lock().ipc_evaluation_current(work.evaluation);
+                        if work.command.is_none() && start.elapsed() >= Duration::from_millis(10) {
+                            crate::trace::span("extension.ipc.source_idle_validation","extension",start,json!({
+                                "evaluation":work.evaluation,"current":current
+                            }));
+                        }
+                        current
+                    };
+                    if !cancelled && (cancellation.load(Ordering::Acquire) || !current()) {
                         cancelled = true;
                         transport.send(
                             json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}),
@@ -2952,11 +2964,13 @@ impl Worker {
                         continue;
                     };
                     let batch_start=Instant::now();
+                    let mut account_reply = true;
                     let prepared_inputs=(||->Result<(),String> {
-                        let (roots,reads,class,jvm,provenance)={
+                        let (roots,root_reads,reads,class,jvm,provenance)={
                             let mut workspace=workspace.lock();
                             stage="prepay-input";
-                            workspace.prepay_ipc_input_read(work.evaluation,method,&message["params"])?;
+                            let stream = workspace.prepay_ipc_input_read(work.evaluation, method, &message["params"])?;
+                            account_reply = stream || work.command.is_some();
                             stage="plan-root-captures";
                             let roots=workspace.begin_ipc_root_captures(work.evaluation,method,&message["params"])?;
                             stage="plan-resource-reads";
@@ -2966,7 +2980,13 @@ impl Worker {
                             stage="plan-jvm-read";
                             let jvm=workspace.begin_ipc_jvm_reads(work.evaluation,method,&message["params"])?;
                             let provenance=workspace.begin_ipc_source_provenance(work.evaluation,method,&message["params"])?;
-                            (roots,reads,class,jvm,provenance)
+                            let root_reads=if roots.is_empty() {
+                                stage="plan-root-reads";
+                                Some(workspace.begin_ipc_root_reads(work.evaluation,method,&message["params"])? )
+                            } else {
+                                None
+                            };
+                            (roots,root_reads,reads,class,jvm,provenance)
                         };
                         for root in roots {
                             stage="root-capture-prepare";
@@ -2974,8 +2994,13 @@ impl Worker {
                             if prepared.catalog.is_ok() {stage="root-capture-attach";}
                             workspace.lock().finish_ipc_root_capture(prepared)?;
                         }
-                        stage="plan-root-reads";
-                        let root_reads=workspace.lock().begin_ipc_root_reads(work.evaluation,method,&message["params"])?;
+                        let root_reads=match root_reads {
+                            Some(reads)=>reads,
+                            None=>{
+                                stage="plan-root-reads";
+                                workspace.lock().begin_ipc_root_reads(work.evaluation,method,&message["params"])?
+                            }
+                        };
                         stage="root-read";
                         for prepared in root_read_batch(root_reads) {
                             workspace.lock().finish_ipc_root_read(prepared)?;
@@ -3006,11 +3031,16 @@ impl Worker {
                         Ok(())
                     })();
                     if let Err(error)=&prepared_inputs {workspace.lock().fail_ipc_input_read(work.evaluation,error);}
-                    let mut result = prepared_inputs.and_then(|_|{stage="facts";workspace.lock().ipc_batch(
-                        work.evaluation,
-                        method,
-                        message["params"].clone(),
-                    )});
+                    let mut requested_source_capture = None;
+                    let mut result = prepared_inputs.and_then(|_|{
+                        stage="facts";
+                        let mut workspace=workspace.lock();
+                        let result=workspace.ipc_batch(work.evaluation,method,message["params"].clone());
+                        if result.is_ok() && method=="analysis/readFacts" {
+                            requested_source_capture=workspace.begin_ipc_requested_source_capture(work.evaluation);
+                        }
+                        result
+                    });
                     if crate::trace::enabled() && method=="analysis/readFacts" {
                         let queries=message["params"]["queries"].as_array();
                         let ops:Vec<_>=queries.into_iter().flatten().take(32)
@@ -3020,21 +3050,18 @@ impl Worker {
                             "stage":stage,"ops":ops,"query_count":queries.map_or(0,Vec::len),
                             "ok":result.is_ok(),"error":result.as_ref().err().map(|error|bounded_trace_text(error))}));
                     }
-                    if result.is_ok() && method == "analysis/readFacts" {
+                    if let Some(mut request)=requested_source_capture {
                         stage="requested-source-capture";
-                        let request=workspace.lock().begin_ipc_requested_source_capture(work.evaluation);
-                        if let Some(mut request)=request {
-                            let waiting=std::mem::take(&mut request.waiting);
-                            let prepared=crate::workspace::prepare_ipc_source_capture(request);
-                            workspace.lock().finish_ipc_source_capture(prepared);
-                            stage="requested-source-wait";
-                            wait_for_requested_sources(waiting,deadline)?;
-                            if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
-                            // The first result has not left the host. Re-read once with all
-                            // original guards; real source/index changes still reject it.
-                            stage="requested-source-facts";
-                            result=workspace.lock().reread_ipc_facts(work.evaluation,message["params"].clone());
-                        }
+                        let waiting=std::mem::take(&mut request.waiting);
+                        let prepared=crate::workspace::prepare_ipc_source_capture(request);
+                        workspace.lock().finish_ipc_source_capture(prepared);
+                        stage="requested-source-wait";
+                        wait_for_requested_sources(waiting,deadline)?;
+                        if cancellation.load(Ordering::Acquire) { return Err("Cancelled".into()); }
+                        // The first result has not left the host. Re-read once with all
+                        // original guards; real source/index changes still reject it.
+                        stage="requested-source-facts";
+                        result=workspace.lock().reread_ipc_facts(work.evaluation,message["params"].clone());
                     }
                     stale_input|=result.as_ref().is_err_and(|error|error=="Stale");
                     after_batch();
@@ -3045,8 +3072,16 @@ impl Worker {
                         }
                     };
                     stage="account-reply";
-                    workspace.lock().account_ipc_stream_reply(work.evaluation,&response)?;
+                    let reply_start=Instant::now();
+                    if account_reply {
+                        workspace.lock().account_ipc_stream_reply(work.evaluation,&response)?;
+                    }
                     transport.send(response)?;
+                    if work.command.is_none() {
+                        crate::trace::span("extension.ipc.fact_reply_sent","extension",reply_start,json!({
+                            "evaluation":work.evaluation,"accounted":account_reply
+                        }));
+                    }
                 } else if message["id"] == id {
                     stage="child-response";
                     if let Some(metadata)=message.get("error").and_then(|error|
@@ -3067,14 +3102,19 @@ impl Worker {
                         return Err(semantic_response_error(error,stale_input || cancelled
                             || !workspace.lock().ipc_evaluation_current(work.evaluation)));
                     }
-                    return workspace
-                        .lock()
-                        .ipc_batch(
-                            work.evaluation,
-                            "analysis/finish",
-                            json!({"evaluation":id,"contributions":message["result"]}),
-                        )
-                        ;
+                    let finish_start=Instant::now();
+                    let mut workspace=workspace.lock();
+                    let lock_wait=finish_start.elapsed();
+                    let result=workspace.ipc_batch(
+                        work.evaluation,
+                        "analysis/finish",
+                        json!({"evaluation":id,"contributions":message["result"]}),
+                    );
+                    drop(workspace);
+                    crate::trace::span("extension.ipc.source_finish","extension",finish_start,json!({
+                        "evaluation":work.evaluation,"lock_wait_us":lock_wait.as_micros(),"ok":result.is_ok()
+                    }));
+                    return result;
                 } else {
                     return Err("unexpected extension response id".into());
                 }
@@ -3177,11 +3217,22 @@ impl Transport {
         &self,
         deadline: Instant,
         stopped: &AtomicBool,
+        prefer_buffered: bool,
         mut idle: impl FnMut() -> Result<(), String>,
     ) -> Result<Value, String> {
         loop {
             if stopped.load(Ordering::Acquire) {
                 return Err("extension stopped".into());
+            }
+            if prefer_buffered {
+                if Instant::now() >= deadline {
+                    return Err("extension evaluation timed out".into());
+                }
+                match self.receiver.try_recv() {
+                    Ok(value) => return value,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             idle()?;
             let remaining = deadline

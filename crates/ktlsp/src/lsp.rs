@@ -679,6 +679,7 @@ impl DependencyResult {
     }
     const INSTALL_CHUNK_FILES: usize = 256;
     const INSTALL_CHUNK_SYMBOLS: usize = 8192;
+    const OPEN_SOURCE_HANDOFF: Duration = Duration::from_millis(20);
 
     fn install_batches(
         &mut self,
@@ -695,6 +696,7 @@ impl DependencyResult {
         let mut flush_time = std::time::Duration::ZERO;
         let mut accepted_files = 0usize;
         let mut flushes = 0usize;
+        let mut handoffs = 0usize;
         let mut max_lock_held = std::time::Duration::ZERO;
         let mut batches = std::mem::take(&mut self.batches).into_iter().peekable();
         while batches.peek().is_some() {
@@ -707,6 +709,27 @@ impl DependencyResult {
                 || !guard.is_current_generation(generation)
             {
                 break;
+            }
+            // The provider may be between its fact reply and final commit. One chance per
+            // open source evaluation gives the child time to respond without borrowing the index.
+            if let Some(evaluation) = guard.claim_open_source_handoff() {
+                parking_lot::MutexGuard::unlock_fair(guard);
+                let handoff_start = install_start.map(|_| Instant::now());
+                std::thread::sleep(Self::OPEN_SOURCE_HANDOFF);
+                if let Some(start) = handoff_start {
+                    crate::trace::span("deps.open_source_handoff","deps",start,serde_json::json!({"evaluation":evaluation}));
+                }
+                handoffs += 1;
+                let lock_start = install_start.map(|_| Instant::now());
+                guard = ws.lock();
+                if let Some(start) = lock_start {
+                    lock_wait += start.elapsed();
+                }
+                if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || !guard.is_current_generation(generation)
+                {
+                    break;
+                }
             }
             let held_start = install_start.map(|_| Instant::now());
             let mut chunk_files = 0usize;
@@ -776,7 +799,7 @@ impl DependencyResult {
                 serde_json::json!({ "label": self.label, "files": stats.files - previous_files,
                     "lock_wait_us": lock_wait.as_micros(), "index_us": index_time.as_micros(),
                     "flush_us": flush_time.as_micros(), "accepted_files": accepted_files,
-                    "flushes": flushes, "max_lock_held_us": max_lock_held.as_micros() }),
+                    "flushes": flushes, "open_source_handoffs": handoffs, "max_lock_held_us": max_lock_held.as_micros() }),
             );
         }
         files_for_coord

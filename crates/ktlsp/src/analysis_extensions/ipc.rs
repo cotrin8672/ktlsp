@@ -461,6 +461,33 @@ mod tests {
     }
 
     #[test]
+    fn dependency_handoff_only_serves_open_current_source_reads_once() {
+        let (index, mut host) = host();
+        let owner = "/ipc/Owner.kt";
+        let work = host.take_ipc_work(&index, None, &[owner]).remove(0);
+        assert_eq!(host.claim_open_source_handoff(|_| true), None);
+
+        let query = |id: u64| {
+            json!({
+                "evaluation": id.to_string(),
+                "queries": [{"op":"resolveType","name":"ipc.Target"}]
+            })
+        };
+        host.ipc_batch(&index, work.evaluation, "analysis/readFacts", query(work.evaluation))
+            .unwrap();
+        assert_eq!(host.claim_open_source_handoff(|_| false), None);
+        assert_eq!(host.claim_open_source_handoff(|key| key == owner), Some(work.evaluation));
+        assert_eq!(host.claim_open_source_handoff(|_| true), None);
+
+        host.finish_ipc_work(work.evaluation, Err("Stale".into()));
+        let stale = host.take_ipc_work(&index, None, &[owner]).remove(0);
+        host.ipc_batch(&index, stale.evaluation, "analysis/readFacts", query(stale.evaluation))
+            .unwrap();
+        host.mark_index_changed();
+        assert_eq!(host.claim_open_source_handoff(|_| true), None);
+    }
+
+    #[test]
     fn explicit_commands_keep_read_lifetimes_without_publishing_contributions() {
         let (index,mut host)=host();
         host.register_ipc_commands(&index,"test.ipc",vec!["fixture-child".into()],vec!["fixture.echo".into()]).unwrap();
@@ -797,6 +824,20 @@ impl AnalysisExtensions {
             .is_some_and(|pending|self.validate_ipc_pending(evaluation,pending).is_ok()))
     }
 
+    pub(crate) fn claim_open_source_handoff(&mut self, is_open: impl Fn(&str) -> bool) -> Option<u64> {
+        let evaluation = self.ipc_evaluations.values_mut().find(|evaluation| {
+            !evaluation.command
+                && !evaluation.dependency_handoff_offered
+                && evaluation.failure.is_none()
+                && is_open(&evaluation.owner)
+                && evaluation.pending.as_ref().is_some_and(|pending| {
+                    pending.observes_semantic_index() && self.store.validate_pending(pending).is_ok()
+                })
+        })?;
+        evaluation.dependency_handoff_offered = true;
+        Some(evaluation.id)
+    }
+
     pub(crate) fn ipc_completion_pending(&self, owner: &str) -> bool {
         self.inputs.contains_key(owner)
             && self.ipc_providers.iter().any(|(provider, slot)| {
@@ -833,7 +874,7 @@ impl AnalysisExtensions {
         self.ipc_current(id).then(||self.ipc_evaluations.get(&id).map(|evaluation|evaluation.owner.as_str())).flatten()
     }
 
-    pub(crate) fn prepay_ipc_input_read(&mut self,id:u64,method:&str,params:&Value)->Result<(),String> {
+    pub(crate) fn prepay_ipc_input_read(&mut self,id:u64,method:&str,params:&Value)->Result<bool,String> {
         if !self.ipc_current(id) {return Err("Stale".into());}
         let evaluation=self.ipc_evaluations.get_mut(&id).ok_or("Stale")?;
         evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
