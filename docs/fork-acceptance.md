@@ -6567,3 +6567,14 @@ projection supplied the erasure, bounds and owner facts needed by these cases.
 Method-body decompilation remains intentionally outside ktlsp's responsibility;
 the existing IntelliJ/decompiler path can provide that UI when available.
 Evidence: `C:/tmp/ktlsp-binary-generic-audit-20261121/{receipt.json,harness/artifacts/corpus-results.json,summary.txt}`.
+
+## 2026-11-21 checkpoint: CEM acceptance on current release
+
+The release binary from the import-action fix (`9D46FC9CFF2CBFAAB952A14DAF37846C3B00D9A5E289E3D0AB14FEF2499DEF3F`)
+was rerun against the real, Mixin-excluded CEM tree using the existing indexed
+cache. The ordinary production group passed **12/12** completion, exact
+definition, hover and signature checks; the incomplete group passed **13/13**
+partial-member, dangling-dot, broken-peer and unknown-receiver checks, including
+buffer restoration and unchanged disk sources. Both sessions exited cleanly and
+the working tree remained unchanged. Receipts:
+`C:/tmp/cem-ordinary-current-9d46` and `C:/tmp/cem-incomplete-current-9d46`.
