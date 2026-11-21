@@ -3817,11 +3817,12 @@ mod initialize_stream_contract_tests {
         let actual=read_frame(&mut std::io::Cursor::new(bytes)).unwrap().unwrap();
         assert_eq!(actual["method"],"initialize");
         let offered=&actual["params"];
+        assert_eq!(offered["supportedOps"][PROJECT_FACTS],json!(["projectContext","typeJvm","sourceProvenance"]));
         assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==RESOURCES));
         assert_eq!(offered["supportedOps"][RESOURCES],json!(["resourceInventory","resourceLookup","resourceSnapshot"]));
         assert!(offered["capabilities"].as_array().unwrap().iter().any(|capability|capability==JVM_CATALOG));
         assert_eq!(offered["supportedOps"][JVM_CATALOG],json!(["jvmCatalog","jvmClass"]));
-        assert_eq!(project_operations(offered),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
+        assert_eq!(project_operations(offered),PROJECT_CONTEXT|TYPE_JVM|SOURCE_PROVENANCE|SOURCE_INVENTORY|SOURCE_SNAPSHOT
             |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|JVM_INVENTORY|JVM_CLASS|SOURCE_LOCATION|SOURCE_FACTS|ANNOTATION_SITES|PROJECT_INPUTS|BINARY_ANNOTATIONS|ROOT_FILE_INVENTORY|ROOT_FILE_SNAPSHOT);
         let mut acknowledgement=offered.clone();acknowledgement["supportedOps"][RESOURCES]=json!(["resourceSnapshot"]);
         assert_eq!(project_operations(&acknowledgement)&(RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT),RESOURCE_SNAPSHOT);
@@ -3837,7 +3838,7 @@ mod initialize_stream_contract_tests {
         }
         let mut legacy=offered.clone();
         legacy["capabilities"].as_array_mut().unwrap().retain(|capability|capability!=JVM_CATALOG);
-        assert_eq!(project_operations(&legacy),PROJECT_CONTEXT|TYPE_JVM|SOURCE_INVENTORY|SOURCE_SNAPSHOT
+        assert_eq!(project_operations(&legacy),PROJECT_CONTEXT|TYPE_JVM|SOURCE_PROVENANCE|SOURCE_INVENTORY|SOURCE_SNAPSHOT
             |RESOURCE_INVENTORY|RESOURCE_LOOKUP|RESOURCE_SNAPSHOT|RUNTIME_CLASS|CLASS_BYTES|SOURCE_LOCATION|SOURCE_FACTS|ANNOTATION_SITES|PROJECT_INPUTS|BINARY_ANNOTATIONS|ROOT_FILE_INVENTORY|ROOT_FILE_SNAPSHOT);
         let mut no_operations=offered.clone();no_operations["supportedOps"].as_object_mut().unwrap().remove(JVM_CATALOG);
         assert_eq!(project_operations(&no_operations)&(JVM_INVENTORY|JVM_CLASS),0);

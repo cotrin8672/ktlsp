@@ -575,22 +575,32 @@ mod compiler_source_tests {
                 Ok(())
             }
         }
-        for (file, plain, generic) in [
+        for (file, sources) in [
             (
                 "/tree/Plain.java",
-                "package tree; class Plain {}",
-                "package tree; class Plain<T> {}",
+                vec![
+                    ("package tree; class Plain {}", true),
+                    // Java generic classes erase to a proven nominal reference; the core's
+                    // nominal-shape regression keeps generic records Unknown.
+                    ("package tree; class Plain<T> {}", true),
+                    ("package tree; record Plain<T>(T value) {}", false),
+                    ("package tree; class Plain<T> {}", true),
+                    ("package tree; class Plain {}", true),
+                ],
             ),
             (
                 "/tree/Plain.kt",
-                "package tree\nclass Plain",
-                "package tree\nclass Plain<T>",
+                vec![
+                    ("package tree\nclass Plain", true),
+                    ("package tree\nclass Plain<T>", false),
+                    ("package tree\nclass Plain", true),
+                ],
             ),
         ] {
             let mut index = Index::new();
             let mut parser = crate::language::LanguageParsers::new();
             let mut extensions = AnalysisExtensions::new(vec![Arc::new(Probe)]);
-            for (text, expected) in [(plain, true), (generic, false), (plain, true)] {
+            for (text, expected) in sources {
                 let tree = parser.parse_for_key(file, text);
                 let language = crate::language::SourceLanguage::for_key(file);
                 let facts = crate::language::symbol_facts(language, &tree, text);
@@ -606,11 +616,16 @@ mod compiler_source_tests {
                 let Knowledge::Found(owner) = read.resolve_type("tree.Plain") else {
                     panic!("current source identity");
                 };
+                let reference = read.reference_type(&owner).unwrap();
                 assert_eq!(
-                    read.reference_type(&owner).unwrap().is_found(),
+                    reference.is_found(),
                     expected,
                     "{file}: {text}"
                 );
+                if !expected {
+                    assert!(matches!(reference, Knowledge::Unknown(_)),
+                        "unsupported shape must remain Unknown: {file}: {text}");
+                }
             }
         }
     }

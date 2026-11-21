@@ -9413,6 +9413,7 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
             configuration_content(&binary).as_ref()
         );
         // Notify before acknowledging registration; the next serial request proves it was handled.
+        // Workspace symbols wait for the initial snapshot, which itself needs this pending ACK.
         for (id, changed) in [(2, false), (3, true)] {
             if changed {
                 std::fs::write(&binary, b"genuinely changed archive").unwrap();
@@ -9424,8 +9425,13 @@ public class Factory { public int unsafeSourceOnly() { return 1; } }",
                 }}),
             )
             .await;
-            send(&mut output, serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/symbol","params":{"query":"absent"}})).await;
-            while receive(&mut input).await["id"] != id {}
+            send(&mut output, serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/executeCommand","params":{"command":"ktlsp.tracePath","arguments":[]}})).await;
+            let response = loop {
+                let response = receive(&mut input).await;
+                if response["id"] == id { break response; }
+            };
+            assert!(response.get("error").is_none() && response.get("result").is_some(),
+                "the serial barrier must complete successfully: {response}");
             assert_eq!(ws.lock().analysis_generation() > generation, changed);
             assert!(!watches.lock().pending_model_jar);
         }

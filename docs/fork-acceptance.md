@@ -6131,3 +6131,15 @@ The host exited cleanly, but the exact GuiMixin revision was still not accepted
 within the editor observation window. Its evaluations reached IPC and were
 rejected as the semantic index or model advanced. The original Sodium workflow
 remains open (`C:/tmp/sodium-open-postfix/run/`).
+
+One workspace test run at `94883119` ended with exit 101. The completed
+non-lib targets reported 1,216 passes and one ignored test. The ktlsp lib
+reported 795 passing tests, 17 ignored, two failing expectations and one
+stalled test before its owned test process was stopped. The two expectations
+were older than the advertised source-provenance operation and Java generic
+nominal-type admission. The watch test withheld registration ACK while its
+serial barrier waited for initial project indexing. The three test-only
+corrections passed individually against one rebuilt test executable, preserving
+exact masks, negative type controls and the deferred-ACK watch assertions.
+The original workspace run retains its nonzero result
+(`C:/tmp/ktlsp-final-94883119-workspace/`).
