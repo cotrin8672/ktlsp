@@ -6414,3 +6414,45 @@ for arbitrary inferred types or synthetic declarations; no such broader API
 was justified by the current Mixin evidence. A separate non-Mixin external
 provider acceptance and documentation cleanup remain open before claiming the
 extension boundary is broadly portable.
+
+## 2026-11-21 checkpoint: current five-repository corpus acceptance
+
+The current release pin `7213f777` was exercised against five independent
+Java/Kotlin repositories restored at fixed revisions: Moshi 1.15.2, OkHttp
+4.12.0, Retrofit 2.11.0, Spring Framework 6.2.0, and Gradle 8.14.3. For
+each repository the normal manifest and the incomplete-input manifest were
+run through the real Neovim corpus harness. The incomplete cases include
+unsaved partial members, dangling dots, broken peers, and unknown receivers;
+the harness also verifies buffer restoration and clean shutdown.
+
+All ten runs passed with zero semantic mismatches and zero failed dependency
+artifacts:
+
+| Repository | Normal semantic | Incomplete semantic | Project files | Library files | Missing sources |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Moshi 1.15.2 | 3/3 | 13/13 | 136--137 | 28,463 | 38 |
+| OkHttp 4.12.0 | 4/4 | 13/13 | 397--398 | 29,618 | 51 |
+| Retrofit 2.11.0 | 6/6 | 13/13 | 304 | 68,009 | 74 |
+| Spring Framework 6.2.0 | 4/4 | 13/13 | 9,101--9,102 | 84,540 | 403 |
+| Gradle 8.14.3 | 3/3 | 13/13 | 11,325 | 80,036 | 316 |
+
+This is 85/85 semantic checks across the five repositories. Evidence is under
+`C:/tmp/ktlsp-current-corpus/{moshi-normal,moshi-incomplete,okhttp-normal2,okhttp-incomplete,retrofit-normal,retrofit-incomplete,spring-normal,spring-incomplete,gradle-normal2,gradle-incomplete}`. The runs prove current release behavior for warm indexing, dependency hydration, unsaved edits, incomplete syntax, cross-language definition, and clean shutdown. They do not prove cold-start latency budgets, complete CEM coverage, code-action/inlay-hint breadth, compiler-plugin/KSP generated-source coverage, or IDEA parity.
+
+## 2026-11-21 checkpoint: bounded transport mutex wait
+
+Commit `55f53116` ports the isolated Lithium transport candidate into the
+shared host. Only `crates/ktlsp/src/extension_ipc.rs` changed: interactive
+transport acquisition now joins the mutex wait queue in bounded slices of
+`min(remaining command budget, 10 ms)` using `parking_lot::Mutex`, while
+background work keeps its blocking path. Cancellation, stopped/current
+generation, acknowledgement, stream accounting, and the existing 30-second
+deadline are rechecked before and after acquisition. Two deterministic
+contention regressions cover successful queue entry and cancellation/stale/
+stopped/expired rejection; the focused extension IPC suite passes 41/41 and
+`git diff --check` is clean.
+
+The Lithium real-editor success used this host candidate together with MC
+commit `f90eee5`, so it is evidence of compatibility, not isolated causal
+proof. A release build and push are still required before treating this fix as
+the public pin.
