@@ -6152,3 +6152,26 @@ The first command (`mcdev.info`, evaluation 318) reached the companion, which
 hit its IPC continuation limit while reading root snapshots. The companion
 owns that follow-up. The project-only startup case and the original Sodium
 workflow are still open (`C:/tmp/sodium-indexed-94883119-199d74d/`).
+
+## 2026-11-21 checkpoint: root snapshot continuation transport
+
+The final workspace Rust suite was rerun once after the three stale test
+expectations were corrected: `cargo test --workspace --locked --no-fail-fast`
+completed with 2,014 passed, 18 ignored, 42 suites, exit 0 in 22.90 seconds.
+The result is recorded separately from the earlier exit-101 run; no timeout or
+test exclusion was added.
+
+The Sodium continuation failure was narrowed to the consumer sending five
+continuation `rootFileSnapshot` queries together. The host counted each query
+before rejecting the oversized batch, exhausting the 256 continuation budget.
+Commit `0a131eade236d0b67f86005e712864f67f9874d0` keeps the initial snapshot
+page at 96 KiB and raises only `after` pages to 384 KiB. UTF-8 boundaries,
+escaped JSON/frame limits, cursor and input guards, the 256 continuation cap,
+and the 64 MiB stream cap are unchanged. Focused wire tests pass 5/5 and
+stream-quota tests pass 2/2; `cargo check -p ktlsp --lib` passes.
+
+The release pin for the next single MC Sodium run is
+`C:/Users/gummy/.codex/ktlsp-runs/01a12550-7d56-71f2-8c34-8ab8c5fe5dda/root-snapshot-continuation-0a131ead/ktlsp.exe`
+(SHA256 `B2D100B6F063BE41FD4FD4C750806381454985C27B58C0F7078099A5E9398B59`).
+The run must distinguish host transport success from MC continuation handling;
+it is not a whole-project readiness or IDEA-parity certificate.
