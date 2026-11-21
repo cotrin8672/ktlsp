@@ -6344,3 +6344,23 @@ reached its root inventory and 35 snapshots (17 cached), but the companion's
 existing 25-second RPC limit ended the operation while transferring the root
 stream. This is now a transport-throughput issue; the watch fix itself is
 confirmed on the real Windows path.
+
+## 2026-11-21 checkpoint: bounded command root-stream handoff
+
+The companion-side bounded handoff candidate `48dc0900` was tested against
+the same Sodium entry without changing the RPC deadline or host guards. It
+allows one active open command evaluation, only while a cached root snapshot
+has a real `next` cursor, to let the dependency installer run outside the
+workspace lock for at most two seconds. Completion or channel drop releases
+the wait immediately; closed/unread evaluations, repeated handoffs, and
+non-cached reads are excluded. Focused lifecycle cases and the companion
+library suite pass (`803` passed).
+
+The real run read all 91 root snapshots, including 73 cached pages, with a
+cached-page median of about 2.015 ms and a single 2.012-second handoff. The
+original `mcdev.info` assertions and standard `Gui.class` hover passed, with
+no watch invalidation, no child-response error, and clean shutdown. The next
+`mcdev.completion` command remains open: its source pre-read currently fans
+out to 388 source facts plus five inventories and then hits a semantic-index
+or provider invalidation. This is now an MC completion-policy issue, not an
+info/root-stream transport failure.
