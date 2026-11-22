@@ -4992,7 +4992,12 @@ pub(crate) fn prepare_model_sources(
         .collect();
     let expected = changed.len();
     let batches = parse_project_files(changed);
-    let project_classes = batches.iter().filter_map(|batch| prepare_project_class(model, batch)).collect();
+    // Compiler metadata includes the full source list. Share its fingerprint for all
+    // outputs of the same immutable task in this model capture.
+    let mut task_digests = HashMap::new();
+    let project_classes = batches.iter()
+        .filter_map(|batch| prepare_project_class(model, batch, &mut task_digests))
+        .collect();
     ModelSourceUpdate {
         current,
         complete: batches.len() == expected,
@@ -5002,7 +5007,11 @@ pub(crate) fn prepare_model_sources(
 }
 
 // Runs in the existing background source-install worker, never on completion/hover requests.
-fn prepare_project_class(model: &crate::classpath::ProjectSnapshot, batch: &ProjectFileIndex) -> Option<ProjectClassInput> {
+fn prepare_project_class(
+    model: &crate::classpath::ProjectSnapshot,
+    batch: &ProjectFileIndex,
+    task_digests: &mut HashMap<*const crate::classpath::CompilerTask, Option<[u8; 32]>>,
+) -> Option<ProjectClassInput> {
     let task = model.java_output_task(&batch.key)?;
     if task.annotation_processor_path.is_empty() || !batch.clean { return None; }
     let mut types = batch.symbols.iter().filter(|symbol| symbol.kind.is_type_like());
@@ -5018,9 +5027,13 @@ fn prepare_project_class(model: &crate::classpath::ProjectSnapshot, batch: &Proj
     if origin.project_scope.is_none() { return None; }
     let class = ktcore::classfile::decode(&origin.origin_id, &bytes).ok()?;
     if class.identity.internal_name.as_str() != internal || class.source_file.as_deref() != Path::new(&batch.key).file_name()?.to_str() { return None; }
+    let task_digest = *task_digests.entry(std::ptr::from_ref(task)).or_insert_with(|| {
+        let bytes = serde_json::to_vec(task).ok()?;
+        Some(Sha256::digest(bytes).into())
+    });
     let mut digest = Sha256::new();
     digest.update(batch.source.0.as_bytes());
-    digest.update(serde_json::to_vec(task).ok()?);
+    digest.update(task_digest?);
     let mut reads = vec![batch.key.clone(), crate::paths::file_key(&output)];
     let mut latest = batch.stamp?.modified;
     // Preserve actual and negative ancestor/configuration reads, including Lombok's external config.

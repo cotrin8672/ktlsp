@@ -281,6 +281,45 @@ pub struct CompiledClassHandle {
     value_namespace: bool,
 }
 
+/// Whether the built-in Java extension could add any method from this class.
+pub fn may_contribute_java_methods(class: &crate::classfile::ClassFileFacts) -> bool {
+    class.methods.iter()
+        .any(|method| compiled_java_return_type(class, method).is_some())
+}
+
+fn compiled_java_return_type(
+    class: &crate::classfile::ClassFileFacts,
+    method: &crate::classfile::MemberFacts,
+) -> Option<crate::types::TypeRef> {
+    const PUBLIC: u16 = 0x0001;
+    const UNSUPPORTED: u16 = 0x0002 | 0x0004 | 0x0008 | 0x0040 | 0x0080 | 0x0400 | 0x1000;
+    if class.access_flags & PUBLIC == 0
+        || class.signature.is_some()
+        || method.access_flags & PUBLIC == 0
+        || method.access_flags & UNSUPPORTED != 0
+        || method.name.starts_with('<')
+        || method.signature.is_some()
+    {
+        return None;
+    }
+    let descriptor = method.descriptor.as_ref();
+    if descriptor != "()Ljava/lang/String;" && !descriptor.starts_with("()[") {
+        return None;
+    }
+    let (parameters, return_type) = crate::classfile::method_types(descriptor)?;
+    let return_type = return_type?;
+    if !parameters.is_empty() {
+        return None;
+    }
+    if return_type.name.ends_with("[]") && class.attribute_names.iter()
+        .chain(&method.attribute_names)
+        .any(|name| name.starts_with("Runtime") && name.ends_with("Annotations"))
+    {
+        return None;
+    }
+    Some(return_type)
+}
+
 /// Current compiler observations, anchored to an authored owner by the host. A frontend
 /// descriptor proves a non-null Kotlin callable; classfile visibility alone only proves the JVM surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2091,34 +2130,9 @@ impl ReadSession<'_> {
             .methods
             .get(handle.method)
             .ok_or(ContractError::ForeignIdentity)?;
-        const PUBLIC: u16 = 0x0001;
-        const UNSUPPORTED: u16 = 0x0002 | 0x0004 | 0x0008 | 0x0040 | 0x0080 | 0x0400 | 0x1000;
-        if class.access_flags & PUBLIC == 0
-            || class.signature.is_some()
-            || method.access_flags & PUBLIC == 0
-            || method.access_flags & UNSUPPORTED != 0
-            || method.name.starts_with('<')
-            || method.signature.is_some()
-        {
-            return Ok(unknown(IncompleteReason::UnsupportedSource));
-        }
-        let Some((parameters, Some(return_type))) =
-            crate::classfile::method_types(&method.descriptor)
-        else {
+        let Some(return_type) = compiled_java_return_type(class, method) else {
             return Ok(unknown(IncompleteReason::UnsupportedSource));
         };
-        let array = return_type.name.ends_with("[]");
-        if !parameters.is_empty()
-            || !array && method.descriptor.as_ref() != "()Ljava/lang/String;"
-            || array
-                && class
-                    .attribute_names
-                    .iter()
-                    .chain(&method.attribute_names)
-                    .any(|name| name.starts_with("Runtime") && name.ends_with("Annotations"))
-        {
-            return Ok(unknown(IncompleteReason::UnsupportedSource));
-        }
         // The raw descriptor was validated above. Nominal array components do not become JvmType::String.
         let signature = MemberSignature {
             kind: MemberKind::Method,

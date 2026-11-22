@@ -241,7 +241,13 @@ impl AnalysisExtensions {
     pub fn flush_index_changed(&mut self, index: &dyn InferenceIndex) {
         if self.pending_index {
             self.pending_index = false;
-            for key in self.inputs.keys().cloned().collect::<Vec<_>>() {
+            // The built-in provider cannot use an output outside its admitted method surface.
+            // Keep the input for late provider registration, which normalizes it in full.
+            let keys: Vec<_> = self.inputs.iter()
+                .filter(|(_, input)| self.retain_all_sources || input.has_compiler_surface())
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
                 let _ = self.normalize_input(index,&key,true,false);
             }
             self.evaluate(index);
@@ -382,9 +388,7 @@ impl AnalysisExtensions {
                 continue;
             }
             if provider == COMPILED_JAVA_PROVIDER
-                && !self.inputs.get(&owner).is_some_and(|input| {
-                    input.compiled.is_some() || !input.compiler_classes.is_empty()
-                })
+                && !self.inputs.get(&owner).is_some_and(SourceInput::has_compiler_surface)
             {
                 continue;
             }
@@ -470,6 +474,11 @@ struct SourceInput {
 }
 
 impl SourceInput {
+    fn has_compiler_surface(&self) -> bool {
+        !self.compiler_classes.is_empty()
+            || self.compiled.as_deref().is_some_and(ktcore::extensions::may_contribute_java_methods)
+    }
+
     fn compiler_source_matches(&self, text: &str, tree: &Tree) -> bool {
         self.text.as_ref() == text
             || !self.compiler_classes.is_empty()
@@ -724,6 +733,47 @@ mod compiler_source_tests {
         };
         assert_eq!(site.owner.as_ref(), Some(owner.definition()));
         assert!(read.compiled_class(&owner).unwrap().is_found());
+    }
+
+    #[test]
+    fn dependency_refresh_skips_output_without_a_builtin_surface_until_provider_registration() {
+        use ktcore::project_model::{FileOrigin, ProjectScope, ScopeVisibility, SourceRepresentation};
+
+        let file = "/compiler-output/FieldOnly.java";
+        let text = include_str!("../../ktcore/tests/fixtures/classfile/sources/fieldfixture/FieldOnly.java");
+        let tree = crate::java::JavaParser::new().parse(text);
+        let mut index = Index::new();
+        let facts = crate::language::symbol_facts(crate::language::SourceLanguage::Java, &tree, text);
+        index.replace_file(file, facts.symbols, ktcore::index::Tier::Durable);
+        let scope = ProjectScope { module: "test".into(), source_set: "main".into() };
+        index.set_file_origin(file, FileOrigin {
+            origin_id: "test".into(), representation: SourceRepresentation::Source,
+            project_scope: Some(scope.clone()),
+        });
+        index.replace_scope_visibilities(vec![ScopeVisibility {
+            scope, ordered_origins: vec!["test".into()],
+        }]);
+        let class = Arc::new(ktcore::classfile::decode("test", include_bytes!(
+            "../../ktcore/tests/fixtures/classfile/fieldfixture/FieldOnly.class"
+        )).unwrap());
+        assert!(!ktcore::extensions::may_contribute_java_methods(&class));
+
+        let mut host = AnalysisExtensions::new(Vec::new());
+        host.accept_project_outputs(&index, vec![(file.into(), Arc::from(text), tree, class)]).unwrap();
+        let compiled_attached = |host: &mut AnalysisExtensions, provider: &str| {
+            let mut read = host.store.begin(&index, provider, file).unwrap();
+            let Knowledge::Found(owner) = read.resolve_type("fieldfixture.FieldOnly") else {
+                panic!("the authored declaration must remain resolvable");
+            };
+            read.compiled_class(&owner).unwrap().is_found()
+        };
+        assert!(compiled_attached(&mut host, COMPILED_JAVA_PROVIDER));
+
+        host.mark_index_changed();
+        host.flush_index_changed(&index);
+        assert!(!compiled_attached(&mut host, COMPILED_JAVA_PROVIDER));
+        host.register_ipc(&index, "late-output", vec!["not-spawned".into()]).unwrap();
+        assert!(compiled_attached(&mut host, "late-output"));
     }
 
     fn input(text: &str, value_namespace: bool) -> SourceInput {
