@@ -6694,3 +6694,90 @@ The companion binary used for the run is
 (18,407,936 bytes). The two focused MC files cover same-client
 Incomplete-to-ready reissue and endpoint-less provider-command readiness; no
 new host API or timeout was introduced.
+
+## 2026-11-22 checkpoint: dependency indexing with compiled Java outputs
+
+Dependency chunks had been rebuilding the normalized facts of all retained
+Java compiler outputs, including classes that could not contribute a method.
+The built-in provider now shares its existing classfile admission check with
+the refresh path. Outputs outside that check keep their source input available
+for full normalization when a provider registers. Project output discovery also
+fingerprints each immutable compiler task once per model capture.
+
+Spring Framework 6.2.0 (`5024bb722`) was run through `dev/ktlsp-harness.sh corpus`
+with `KTLSP_CORPUS_WAIT_INDEX=1` and its existing incomplete-code manifest.
+Both sessions used the same JDK and Gradle home and separate copies of the same
+ktlsp cache. Both runs used the disk model and indexed 9,101 project
+sources and 84,540 library files in 626 dependency chunks. Both passed 13/13
+semantic assertions with identical probe source hashes, clean git status and
+clean LSP exit. They recorded zero failed dependencies and 403 missing sources.
+
+| Spring timing (one run per binary) | `ea026cf5` | `84c85326` |
+| --- | ---: | ---: |
+| From project refresh request to dependency index completion | 481.434 s | 109.074 s |
+| Dependency indexing phase | 389.144 s | 95.761 s |
+| Time spent refreshing semantic facts during dependency install | 373.482 s | 88.406 s |
+| Longest dependency chunk holding the workspace lock | 1,672.23 ms | 282.51 ms |
+| Server processing time for five useful completion replies (min–max) | 3.190–4.105 ms | 2.089–3.073 ms |
+
+The semantic refresh numbers cover the same count of installed files and
+chunks. End-to-end timings also include filesystem and Gradle work. An earlier
+candidate launch was stopped after discovering a shared Cargo output collision.
+The measured candidate used a separate target directory. Its frozen copy is
+`C:/tmp/ktlsp-startup-flush-20261122/ktlsp-spring-84c85326.exe` with SHA-256
+`BDE2B154C8D9C131414D23E523AC9853A307848B48C21CDDFE0134273BACDDDE`.
+Evidence is in `C:/tmp/ktlsp-startup-flush-20261122/{baseline,verified-candidate}/artifacts/`.
+
+## 2026-11-22 checkpoint: repeated extension completion on Lithium
+
+The host retains one physical JVM catalog for a matching owner and project
+snapshot, with native input leases and origin checks on reuse. Opaque handles
+and validation remain evaluation-specific. Cache eligibility is tracked before
+truncating displayed problems, so transient I/O failures still force a fresh
+read. A missing MR-JAR profile can be reused when the selected model has no SDK
+and the response continues to report incomplete coverage.
+
+Three Neovim launches per release against Lithium `749edb8` measured the time
+from the same unsaved `canUs` edit to the first usable `canUse` candidate. All
+15/15 candidate observations succeeded, applied the expected edit and restored
+the original text. The median first request moved from 6.022 to 4.682 seconds
+(three per release). The median repeat moved from 4.631 to 1.806 seconds
+(12 per release, candidate range 0.767–2.694 seconds). All 12 repeated physical
+catalog queries were cache hits and took 9.4–13.2 ms. The residual wait before
+dispatch to the companion had a median of 1.190 seconds.
+
+The measured catalog-only candidate is `55b12670` with SHA-256
+`D7725D73D4DF82030029057F3502AD7870E0FF8A0F4F272E5D274CFA9C1A83AA`.
+The catalog changes were integrated as `e21be8a0` alongside the indexing fix.
+Evidence is in `C:/tmp/mcdev-lithium-perf-catalog-final-20261122/comparison.json`
+and `host-stages.json` in the same directory.
+
+The integrated `e21be8a0` release built successfully with SHA-256
+`451D0F293747F5AFDFCC49AFF9FBDBA04D176AB6D5AADD4C0F1C523C53C85CFB`.
+`cargo test --workspace --locked -- --test-threads=1` reported 2,029 passed,
+0 failed and 18 ignored across 42 targets. The real CEM working-copy
+incomplete-code run passed 13/13 with clean shutdown and unchanged source
+files. The disk model and project-source scan were ready after 1.311 seconds.
+Five useful server completion responses took 8.414–10.995 ms. This scenario
+completed while library indexing was still in progress.
+Evidence is in `C:/tmp/ktlsp-startup-flush-20261122/cargo-workspace.log`
+and `C:/tmp/ktlsp-startup-flush-20261122/cem-confirm/artifacts/`.
+
+Gradle 8.14.3 (`e5ee1df3`) also passed its existing incomplete-code corpus
+13/13 with zero mismatches, clean shutdown and unchanged probe source hashes.
+Both the stored `7213f777` run and the integrated release used the disk model
+and indexed 11,325 project files and 80,036 library files in 517 chunks.
+
+| Gradle timing | Stored `7213f777` run | Integrated `e21be8a0` run |
+| --- | ---: | ---: |
+| From project refresh to dependency index completion | 495.418 s | 388.619 s |
+| Dependency indexing phase | 462.521 s | 250.420 s |
+| Time spent refreshing semantic facts during dependency install | 419.978 s | 167.327 s |
+| Longest dependency chunk holding the workspace lock | 1,519.22 ms | 706.07 ms |
+
+The integrated run spent 63.024 seconds collecting the existing build-output
+baseline, covering 7,652 class files. Gradle source selection took 217.625
+seconds and overlapped dependency installation. The end-to-end numbers are
+single observations taken at different times. Evidence is in
+`C:/tmp/ktlsp-current-corpus/gradle-incomplete/artifacts/` and
+`C:/tmp/ktlsp-startup-flush-20261122/gradle-confirm/artifacts/`.
