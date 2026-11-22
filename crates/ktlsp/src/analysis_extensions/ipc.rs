@@ -1100,7 +1100,11 @@ impl AnalysisExtensions {
             self.store.validate_pending(pending).is_ok()) {return Err("Stale".into());}
         evaluation.project_operations=self.ipc_providers.get(&evaluation.provider)
             .filter(|slot|slot.enabled && slot.worker.id==evaluation.instance).map_or(0,|slot|slot.worker.project_operations());
-        evaluation.begin_jvm_reads(method,params)
+        let mut plan = evaluation.begin_jvm_reads(method,params)?;
+        if let Some(plan) = &mut plan {
+            self.jvm_catalog_cache.reuse(plan);
+        }
+        Ok(plan)
     }
 
     pub(crate) fn begin_ipc_source_provenance(&mut self,index:&Index,open:&BTreeSet<String>,id:u64,
@@ -1137,8 +1141,13 @@ impl AnalysisExtensions {
             let pending=evaluation.pending.take().ok_or("Stale")?;
             let owner=evaluation.owner.clone();
             let mut read=self.store.resume(index,&owner,pending).map_err(|_|"Stale")?;
+            let catalog = prepared.catalog.as_ref().ok().cloned();
             let result=evaluation.finish_jvm_read(&mut read,prepared);
-            evaluation.pending=Some(read.finish()); result
+            evaluation.pending=Some(read.finish());
+            if let (Ok(()), Some(catalog)) = (&result, catalog) {
+                self.jvm_catalog_cache.remember(&owner, catalog);
+            }
+            result
         })();
         self.ipc_evaluations.insert(id,evaluation); result
     }

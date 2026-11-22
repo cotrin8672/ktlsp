@@ -35,15 +35,73 @@ pub(crate) struct JvmCatalog {
     pub entries: Vec<CatalogEntry>,
     pub complete: bool,
     pub problems: Vec<String>,
+    cacheable: bool,
     pub guards: Vec<Arc<HostInputLease>>,
     read_coverage: WatchPlan,
+    origin_revisions: Vec<(PathBuf, String)>,
     feature: Option<u16>,
 }
+/// Reuse the physical listing for successive requests from the same file. Each
+/// evaluation still issues its own handles and observes the existing leases.
+#[derive(Default)]
+pub(crate) struct CatalogCache {
+    last: Option<(PathBuf, Arc<JvmCatalog>)>,
+}
+
+impl CatalogCache {
+    pub(crate) fn reuse(&self, plan: &mut CatalogPlan) {
+        if plan.catalog.is_some() {
+            return;
+        }
+        let state = match &self.last {
+            None => "empty",
+            Some((owner, _)) if *owner != plan.owner => "owner-changed",
+            Some((_, catalog)) if !Arc::ptr_eq(&catalog.model, &plan.model) => "model-changed",
+            Some((_, catalog)) if !catalog.current() => "input-changed",
+            Some((_, catalog)) => {
+                plan.catalog = Some(catalog.clone());
+                "hit"
+            }
+        };
+        if crate::trace::enabled() {
+            crate::trace::span("extension.ipc.jvm_catalog_cache", "extension",
+                std::time::Instant::now(), serde_json::json!({"evaluation": plan.evaluation, "state": state}));
+        }
+    }
+
+    pub(crate) fn remember(&mut self, owner: &str, catalog: Arc<JvmCatalog>) {
+        if catalog.current() && catalog.cacheable {
+            if !self.last.as_ref().is_some_and(|(_, previous)| Arc::ptr_eq(previous, &catalog)) {
+                self.last = Some((PathBuf::from(owner), catalog));
+            }
+        }
+    }
+}
+
 impl JvmCatalog {
     pub(crate) fn current(&self) -> bool { self.guards.iter().all(|guard| guard.is_current()) }
-    fn problem(&mut self, problem: impl Into<String>) {
+    fn model_limit(&mut self, problem: impl Into<String>) {
         self.complete = false;
         if self.problems.len() < 32 { self.problems.push(problem.into().chars().take(512).collect()); }
+    }
+    fn problem(&mut self, problem: impl Into<String>) {
+        let problem = problem.into();
+        if self.cacheable && crate::trace::enabled() {
+            crate::trace::span("extension.ipc.jvm_catalog_uncacheable", "extension",
+                std::time::Instant::now(), serde_json::json!({
+                    "problem": crate::extension_ipc::bounded_trace_text(&problem)
+                }));
+        }
+        self.cacheable = false;
+        self.model_limit(problem);
+    }
+    fn input_problem(&mut self, error: String, sdk_selected: bool) {
+        // With no selected SDK this missing profile is fixed by the model.
+        if !sdk_selected && error == "MR-JAR selection profile unavailable" {
+            self.model_limit(error);
+        } else {
+            self.problem(error);
+        }
     }
     fn append(&mut self, entry: CatalogEntry) {
         if self.entries.len() >= MAX_CATALOG_CLASSES { self.problem("catalog-class-limit"); }
@@ -125,20 +183,25 @@ impl JvmCatalog {
         // This is the raw selected physical JVM view, not a javac/Kotlin compiler
         // interpretation. Its MR profile matches normal-runtime Code: SDK home.
         let feature=sdk.as_ref().and_then(|selection|crate::sdk_runtime::runtime_feature(selection).ok());
-        let mut catalog = Self { model:model.clone(), entries:Vec::new(), complete, problems:Vec::new(), guards:vec![lease],read_coverage:plan,feature };
-        if !complete { catalog.problem("incomplete-selected-classpath"); }
+        let mut catalog = Self { model:model.clone(), entries:Vec::new(), complete, problems:Vec::new(), cacheable:true, guards:vec![lease],read_coverage:plan,origin_revisions:Vec::new(),feature };
+        if !complete { catalog.model_limit("incomplete-selected-classpath"); }
         for (association, paths) in [("output", outputs), ("compileClasspath", classpath)] {
             for (order, path) in paths.iter().enumerate() {
-                if model.artifact_origin(path).is_some_and(|origin|crate::classpath::file_origin_id(path)!=origin) {return Err("Stale".into());}
+                if let Some(origin) = model.artifact_origin(path) {
+                    if crate::classpath::file_origin_id(path) != origin {
+                        return Err("Stale".into());
+                    }
+                    catalog.origin_revisions.push((path.clone(), origin.to_owned()));
+                }
                 let origin = model.artifact_origin(path).map(str::to_owned)
                     .unwrap_or_else(||format!("{association}:{}#{}:{order}",scope.module,scope.source_set));
                 if let Err(error) = catalog.input(path, &origin, association, order, "", "compiled-input") {
-                    if error == "Stale" { return Err(error); } catalog.problem(error);
+                    if error == "Stale" { return Err(error); } catalog.input_problem(error, sdk.is_some());
                 }
             }
         }
         match sdk {
-            None => catalog.problem("missing-selected-sdk"),
+            None => catalog.model_limit("missing-selected-sdk"),
             Some(selection) if selection.release.is_some() => {
                 let plan = WatchPlan::read_inputs(&[selection.archive.clone()]).map_err(|error|error.to_string())?;
                 catalog.guards.push(HostInputLease::new(plan,wake).map_err(|error|error.to_string())?);
@@ -202,7 +265,16 @@ impl JvmCatalog {
 
 pub(crate) fn prepare(plan: CatalogPlan, wake: Arc<dyn Fn()+Send+Sync>) -> PreparedCatalog {
     let catalog = match plan.catalog {
-        Some(catalog) if Arc::ptr_eq(&catalog.model,&plan.model) && catalog.current() => Ok(catalog),
+        Some(catalog)
+            if Arc::ptr_eq(&catalog.model, &plan.model)
+                && catalog.current()
+                && catalog.origin_revisions.iter().all(|(path, revision)| {
+                    // An adjacent sources JAR also contributes to the model's origin stamp.
+                    crate::classpath::file_origin_id(path) == *revision
+                }) =>
+        {
+            Ok(catalog)
+        }
         Some(_) => Err("Stale".into()),
         None => JvmCatalog::prepare(plan.model.clone(),&plan.owner,wake),
     };
@@ -276,6 +348,27 @@ mod tests {
         assert!(Arc::ptr_eq(&prepared.model,&model));
         let catalog=prepared.catalog.unwrap_or_else(|error|panic!("selected catalog failed: {error}"));
         assert!(catalog.current());assert!(catalog.complete,"{:?}",catalog.problems);
+        let mut cache = CatalogCache::default();
+        cache.remember(owner.to_str().unwrap(), catalog.clone());
+        let mut next = CatalogPlan {
+            evaluation: 18,
+            model: model.clone(),
+            owner: owner.with_file_name("Other.java"),
+            catalog: None,
+            reads: Vec::new(),
+        };
+        cache.reuse(&mut next);
+        assert!(next.catalog.is_none());
+        next.owner = owner.clone();
+        next.model = Arc::new(ProjectSnapshot::new(Vec::new()));
+        cache.reuse(&mut next);
+        assert!(next.catalog.is_none());
+        next.model = model.clone();
+        cache.reuse(&mut next);
+        assert!(Arc::ptr_eq(next.catalog.as_ref().unwrap(), &catalog));
+        let reused = prepare(next, Arc::new(|| {}));
+        assert_eq!(reused.evaluation, 18);
+        assert!(Arc::ptr_eq(&reused.catalog.unwrap(), &catalog));
         assert_eq!(catalog.entries.len(),5,"the absent physical output and module descriptor do not add ordinary classes");
         for association in ["output","compileClasspath","sdk"] {
             let (index,entry)=catalog.entries.iter().enumerate().find(|(_,entry)|entry.association==association && entry.internal_name=="pluginfixture/Person").unwrap();
@@ -295,11 +388,69 @@ mod tests {
         fs::OpenOptions::new().append(true).open(&compile).unwrap().write_all(b"changed").unwrap();
         observed.recv_timeout(std::time::Duration::from_secs(5)).expect("selected compile input edit must reach its native observer");
         assert!(!catalog.current());
+        let mut stale = CatalogPlan {
+            evaluation: 19,
+            model: model.clone(),
+            owner,
+            catalog: None,
+            reads: Vec::new(),
+        };
+        cache.reuse(&mut stale);
+        assert!(stale.catalog.is_none());
+        drop(cache);
         assert!(matches!(catalog.read(0),Err(error) if error=="Stale"));
         drop(runtime);drop(catalog);drop(model);
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn missing_sdk_profile_is_reusable_but_transient_catalog_errors_are_not() {
+        let model = Arc::new(ProjectSnapshot::new(Vec::new()));
+        let owner = PathBuf::from("/project/Test.java");
+        let mut plan = CatalogPlan {
+            evaluation: 2,
+            model: model.clone(),
+            owner: owner.clone(),
+            catalog: None,
+            reads: Vec::new(),
+        };
+        let mut catalog = JvmCatalog {
+            model: model.clone(),
+            entries: Vec::new(),
+            complete: true,
+            problems: Vec::new(),
+            cacheable: true,
+            guards: Vec::new(),
+            read_coverage: WatchPlan::default(),
+            origin_revisions: Vec::new(),
+            feature: None,
+        };
+        for _ in 0..40 {
+            catalog.input_problem("MR-JAR selection profile unavailable".into(), false);
+        }
+        catalog.model_limit("missing-selected-sdk");
+        assert_eq!(catalog.problems.len(), 32);
+        assert!(!catalog.complete && catalog.cacheable);
+
+        let mut cache = CatalogCache::default();
+        let mut catalog = Arc::new(catalog);
+        cache.remember(owner.to_str().unwrap(), catalog.clone());
+        cache.reuse(&mut plan);
+        assert!(Arc::ptr_eq(&plan.catalog.take().unwrap(), &catalog));
+        drop(cache);
+
+        let rejected = Arc::get_mut(&mut catalog).unwrap();
+        rejected.input_problem("MR-JAR selection profile unavailable".into(), true);
+        assert!(!rejected.cacheable);
+        rejected.cacheable = true;
+        rejected.input_problem("permission denied".into(), false);
+        assert!(!rejected.cacheable);
+        assert_eq!(rejected.problems.len(), 32);
+        let mut cache = CatalogCache::default();
+        cache.remember(owner.to_str().unwrap(), catalog);
+        cache.reuse(&mut plan);
+        assert!(plan.catalog.is_none());
+    }
     #[test]
     fn physical_catalog_pages_duplicates_compile_abi_headers_and_stale_reads() {
         let root=std::env::temp_dir().join(format!("ktlsp-jvm-catalog-{}-{}",std::process::id(),
@@ -331,8 +482,8 @@ mod tests {
         let (invalidated,observed)=std::sync::mpsc::channel();
         let guard=HostInputLease::new(plan.clone(),Arc::new(move || {let _=invalidated.send(());})).unwrap();
         let model=Arc::new(ProjectSnapshot::new(Vec::new()));
-        let mut catalog=JvmCatalog {model:model.clone(),entries:Vec::new(),complete:true,problems:Vec::new(),
-            guards:vec![guard.clone()],read_coverage:plan.clone(),feature:Some(8)};
+        let mut catalog=JvmCatalog {model:model.clone(),entries:Vec::new(),complete:true,problems:Vec::new(),cacheable:true,
+            guards:vec![guard.clone()],read_coverage:plan.clone(),origin_revisions:Vec::new(),feature:Some(8)};
         catalog.input(&first,"compile-first","compileClasspath",0,"","compiled-input").unwrap();
         catalog.input(&second,"compile-second","compileClasspath",1,"","compiled-input").unwrap();
         catalog.append(CatalogEntry {internal_name:"java/lang/Object".into(),origin:"selected-release8".into(),
@@ -341,8 +492,8 @@ mod tests {
         catalog.entries.sort_by(|a,b|a.internal_name.cmp(&b.internal_name).then(a.order.cmp(&b.order)));
         assert!(catalog.complete);
         assert_eq!(catalog.entries.iter().filter(|entry|entry.internal_name=="pluginfixture/Person").count(),2);
-        let incomplete=Arc::new(JvmCatalog {model,entries:Vec::new(),complete:false,problems:vec!["incomplete-selected-classpath".into()],
-            guards:vec![guard],read_coverage:plan,feature:Some(8)});
+        let incomplete=Arc::new(JvmCatalog {model,entries:Vec::new(),complete:false,problems:vec!["incomplete-selected-classpath".into()],cacheable:true,
+            guards:vec![guard],read_coverage:plan,origin_revisions:Vec::new(),feature:Some(8)});
         crate::extension_ipc::assert_jvm_catalog_wire(Arc::new(catalog),incomplete,&first,observed);
         fs::remove_dir_all(root).unwrap();
     }

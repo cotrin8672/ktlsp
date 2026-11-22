@@ -21,6 +21,7 @@ pub(crate) struct AnalysisExtensions {
     providers: BTreeMap<String, Arc<dyn AnalysisProvider>>,
     ipc_providers: BTreeMap<String, ipc::Slot>,
     ipc_evaluations: BTreeMap<u64, crate::extension_ipc::Evaluation>,
+    jvm_catalog_cache: crate::jvm_catalog::CatalogCache,
     inputs: BTreeMap<String, SourceInput>,
     retain_all_sources: bool,
     compiled_enabled: bool,
@@ -213,6 +214,7 @@ impl AnalysisExtensions {
     }
 
     pub fn model_changed(&mut self, index: &dyn InferenceIndex) {
+        self.jvm_catalog_cache = Default::default();
         if self.is_empty() {
             return;
         }
