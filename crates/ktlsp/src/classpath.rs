@@ -449,6 +449,9 @@ pub struct SourceSetClasspath {
     pub provided_artifacts: Vec<PathBuf>,
     pub entries: Vec<PathBuf>,
     pub artifacts: Vec<ResolvedArtifact>,
+    /// Fingerprint of Gradle's selected module coordinates, including metadata-only components.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_selection: Option<String>,
     /// Exact Gradle source selections; absent until the background source query completes.
     #[serde(default)]
     pub source_artifacts: Option<Vec<ResolvedArtifact>>,
@@ -2459,6 +2462,7 @@ fn parse_dump_reader(
                             | "PROVIDES"
                             | "SCP"
                             | "ARTIFACT"
+                            | "SOURCE_SELECTION"
                             | "SOURCEARTIFACT"
                             | "SOURCEQUERY"
                             | "POMARTIFACT"
@@ -2531,6 +2535,7 @@ fn parse_dump_reader(
                 | "PROVIDES"
                 | "SCP"
                 | "ARTIFACT"
+                | "SOURCE_SELECTION"
                 | "SOURCEARTIFACT"
                 | "SOURCEQUERY"
                 | "POMARTIFACT"
@@ -2553,6 +2558,21 @@ fn parse_dump_reader(
                             cur.source_sets.len() - 1
                         });
                     let source = &mut cur.source_sets[idx];
+                    if record == "SOURCE_SELECTION" {
+                        let digest = parts.next().filter(|value| {
+                            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        });
+                        anyhow::ensure!(
+                            source.source_selection.is_none()
+                                && digest.is_some()
+                                && parts.next().is_none(),
+                            "invalid SOURCE_SELECTION for {}:{}",
+                            cur.module,
+                            name
+                        );
+                        source.source_selection = digest.map(str::to_owned);
+                        continue;
+                    }
                     if record == "SOURCEQUERY" || record == "POMQUERY" {
                         let (artifacts, incomplete) = if record == "POMQUERY" {
                             (&mut source.source_poms, &mut source.source_poms_incomplete)
@@ -2946,7 +2966,15 @@ pub(crate) fn load_source_snapshot(
         start,
         serde_json::json!({"root": root.to_string_lossy(), "ok": result.is_ok()}),
     );
-    source_snapshot(root, accepted, result?)
+    let start = std::time::Instant::now();
+    let result = source_snapshot(root, accepted, result?);
+    crate::trace::span(
+        "classpath.source_apply",
+        "classpath",
+        start,
+        serde_json::json!({"root": root.to_string_lossy(), "ok": result.is_ok()}),
+    );
+    result
 }
 
 fn source_snapshot(
@@ -2954,28 +2982,56 @@ fn source_snapshot(
     accepted: &ProjectSnapshot,
     modules: Vec<ModuleClasspath>,
 ) -> anyhow::Result<Arc<ProjectSnapshot>> {
-    let without_sources = |modules: &[ModuleClasspath]| {
-        let mut by_identity = BTreeMap::new();
-        for mut module in modules.to_vec() {
-            for source in &mut module.source_sets {
-                source.source_artifacts = None;
-                source.source_artifacts_incomplete = false;
-                source.source_poms = None;
-                source.source_poms_incomplete = false;
-            }
-            // Parallel Gradle tasks may emit complete modules in a different order. A project
-            // path belongs to its build; preserve every other fact and every inner ordering.
-            let identity = (module.build.clone(), module.module.clone());
+    let mut queried = BTreeMap::new();
+    for module in modules {
+        // Independent Gradle runs can emit modules in a different order.
+        let identity = (module.build.clone(), module.module.clone());
+        anyhow::ensure!(
+            queried.insert(identity, module).is_none(),
+            "Duplicate Gradle module identity during source resolution"
+        );
+    }
+    let mut modules = Vec::with_capacity(accepted.modules.len());
+    for base in &accepted.modules {
+        let module = queried
+            .remove(&(base.build.clone(), base.module.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Gradle module selection changed during source resolution")
+            })?;
+        anyhow::ensure!(
+            base.project_dir == module.project_dir
+                && base.entries == module.entries
+                && base.unresolved == module.unresolved
+                && base.source_sets.len() == module.source_sets.len(),
+            "Gradle binary selection changed during source resolution for {}:{}",
+            base.build,
+            base.module
+        );
+        let mut enriched = base.clone();
+        for (source, query) in enriched.source_sets.iter_mut().zip(module.source_sets) {
             anyhow::ensure!(
-                by_identity.insert(identity, module).is_none(),
-                "Duplicate Gradle module identity during source resolution"
+                source.name == query.name
+                    && source.entries == query.entries
+                    && source.artifacts == query.artifacts
+                    && source.unresolved == query.unresolved
+                    && source.classpath_incomplete == query.classpath_incomplete
+                    && source.source_selection == query.source_selection,
+                "Gradle binary selection changed during source resolution for {}:{}:{}",
+                base.build,
+                base.module,
+                source.name
             );
+            // Retain the accepted compiler, resource and runtime captures, including their identity.
+            source.source_artifacts = query.source_artifacts;
+            source.source_artifacts_incomplete = query.source_artifacts_incomplete;
+            source.source_poms = query.source_poms;
+            source.source_poms_incomplete = query.source_poms_incomplete;
         }
-        Ok::<_, anyhow::Error>(by_identity)
-    };
+        modules.push(enriched);
+    }
     anyhow::ensure!(
-        without_sources(&modules)? == without_sources(&accepted.modules)?,
-        "Gradle binary model changed during source resolution"
+        queried.is_empty(),
+        "Gradle module selection changed during source resolution"
     );
     anyhow::ensure!(
         model_inputs_current(root, &accepted.modules, &accepted.mtimes),
@@ -5936,9 +5992,18 @@ pub(crate) mod tests {
             "java_home": "/jdk", "options": {"release": 8},
             "output_roots": [], "complete": true, "problem": null
         });
+        let capture = serde_json::json!({
+            "identity": "original-capture", "captured_at_unix_ms": 1,
+            "gradle_version": "8.14.3", "build_identity": ":",
+            "source_sets": ["main", "test"], "java_source_sets_complete": true,
+            "plugin_classes": [], "kotlin_present": false,
+            "kotlin_source_sets": null, "kotlin_targets": null
+        });
+        let selection = "a".repeat(64);
         let dump = format!(
-            "PROJECT\t:app\t/repo/app\nCP\t/jars/a.jar\nCP\t/jars/b.jar\n\
+            "PROJECT\t:app\t/repo/app\nPROJECT_INPUTS\t{capture}\nCP\t/jars/a.jar\nCP\t/jars/b.jar\n\
              SOURCESET\tmain\nSCP\tmain\t/jars/a.jar\nSCP\tmain\t/jars/b.jar\n\
+             SOURCE_SELECTION\tmain\t{selection}\n\
              ARTIFACT\tmain\t/jars/api.jar\tMODULE\tvendor\tapi\t1\n\
              COMPILER\tmain\t{compiler}\nSOURCESET\ttest\nEND\t:app\n\
              PROJECT\t:lib\t/repo/lib\nSOURCESET\tmain\nEND\t:lib\n"
@@ -5952,6 +6017,8 @@ pub(crate) mod tests {
             .iter_mut()
             .flat_map(|module| &mut module.source_sets)
         {
+            source.project_capture = None;
+            source.compiler_tasks.clear();
             source.source_artifacts = Some(Vec::new());
             source.source_poms = Some(Vec::new());
         }
@@ -5970,20 +6037,20 @@ pub(crate) mod tests {
     fn source_snapshot_accepts_unique_reordered_modules_and_retains_sources() {
         let (root, accepted, mut queried) = source_snapshot_order_fixture();
         queried.reverse();
-        let enriched = source_snapshot(&root, &accepted, queried.clone()).unwrap();
+        let enriched = source_snapshot(&root, &accepted, queried).unwrap();
         assert!(accepted.source_enrichment_needed());
         assert!(!enriched.source_enrichment_needed());
+        assert_eq!(enriched.modules[0].module, ":app");
+        let main = &enriched.modules[0].source_sets[0];
+        let base = &accepted.modules[0].source_sets[0];
         assert_eq!(
-            enriched.modules, queried,
-            "keep returned order and exact enriched facts"
+            main.project_capture.as_ref().unwrap().identity,
+            "original-capture"
         );
-        assert_eq!(enriched.modules[0].module, ":lib");
+        assert_eq!(main.compiler_tasks, base.compiler_tasks);
+        assert!(!main.compiler_tasks.is_empty());
         assert_eq!(
-            enriched.modules[1].source_sets[0]
-                .source_artifacts
-                .as_ref()
-                .unwrap()[0]
-                .path,
+            main.source_artifacts.as_ref().unwrap()[0].path,
             PathBuf::from("/sources/api-sources.jar")
         );
 
@@ -6007,15 +6074,11 @@ pub(crate) mod tests {
             ("module identity", |modules| {
                 modules[0].build = ":other".into()
             }),
-            ("compiler arguments order", |modules| {
-                modules[0].source_sets[0].compiler_tasks[0]
-                    .arguments
-                    .swap(0, 1)
+            ("metadata-only component selection", |modules| {
+                modules[0].source_sets[0].source_selection = Some("b".repeat(64))
             }),
-            ("compiler options", |modules| {
-                modules[0].source_sets[0].compiler_tasks[0]
-                    .options
-                    .insert("release".into(), serde_json::json!(9));
+            ("scope classpath completeness", |modules| {
+                modules[0].source_sets[0].classpath_incomplete = true
             }),
             ("source classpath order", |modules| {
                 modules[0].source_sets[0].entries.swap(0, 1)
@@ -6125,6 +6188,18 @@ pub(crate) mod tests {
                 .sum::<usize>(),
             72_307
         );
+    }
+
+    #[test]
+    fn gradle_selection_fingerprint_must_be_valid_and_unique() {
+        let selection = "a".repeat(64);
+        for records in [
+            format!("SOURCE_SELECTION\tmain\t{selection}\nSOURCE_SELECTION\tmain\t{selection}\n"),
+            "SOURCE_SELECTION\tmain\tinvalid\n".into(),
+        ] {
+            let dump = format!("PROJECT\t:app\t/repo/app\nSOURCESET\tmain\n{records}END\t:app\n");
+            assert!(parse_dump_reader(dump.as_bytes(), true).is_err());
+        }
     }
 
     #[test]

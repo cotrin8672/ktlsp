@@ -159,9 +159,17 @@ object KtlspRuntimeInputs {
 class KtlspSourceSet(
     val name: String,
     val metadata: Provider<List<String>>,
+    val classpath: Provider<List<String>>,
     val artifacts: Provider<List<String>>,
     val resolutionRoot: Provider<ResolvedComponentResult>,
 )
+
+fun ktlspClasspathRecords(name: String, fallback: FileCollection, resolve: () -> Set<java.io.File>): List<String> {
+    val actualClasspath = runCatching(resolve)
+    val entries = actualClasspath.getOrElse { fallback.files }
+    return entries.map { "SCP\t${name}\t${it.absolutePath}" } +
+        if (actualClasspath.isFailure) listOf("INCOMPLETE\t${name}") else emptyList()
+}
 
 // Owned only by this export invocation; no Gradle/KGP classloader enters this inventory.
 abstract class KtlspCompilerRuntimes : org.gradle.api.services.BuildService<org.gradle.api.services.BuildServiceParameters.None>, AutoCloseable {
@@ -1304,27 +1312,31 @@ class KtlspDumpClasspathAction(
 ) : Action<Task> {
     override fun execute(task: Task) {
         val out = StringBuilder()
+        val sourcesOnly = task.name == "ktlspDumpSources"
         out.append("PROJECT\t${projectPath}\t${projectDirPath}\n")
         val projectId = resolutionRoot.get().id as? ProjectComponentIdentifier
         out.append("BUILD\t${KtlspBuildIdentity.path(projectId?.build, currentBuildRoot, includedBuildRoots)}\n")
-        val javaSets=task.project.extensions.findByType(SourceSetContainer::class.java)?.names
-        val kotlinExtension=task.project.extensions.findByName("kotlin")
-        val capture=linkedMapOf("identity" to java.util.UUID.randomUUID().toString(),
-            "captured_at_unix_ms" to System.currentTimeMillis(),"gradle_version" to task.project.gradle.gradleVersion,
-            "build_identity" to KtlspBuildIdentity.path(projectId?.build,currentBuildRoot,includedBuildRoots),
-            "source_sets" to sourceSets.map { it.name },
-            "java_source_sets_complete" to (javaSets!=null && javaSets==sourceSets.map { it.name }.toSet()),
-            "plugin_classes" to task.project.plugins.map { it.javaClass.name }.sorted(),
-            "kotlin_present" to (kotlinExtension!=null),
-            "kotlin_source_sets" to kotlinExtension?.let(KtlspProjectInputs::kotlinSourceSets),
-            "kotlin_targets" to kotlinExtension?.let(KtlspProjectInputs::kotlinTargets))
-        out.append("PROJECT_INPUTS\t${JsonOutput.toJson(capture)}\n")
+        if (!sourcesOnly) {
+            val javaSets=task.project.extensions.findByType(SourceSetContainer::class.java)?.names
+            val kotlinExtension=task.project.extensions.findByName("kotlin")
+            val capture=linkedMapOf("identity" to java.util.UUID.randomUUID().toString(),
+                "captured_at_unix_ms" to System.currentTimeMillis(),"gradle_version" to task.project.gradle.gradleVersion,
+                "build_identity" to KtlspBuildIdentity.path(projectId?.build,currentBuildRoot,includedBuildRoots),
+                "source_sets" to sourceSets.map { it.name },
+                "java_source_sets_complete" to (javaSets!=null && javaSets==sourceSets.map { it.name }.toSet()),
+                "plugin_classes" to task.project.plugins.map { it.javaClass.name }.sorted(),
+                "kotlin_present" to (kotlinExtension!=null),
+                "kotlin_source_sets" to kotlinExtension?.let(KtlspProjectInputs::kotlinSourceSets),
+                "kotlin_targets" to kotlinExtension?.let(KtlspProjectInputs::kotlinTargets))
+            out.append("PROJECT_INPUTS\t${JsonOutput.toJson(capture)}\n")
+        }
         classpathFiles.files.forEach {
             out.append("CP\t${it.absolutePath}\n")
         }
         sourceSets.forEach { sourceSet ->
             out.append("SOURCESET\t${sourceSet.name}\n")
-            sourceSet.metadata.get().forEach { out.append(it).append('\n') }
+            if (!sourcesOnly) sourceSet.metadata.get().forEach { out.append(it).append('\n') }
+            sourceSet.classpath.get().forEach { out.append(it).append('\n') }
             sourceSet.artifacts.get().forEach { out.append(it).append('\n') }
         }
 
@@ -1375,9 +1387,16 @@ class KtlspDumpClasspathAction(
                 }
             }
             failures.forEach { out.append(it).append('\n') }
-            sourceModules[sourceSet.name] = seen.filterIsInstance<ModuleComponentIdentifier>().toSet()
+            val modules = seen.filterIsInstance<ModuleComponentIdentifier>().toSet()
+            sourceModules[sourceSet.name] = modules
+            // Metadata-only components (such as platforms) can have no compile classpath entry.
+            val coordinates = modules.map { JsonOutput.toJson(listOf(it.group, it.module, it.version)) }.sorted()
+            val selection = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(coordinates.joinToString("\n").toByteArray(Charsets.UTF_8))
+                .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+            out.append("SOURCE_SELECTION\t${sourceSet.name}\t${selection}\n")
         }
-        if (task.name == "ktlspDumpSources") {
+        if (sourcesOnly) {
             val parentXmlFactory by lazy {
                 val factory = javax.xml.parsers.DocumentBuilderFactory.newInstance()
                 factory.isNamespaceAware = true
@@ -1430,16 +1449,22 @@ class KtlspDumpClasspathAction(
                     val metadataFailures = mutableSetOf<String>()
                     if (prefix == "POM") {
                         val checked = mutableSetOf<Pair<String, ComponentIdentifier>>()
+                        // Each selected Gradle POM can contribute to multiple source sets in this task.
+                        val parentByFile = mutableMapOf<java.io.File, Triple<String, String, String>?>()
                         fun key(id: ComponentIdentifier): Triple<String, String, String>? =
                             (id as? ModuleComponentIdentifier)?.let { Triple(it.group, it.module, it.version) }
                         // Discovery only: Rust validates the exported GAVs, properties and encoding.
-                        repeat(8) {
+                        for (depth in 1..8) {
                             val parents = linkedMapOf<Triple<String, String, String>, MutableSet<String>>()
                             membersByName.forEach { (name, members) ->
                                 resolved.filter { it.id in members && checked.add(name to it.id) }.forEach { component ->
                                     component.getArtifacts(artifactType).filterIsInstance<ResolvedArtifactResult>().forEach { artifact ->
                                         try {
-                                            parentCoordinate(artifact.file)?.let { parents.getOrPut(it) { mutableSetOf() }.add(name) }
+                                            val file = artifact.file
+                                            val parent = if (file in parentByFile) parentByFile[file] else {
+                                                parentCoordinate(file).also { parentByFile[file] = it }
+                                            }
+                                            parent?.let { parents.getOrPut(it) { mutableSetOf() }.add(name) }
                                         } catch (failure: Exception) {
                                             if (failure is InterruptedException || failure is org.gradle.api.BuildCancelledException ||
                                                 Thread.currentThread().isInterrupted) throw failure
@@ -1448,6 +1473,7 @@ class KtlspDumpClasspathAction(
                                     }
                                 }
                             }
+                            if (parents.isEmpty()) break
                             val missing = parents.keys.filter { parent -> resolved.none { key(it.id) == parent } }
                             if (missing.isNotEmpty()) {
                                 val parentQuery = task.project.dependencies.createArtifactResolutionQuery()
@@ -1512,6 +1538,7 @@ class KtlspDumpClasspathAction(
 //   KOTLIN_COMPILE_TASK\t<source set>\t<JSON public compilation task path or null>
 //   COMPILER\t<source set>\t<JSON task configuration, escaped opaque arguments>
 //   SCP\t<source set>\t<absolute classpath entry> (in compilation order)
+//   SOURCE_SELECTION\t<source set>\t<SHA-256 of selected module coordinates>
 //   ARTIFACT\t<source set>\t<absolute file>\tMODULE\t<group>\t<name>\t<version>
 //   ARTIFACT\t<source set>\t<absolute file>\tPROJECT\t<build path>\t<project path>
 //   UNRESOLVED\t<selector>\t<problem> (lenient-resolution drops, repeated)
@@ -1547,7 +1574,7 @@ allprojects {
         val resolutionRoot = configuration.incoming.resolutionResult.rootComponent
         listOf("ktlspDumpClasspath", "ktlspDumpSources").forEach { taskName ->
             tasks.register(taskName) {
-                usesService(compilerRuntimes)
+                if (taskName == "ktlspDumpClasspath") usesService(compilerRuntimes)
                 doLast(KtlspDumpClasspathAction(
                     projectPath, projectDirPath, currentBuildRoot, includedBuildRoots,
                     classpathFiles, resolutionRoot, sourceSets,
@@ -1612,8 +1639,6 @@ allprojects {
                                 provided.addAll(it.artifacts.files.files)
                             }
                         }
-                    val actualClasspath = runCatching { sourceSet.compileClasspath.files }
-                    val entries = actualClasspath.getOrElse { view.files.files }
                     listOf("SOURCESET_CONFIGURATIONS\t${sourceSetName}\t${JsonOutput.toJson(linkedMapOf(
                         "compile_classpath" to sourceSet.compileClasspathConfigurationName,
                         "runtime_classpath" to sourceSet.runtimeClasspathConfigurationName,
@@ -1626,12 +1651,12 @@ allprojects {
                         outputs.map { "OUTPUT\t${sourceSetName}\t${it.absolutePath}" } +
                         provided.map { "PROVIDES\t${sourceSetName}\t${it.absolutePath}" } +
                         listOf("KOTLIN_COMPILE_TASK\t${sourceSetName}\t${JsonOutput.toJson(primaryKotlinTask?.path)}") +
-                        compilers.map { "COMPILER\t${sourceSetName}\t${it}" } +
-                        entries.map { "SCP\t${sourceSetName}\t${it.absolutePath}" } +
-                        if (actualClasspath.isFailure) listOf("INCOMPLETE\t${sourceSetName}") else emptyList()
+                        compilers.map { "COMPILER\t${sourceSetName}\t${it}" }
                 }
                 sourceSets.add(KtlspSourceSet(
-                    sourceSetName, metadata, providers.provider {
+                    sourceSetName, metadata,
+                    providers.provider { ktlspClasspathRecords(sourceSetName, view.files) { sourceSet.compileClasspath.files } },
+                    providers.provider {
                         // Read declared artifact paths without requiring project JAR tasks to run.
                         view.artifacts.artifacts.map { artifact ->
                             val identity = when (val id = artifact.id.componentIdentifier) {
@@ -1704,10 +1729,6 @@ allprojects {
                                 }
                             }
                         }
-                        val actualClasspath = runCatching {
-                            (KtlspCompilerConfiguration.read(compilation, "getCompileDependencyFiles") as FileCollection).files
-                        }
-                        val entries = actualClasspath.getOrElse { view.files.files }
                         val compilers = listOfNotNull(javaTask?.let {
                             KtlspCompilerConfiguration.dump(it, "java", compilerRuntimes)
                         }) + KtlspCompilerConfiguration.dump(kotlinTask, "kotlin", compilerRuntimes)
@@ -1715,11 +1736,14 @@ allprojects {
                             outputs.map { "OUTPUT\t${sourceSetName}\t${it.absolutePath}" } +
                             provided.map { "PROVIDES\t${sourceSetName}\t${it.absolutePath}" } +
                             listOf("KOTLIN_COMPILE_TASK\t${sourceSetName}\t${JsonOutput.toJson(kotlinTask.path)}") +
-                            compilers.map { "COMPILER\t${sourceSetName}\t${it}" } +
-                            entries.map { "SCP\t${sourceSetName}\t${it.absolutePath}" } +
-                            if (actualClasspath.isFailure) listOf("INCOMPLETE\t${sourceSetName}") else emptyList()
+                            compilers.map { "COMPILER\t${sourceSetName}\t${it}" }
                     }
-                    sourceSets.add(KtlspSourceSet(sourceSetName, metadata, providers.provider {
+                    val classpath = providers.provider {
+                        ktlspClasspathRecords(sourceSetName, view.files) {
+                            (KtlspCompilerConfiguration.read(compilation, "getCompileDependencyFiles") as FileCollection).files
+                        }
+                    }
+                    sourceSets.add(KtlspSourceSet(sourceSetName, metadata, classpath, providers.provider {
                         view.artifacts.artifacts.map { artifact ->
                             val identity = when (val id = artifact.id.componentIdentifier) {
                                 is ModuleComponentIdentifier -> "MODULE\t${id.group}\t${id.module}\t${id.version}"
