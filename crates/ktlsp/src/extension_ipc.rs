@@ -2785,6 +2785,7 @@ pub(crate) struct Worker {
     stopped: AtomicBool,
     failed: Arc<AtomicBool>,
     project_operations: AtomicU32,
+    interactive_commands: AtomicU32,
     commands: std::collections::BTreeSet<String>,
     negotiated_commands: Mutex<std::collections::BTreeSet<String>>,
     transport: parking_lot::Mutex<Option<Transport>>,
@@ -2801,6 +2802,7 @@ impl Worker {
             stopped: AtomicBool::new(false),
             failed: Arc::new(AtomicBool::new(false)),
             project_operations: AtomicU32::new(0),
+            interactive_commands: AtomicU32::new(0),
             commands,
             negotiated_commands: Mutex::new(std::collections::BTreeSet::new()),
             transport: parking_lot::Mutex::new(None),
@@ -2822,6 +2824,18 @@ impl Worker {
         self.stop();
         drop(self.transport.lock().take());
     }
+    pub(crate) fn reserve_interactive_command(&self) {
+        self.interactive_commands.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn release_interactive_command(&self) -> bool {
+        self.interactive_commands.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    pub(crate) fn interactive_command_pending(&self) -> bool {
+        self.interactive_commands.load(Ordering::Acquire) != 0
+    }
+
     fn lock_command_transport(
         &self, deadline: Instant, cancellation: &AtomicBool, mut current: impl FnMut() -> bool,
     ) -> Result<parking_lot::MutexGuard<'_, Option<Transport>>, String> {
@@ -2875,6 +2889,11 @@ impl Worker {
         }
         if self.stopped.load(Ordering::Acquire) {
             return Err("extension stopped".into());
+        }
+        // A source job selected before the reservation can still be waiting here.
+        // Requeue it through the ordinary stale path if it has not been sent.
+        if work.command.is_none() && self.interactive_command_pending() {
+            return Err("Stale".into());
         }
         let mut stage="initialize";
         let result = (|| {
@@ -2950,6 +2969,10 @@ impl Worker {
             transport.send(
                 work_message(work),
             )?;
+            if work.command.is_some() && crate::trace::enabled() {
+                crate::trace::span("extension.ipc.command_sent", "extension", Instant::now(),
+                    json!({"evaluation": work.evaluation, "instance": self.id}));
+            }
             let deadline = Instant::now() + EVALUATION_LIMIT;
             let mut cancelled = false;
             let mut stale_input = false;

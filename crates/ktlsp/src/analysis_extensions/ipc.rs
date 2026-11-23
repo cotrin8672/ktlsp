@@ -22,6 +22,19 @@ mod tests {
     use ktcore::parser::KotlinParser;
     use serde_json::json;
 
+    #[test]
+    fn pending_interactive_commands_defer_queued_source_work_until_last_release() {
+        let (index, mut host) = host();
+        let worker = host.ipc_providers["test.ipc"].worker.clone();
+        worker.reserve_interactive_command();
+        worker.reserve_interactive_command();
+        assert!(host.take_ipc_work(&index, None, &[]).is_empty());
+        assert!(!worker.release_interactive_command());
+        assert!(host.take_ipc_work(&index, None, &[]).is_empty());
+        assert!(worker.release_interactive_command());
+        assert_eq!(host.take_ipc_work(&index, None, &[]).len(), 1);
+    }
+
     fn host() -> (Index, AnalysisExtensions) {
         let mut index = Index::new();
         let mut host = AnalysisExtensions::new(Vec::new());
@@ -770,7 +783,7 @@ impl AnalysisExtensions {
         let ids: Vec<_> = self.ipc_providers.keys().cloned().collect();
         for provider in ids {
             let slot = self.ipc_providers.get_mut(&provider).unwrap();
-            if !slot.enabled || slot.running {
+            if !slot.enabled || slot.running || slot.worker.interactive_command_pending() {
                 continue;
             }
             // Open documents have strict priority; closed owners retain their queued order.

@@ -14464,6 +14464,29 @@ struct ProviderCommandStart {
     revision: Option<u64>,
     version: Option<i32>,
 }
+struct InteractiveProviderCommand<'a> {
+    backend: &'a Backend,
+    worker: Arc<crate::extension_ipc::Worker>,
+}
+impl<'a> InteractiveProviderCommand<'a> {
+    fn new(backend: &'a Backend, worker: Arc<crate::extension_ipc::Worker>) -> Self {
+        worker.reserve_interactive_command();
+        Self { backend, worker }
+    }
+}
+impl Drop for InteractiveProviderCommand<'_> {
+    fn drop(&mut self) {
+        if !self.worker.release_interactive_command() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let workspace = self.backend.ws.clone();
+            let client = self.backend.client.clone();
+            let versions = self.backend.doc_versions.clone();
+            runtime.spawn(async move { schedule_extension_sources(&workspace, &client, &versions); });
+        }
+    }
+}
 struct ProviderCommandCancellation { cancelled: Arc<std::sync::atomic::AtomicBool>, armed: bool }
 impl Drop for ProviderCommandCancellation {
     fn drop(&mut self) { if self.armed { self.cancelled.store(true,std::sync::atomic::Ordering::Release); } }
@@ -14590,6 +14613,10 @@ impl Backend {
             .map_err(tower_lsp_server::jsonrpc::Error::invalid_params)?;
         // Preflight negotiates permissions and hydrates sources without dispatching the command.
         let start=self.prepare_provider_command(&request)?;
+        // Keep background work queued across the handoff between preflight and dispatch.
+        // Refresh commands keep their existing scheduling while awaiting a new model.
+        let _interactive = (!request.refresh_project)
+            .then(|| InteractiveProviderCommand::new(self, start.work.worker.clone()));
         let instance=start.work.worker.id;let owner=start.owner.clone();let revision=start.revision;let version=start.version;
         self.run_provider_command_work(start,false).await?;
         let generation=if request.refresh_project {
