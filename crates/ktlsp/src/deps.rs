@@ -127,8 +127,7 @@ impl LibrarySource {
             if !current() || !self.is_current() || !self.content_is_current() {verified.clear();}
             return verified;
         }
-        let Ok(file) = fs::File::open(path) else { return verified; };
-        let Ok(mut archive) = zip::ZipArchive::new(file) else { return verified; };
+        let Ok(mut archive) = jar::open_class_archive(path) else { return verified; };
         let Ok(selected) = jar::selected_class_entries(&mut archive,"",None,&current)
             else { return verified; };
         for file in files {

@@ -2858,7 +2858,8 @@ impl Worker {
         after_batch: Arc<dyn Fn() + Send + Sync>, cancellation: &AtomicBool, dispatch: bool,
     ) -> Result<Value, String> {
         trace_command_state(work,workspace,dispatch,"start",None);
-        let queue_deadline = Instant::now() + EVALUATION_LIMIT;
+        let queue_started = Instant::now();
+        let queue_deadline = queue_started + EVALUATION_LIMIT;
         let mut transport = if work.command.is_some() {
             self.lock_command_transport(queue_deadline, cancellation, ||
                 workspace.lock().ipc_evaluation_current(work.evaluation)
@@ -2868,6 +2869,10 @@ impl Worker {
                 }
             })?
         } else { self.transport.lock() };
+        if work.command.is_some() && crate::trace::enabled() {
+            crate::trace::span("extension.ipc.command_transport_wait", "extension", queue_started,
+                json!({"evaluation": work.evaluation, "instance": self.id, "dispatch": dispatch}));
+        }
         if self.stopped.load(Ordering::Acquire) {
             return Err("extension stopped".into());
         }
@@ -3112,7 +3117,12 @@ impl Worker {
                     if let Some(mut request)=requested_source_capture {
                         stage="requested-source-capture";
                         let waiting=std::mem::take(&mut request.waiting);
+                        let prepare_started = Instant::now();
                         let prepared=crate::workspace::prepare_ipc_source_capture(request);
+                        if crate::trace::enabled() {
+                            crate::trace::span("extension.ipc.requested_source_prepare", "extension", prepare_started,
+                                json!({"evaluation": work.evaluation, "instance": self.id, "command": work.command.is_some()}));
+                        }
                         workspace.lock().finish_ipc_source_capture(prepared);
                         stage="requested-source-wait";
                         wait_for_requested_sources(waiting,deadline)?;

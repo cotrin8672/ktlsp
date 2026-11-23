@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +28,32 @@ fn open_archive(jar: &Path) -> anyhow::Result<zip::ZipArchive<io::Cursor<Vec<u8>
     let bytes = fs::read(jar).with_context(|| format!("open jar {}", jar.display()))?;
     zip::ZipArchive::new(io::Cursor::new(bytes))
         .with_context(|| format!("read jar {}", jar.display()))
+}
+
+/// Class selection visits the whole central directory and opens local headers.
+/// Buffer modest archives to avoid seeking on disk for each of those headers.
+const MAX_BUFFERED_CLASS_ARCHIVE: u64 = 32 << 20;
+
+pub(crate) trait ClassArchiveReader: Read + Seek {}
+impl<T: Read + Seek> ClassArchiveReader for T {}
+
+pub(crate) fn open_class_archive(path: &Path) -> Result<zip::ZipArchive<Box<dyn ClassArchiveReader>>, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if metadata.is_file() && metadata.len() <= MAX_BUFFERED_CLASS_ARCHIVE {
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        (&mut file).take(MAX_BUFFERED_CLASS_ARCHIVE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 <= MAX_BUFFERED_CLASS_ARCHIVE {
+            let reader: Box<dyn ClassArchiveReader> = Box::new(io::Cursor::new(bytes));
+            return zip::ZipArchive::new(reader).map_err(|error| error.to_string());
+        }
+        // The file grew between the size check and the read. Keep the allocation bounded.
+        file.rewind().map_err(|error| error.to_string())?;
+    }
+    let reader: Box<dyn ClassArchiveReader> = Box::new(file);
+    zip::ZipArchive::new(reader).map_err(|error| error.to_string())
 }
 
 pub(crate) fn read_class_file(
@@ -145,7 +171,7 @@ pub(crate) fn read_effective_class_bytes(path:&Path, internal_name:&str, prefix:
     if path.is_dir() || !prefix.is_empty() {
         return read_class_bytes(path,&format!("{prefix}{internal_name}.class"));
     }
-    let mut archive=zip::ZipArchive::new(fs::File::open(path).map_err(|error|error.to_string())?).map_err(|error|error.to_string())?;
+    let mut archive = open_class_archive(path)?;
     let selected=selected_class_entries(&mut archive,prefix,feature,&current)?.into_iter().find(|entry|entry.internal_name==internal_name);
     let Some(selected)=selected else {return Ok(None);};
     read_selected_class_bytes(&mut archive,&selected,current).map(Some)
@@ -3487,6 +3513,29 @@ mod tests {
         fs::write(&path,bytes).unwrap();
         assert!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||true).unwrap_err().contains("ambiguous"));
         assert_eq!(read_effective_class_bytes(&path,"mr/Api","",Some(21),||false).unwrap_err(),"Stale");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn buffered_and_large_file_class_archives_select_the_same_bytes() {
+        let root = std::env::temp_dir().join(format!("ktlsp_class_archive_buffer_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let small = root.join("small.jar");
+        let large = root.join("large.jar");
+        let class = include_bytes!("../../ktcore/tests/fixtures/classfile/pluginfixture/Person.class");
+        write_binary_jar(&small, &[("pluginfixture/Person.class", class)]);
+        let mut output = fs::File::create(&large).unwrap();
+        output.seek(io::SeekFrom::Start(MAX_BUFFERED_CLASS_ARCHIVE + 1)).unwrap();
+        io::copy(&mut fs::File::open(&small).unwrap(), &mut output).unwrap();
+        drop(output);
+
+        for path in [&small, &large] {
+            assert_eq!(
+                read_effective_class_bytes(path, "pluginfixture/Person", "", None, || true)
+                    .unwrap().as_deref(),
+                Some(class.as_slice())
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
