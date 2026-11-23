@@ -6781,3 +6781,58 @@ seconds and overlapped dependency installation. The end-to-end numbers are
 single observations taken at different times. Evidence is in
 `C:/tmp/ktlsp-current-corpus/gradle-incomplete/artifacts/` and
 `C:/tmp/ktlsp-startup-flush-20261122/gradle-confirm/artifacts/`.
+
+### Gradle dependency sources and Lithium completion — 2026-11-23
+
+Gradle 8.14.3 (`e5ee1df3`) ran the existing Neovim corpus using JDK 21 and
+the same Gradle user home. The release with `b1f0ef01` skipped compiler,
+resource and runtime metadata in the source query. It verified the ordered
+classpath and selected module fingerprints, retained the accepted compiler
+capture and saved sources and POMs for all 1,176 source sets. The cache
+contains 49,390 source references and 72,307 POM references, with complete
+query results for every source set.
+
+| Gradle measurement | Previous release | Source-query release |
+| --- | ---: | ---: |
+| Dependency source query | 217.625 s | 129.177 s |
+| Time until library readiness | 388.619 s | 783.572 s |
+| Library files indexed | 80,036 | 139,267 |
+| Dependencies with missing sources | 316 | 29 |
+
+The previous library-readiness measurement used a cached model and discarded
+the source query. The new run rebuilt its model cache (204.904 s Gradle
+dump), then indexed the selected sources after binary preview. Model
+validation and source merge took 3.269 s. The library run had one failed
+source archive, `nekohtml:1.9.20`, whose Java source contains invalid UTF-8.
+The binary fallback remained selected. Eleven corpus assertions were on
+time and matched. One completion produced the expected `incrementAndGet`
+item and omitted `onProblem`, but synchronous trace recording delayed the
+response beyond the editor's 5-second deadline. Both assertions for that
+request remain unmeasured in the corpus receipt. The candidate was computed
+approximately 11 ms after request start, before the 6.76 s trace interval.
+The proof, late LSP response and trace are in
+`C:/tmp/ktlsp-gradle-source-20261123/gradle-8.14.3/`.
+
+Lithium (`749edb8`) used three real Neovim launches per release with five
+`@Redirect(method = "canUs")` completions each. All 15 candidate completions
+offered `canUse` and restored the original source when applied. All three
+processes exited cleanly. The release under test used the bounded JAR reads
+and interactive IPC scheduling from `67e074af` and `3c7f630c`.
+
+| Lithium measurement | Previous release | IPC scheduling release |
+| --- | ---: | ---: |
+| First completion p50, n=3 | 4.682 s | 3.188 s |
+| Warm completion p50, n=12 | 1.806 s | 0.971 s |
+| Warm completion nearest-rank p95, n=12 | 2.694 s | 1.338 s |
+| Warm preflight-to-dispatch p50, n=12 | 1.190 s | 0.298 s |
+
+The warm window is measured from editor input to candidate callback. The
+median time before the new release sent the actual command was 0.300 s,
+with a 0.295 s median transport wait. Evidence is in
+`C:/tmp/mcdev-lithium-predispatch-priority-20261123/comparison.json`.
+
+Integrated code through `4c2647ee` passed 2,032 Rust tests across 42 targets,
+with 18 ignored and no failures. The combined basic Neovim harness passed
+the initialization and definition checks. Its client stopped the child
+with signal 15 during teardown, while both real-project runs recorded
+normal server exit. Logs are in `C:/tmp/ktlsp-gradle-source-20261123/`.
